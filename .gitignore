@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Node / dashboard
+node_modules/
+dashboard/dist/
+
+# loom runtime state — never commit
+.loom/
+*.log
+
+# local, possibly-sensitive per-repo overrides
+.loom.local.yaml
+.env
+.env.*
+
+# macOS
+.DS_Store

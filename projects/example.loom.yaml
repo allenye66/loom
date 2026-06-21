@@ -1,0 +1,40 @@
+# Example .loom.yaml — copy to your repo root. Config travels with the repo. Secrets stay
+# in your shell env; ${VAR} values are expanded from the shell that runs `loom serve`.
+
+name: my-app
+base_branch: main
+
+# Editor opened by the chat header's "✎ edit" button. {worktree} is substituted; a bare
+# command (e.g. "code") gets the path appended. Per-machine override: the $LOOM_EDITOR env var.
+editor: "cursor --new-window {worktree}"   # e.g. "code --new-window {worktree}", "subl {worktree}"
+
+# Make a new worktree ready in seconds — symlink heavy install dirs instead of reinstalling.
+setup:
+  - "ln -snf {repo_root}/frontend/node_modules {worktree}/frontend/node_modules"
+
+# Deterministic per-worktree ports: hash(branch) -> stable offset, collision-checked.
+# loom hands each worktree backend=<base>+offset, frontend=<base>+offset.
+ports:
+  backend: 5000      # Flask default
+  frontend: 3000
+
+# Isolated test runs. `serialize` queues concurrent runs behind one global lock.
+test:
+  command: "pytest {pytest_args}"
+  cwd: "{worktree}"
+  isolation: serialize
+
+# Per-worktree dev servers (the task card's start/stop). {backend_port}/{frontend_port}
+# are this worktree's allocated ports; {worktree}/{repo_root}/{slug}/{offset} are also
+# available (derive any extra per-worktree index, e.g. a DB number, from {offset}).
+services:
+  - name: backend
+    cwd: "{worktree}"
+    command: "flask --app app run --port {backend_port}"
+    health: "http://127.0.0.1:{backend_port}/health"
+    env:
+      LOOM_LOG_DIR: "${HOME}/.loom/logs/{slug}"
+  - name: frontend
+    cwd: "{worktree}/frontend"
+    command: "npm run dev -- --port {frontend_port} --strictPort"
+    health: "http://127.0.0.1:{frontend_port}"

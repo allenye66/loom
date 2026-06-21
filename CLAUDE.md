@@ -1,0 +1,80 @@
+# CLAUDE.md — loom
+
+Orientation for any AI agent (or human) picking up work in this repo. Read this
+first, then the deeper docs in `docs/`.
+
+## What loom is
+
+A **local-first orchestrator for working on many Claude Code tasks at once**.
+Two halves:
+1. **Worktree tasks** — each task = a git worktree on its own branch, with
+   deterministic ports + isolated test runs, so you can work/test several
+   branches in parallel without checkout conflicts.
+2. **In-browser Claude Code client** — the **real** interactive `claude` TUI,
+   hosted in a server-side **tmux** session and bridged to xterm.js over a
+   WebSocket (so every slash command / permission prompt / feature works with zero
+   reimplementation), plus a chat manager that indexes your `~/.claude` history.
+   The goal is to **replace the Claude Code terminal as a UI** and let you
+   run/▸switch between multiple chats.
+
+A personal tool, shared as-is. Repo: `github.com/allenye66/loom`.
+
+## Run / dev
+
+- **Python** via `uv`, **JS** via `bun`. Prereqs checked by `loom doctor`.
+- Run the app: `uv run loom serve` (from the repo root) → http://127.0.0.1:8787
+  (serves the built dashboard + the API/WS).
+- **Two critical gotchas when iterating:**
+  - **Backend (Python) changes need a server restart** — there is no hot-reload
+    (`Ctrl+C`, re-run `uv run loom serve`).
+  - **Frontend (dashboard) changes need `bun run --cwd dashboard build`** and a
+    **browser hard-refresh** (`Cmd+Shift+R`) — the server serves `dashboard/dist`,
+    and the browser aggressively caches the hashed bundle.
+- Typecheck/build the dashboard: `bun run --cwd dashboard typecheck && bun run --cwd dashboard build`
+- **Run loom from a plain terminal, not from inside a Claude Code session** —
+  a nested `claude` inherits `CLAUDECODE`/`CLAUDE_CODE_*` env and auto-approves
+  tools (see `docs/CLAUDE_AGENT_SDK_NOTES.md`).
+
+## Architecture at a glance
+
+- **Backend** (`loom/`): FastAPI + Typer. `cli.py` (commands), `server/`
+  (HTTP + `/api/ws/term` WebSocket), `core/` (the logic). State lives in
+  `~/.loom/` (JSON registries + logs), never committed.
+- **Frontend** (`dashboard/`): React + Vite + Tailwind v4 (bun). TanStack Query
+  for REST, a raw WebSocket for the live terminal.
+- **Live terminal** (`loom/core/terminals.py` ↔ `dashboard/src/term/`): each chat
+  is a real `claude` CLI running inside a server-side **tmux** session (`loomx-<chat_id>`),
+  so it survives browser disconnects *and* loom restarts. loom holds one PTY on that
+  tmux session; `/api/ws/term` attaches as a subscriber, fanning its raw bytes to
+  xterm.js. Per-worktree ports/logs are injected via `core/runtime.py`.
+
+Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
+
+## Key conventions / gotchas (don't relearn these the hard way)
+
+- **Terminal mode needs `tmux`** — `claude` runs inside a tmux session so it survives
+  browser disconnects and loom restarts. The PTY scrubs `CLAUDECODE`/`CLAUDE_CODE_*` from
+  the child so the nested `claude` doesn't inherit auto-approve (see
+  `docs/CLAUDE_AGENT_SDK_NOTES.md`).
+- Terminal sessions launch `claude --effort max` by default.
+- The chat manager treats `~/.claude/projects/**/*.jsonl` as **read-only** truth
+  and keeps user state (star/archive/tags/name) in `~/.loom/chats.json`.
+- Match the existing code style; keep Python imports at top of file.
+
+## Docs
+
+- `docs/ARCHITECTURE.md` — modules, data flow, WS protocol, state files.
+- `docs/DECISIONS.md` — design decisions + rationale (read before changing direction).
+- `docs/CLAUDE_AGENT_SDK_NOTES.md` — **verified** SDK/CLI/transcript facts (with sources). Trust this over training data.
+- `docs/SESSIONS_DESIGN.md` — chat manager / session indexing design.
+- `README.md` — install + quickstart.
+
+## Roadmap (current focus)
+
+**Done:** the in-browser terminal — the real `claude` TUI over tmux (`terminals.py`),
+surviving browser disconnects + loom restarts; a **sidebar** of per-worktree chats with
+click-to-switch + `?chat=<id>` deep links; per-worktree dev-stack start/stop from the
+task card.
+
+**Next:** richer per-worktree status surfacing in the sidebar. See
+`docs/ARCHITECTURE.md` § Roadmap.
