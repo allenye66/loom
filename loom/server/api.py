@@ -6,6 +6,7 @@ import base64
 import contextlib
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 import uuid
@@ -319,6 +320,38 @@ def _editor_command(cwd: str) -> str:
     return "cursor --new-window {worktree}"
 
 
+# GUI editors ship a launcher CLI *inside* their macOS .app bundle, and it's commonly
+# NOT on $PATH when loom is started from a login/GUI shell (the user never ran the
+# "Install 'cursor' command in PATH" palette action). Map the bare command name to that
+# bundled CLI so the edit button works out of the box. Harmless on non-macOS: the paths
+# just won't exist.
+_EDITOR_BUNDLE_CLIS = {
+    "cursor": [
+        "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+        "~/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+    ],
+    "code": [
+        "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+        "~/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+    ],
+    "subl": ["/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl"],
+}
+
+
+def _resolve_editor_binary(name: str) -> str | None:
+    """Absolute path to the editor CLI `name`, or None if it can't be found. Tries `$PATH`
+    first, then the launcher bundled inside the matching macOS .app (Cursor/VS Code/Sublime
+    ship one, but it's often missing from PATH when loom starts from a GUI/login shell)."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for cand in _EDITOR_BUNDLE_CLIS.get(Path(name).name, []):
+        candp = Path(cand).expanduser()
+        if candp.exists():
+            return str(candp)
+    return None
+
+
 @router.post("/ide")
 def open_ide(body: OpenIdeIn) -> dict:
     """Open a worktree folder in the configured editor (the chat header's edit button).
@@ -336,7 +369,20 @@ def open_ide(body: OpenIdeIn) -> dict:
             raise ValueError("empty editor command — check `editor:` / $LOOM_EDITOR")
         if "{worktree}" not in template:
             argv.append(str(p))
+        # Resolve argv[0] to an absolute path — covers the common case where the editor CLI
+        # lives inside a macOS .app and isn't on the PATH loom inherited.
+        resolved = _resolve_editor_binary(argv[0])
+        if not resolved:
+            raise HTTPException(
+                400,
+                f"editor command {argv[0]!r} not found on PATH or in a known app bundle — "
+                "install its shell command (e.g. Cursor → Cmd+Shift+P → \"Install 'cursor' "
+                "command in PATH\"), or set `editor:` in .loom.yaml / the $LOOM_EDITOR env var.",
+            )
+        argv[0] = resolved
         r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except HTTPException:
+        raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"could not run editor command ({template!r}): {e}") from e
     if r.returncode != 0:
