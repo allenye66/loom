@@ -175,7 +175,7 @@ export function DevStackBar({ task }: { task: Task }) {
 export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const openChat = useOpenChat();
   const { patch } = useChatActions();
-  const { create } = useTaskActions();
+  const { create, remove } = useTaskActions();
   const { data: repos } = useRepos();
   const [tab, setTabState] = useState<'active' | 'archived'>(_sidebarTab);
   const setTab = (t: 'active' | 'archived') => {
@@ -260,6 +260,24 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   };
 
   const archiveToggle = (id: string) => patch.mutate({ id, patch: { archived: tab !== 'archived' } });
+  // Fully delete an archived chat's worktree (git worktree + files). Warns first; the branch and
+  // the chat transcript are kept. Also trims the worktree count, which keeps loom snappy.
+  const deleteWorktree = (r: Row) => {
+    const task = (tasks ?? []).find((t) => t.worktree_path && t.worktree_path === r.cwd);
+    if (!task) {
+      alert('No worktree found for this chat — it may already be removed.');
+      return;
+    }
+    if (
+      !confirm(
+        `Fully delete the worktree for "${task.branch}"?\n\n` +
+          `This permanently removes the git worktree and its files — any uncommitted changes are lost. ` +
+          `The branch and the chat transcript are kept.`,
+      )
+    )
+      return;
+    remove.mutate({ id: task.id, force: true });
+  };
   const createTask = async () => {
     const b = branch.trim().replace(/^-+/, ''); // input is sanitized live; also drop any leading "-"
     if (!b || !repoRoot) return;
@@ -393,6 +411,15 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           >
             {tab === 'archived' ? '↺' : '⊘'}
           </button>
+          {tab === 'archived' && (
+            <button
+              onClick={(e) => { e.stopPropagation(); deleteWorktree(r); }}
+              title="fully delete this worktree (removes the git worktree + files; branch & transcript kept)"
+              className="opacity-0 group-hover:opacity-100 text-muted hover:text-bad shrink-0 text-xs leading-none"
+            >
+              🗑
+            </button>
+          )}
         </div>
         );
       })}
