@@ -86,7 +86,11 @@ export function useTaskActions() {
         jsend(`/tasks/${v.id}/test`, 'POST', { pytest_args: v.pytest_args ?? '' }),
       onSuccess: invTasks,
     }),
-    start: useMutation({ mutationFn: (id: string) => jsend(`/tasks/${id}/start`, 'POST'), onSuccess: invTasks }),
+    start: useMutation({
+      mutationFn: (v: { id: string; only?: string[] }) =>
+        jsend(`/tasks/${v.id}/start${v.only?.length ? `?only=${v.only.join(',')}` : ''}`, 'POST'),
+      onSuccess: invTasks,
+    }),
     stop: useMutation({ mutationFn: (id: string) => jsend(`/tasks/${id}/stop`, 'POST'), onSuccess: invTasks }),
     addRepo: useMutation({
       mutationFn: (root: string) => jsend<Repo>('/repos', 'POST', { root }),

@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { ChatSidebar, DevStackBar, OpenInIde } from '../chat/ChatSidebar';
+import { PrBadges } from '../components/PrBadges';
 import type { Task } from '../api';
 
 // Match the app palette (index.css @theme tokens) so the TUI feels native.
@@ -121,6 +122,15 @@ export function TerminalView({
     (t) => t.worktree_path && (cwd === t.worktree_path || (cwd?.startsWith(t.worktree_path + '/') ?? false)),
   );
 
+  // The chat's branch + auto-detected PRs (from the transcript's pr-link records), with live
+  // GitHub merge status (open / tests passing / ready to merge / error / merged …).
+  const { data: chatMeta } = useQuery({
+    queryKey: ['chat-meta', resume],
+    queryFn: () => fetch(`/api/chats/${resume}`).then((r) => r.json()).then((d) => d.chat),
+    enabled: !!resume,
+    refetchInterval: 30000,
+  });
+
   // Drag an image in → save it server-side and type its path into claude's input (mirrors a
   // native terminal's image drop). xterm has no file-drop handling, so we do it on the wrapper.
   const [dragOver, setDragOver] = useState(false);
@@ -210,14 +220,24 @@ export function TerminalView({
     // events ourselves and tell xterm to ignore it (return false). The xterm<->tmux mouse-mode
     // handshake is flaky — scrolling would work, then stop after claude redrew — so we don't
     // rely on it. tmux (mouse on) interprets these and scrolls its scrollback / copy-mode.
+    // Calmer scrolling: ACCUMULATE wheel pixels and emit one tmux wheel notch per
+    // SCROLL_STEP_PX, rather than forcing >=1 notch per raw wheel event. Trackpad momentum
+    // fires a flood of tiny events, so the old per-event minimum flew through the buffer;
+    // accumulating decouples scroll speed from event count. Larger SCROLL_STEP_PX = less sensitive.
+    const SCROLL_STEP_PX = 80;
+    let wheelAccum = 0;
     term.attachCustomWheelEventHandler((e) => {
-      const seq = e.deltaY < 0 ? '\x1b[<64;1;1M' : '\x1b[<65;1;1M'; // SGR wheel up / down
-      // Calmer scrolling: normalize the delta (deltaMode 0=px, 1=lines, 2=pages) and dampen so a
-      // trackpad / high-res wheel doesn't fly through the buffer.
-      const px = e.deltaMode === 1 ? Math.abs(e.deltaY) * 16 : e.deltaMode === 2 ? Math.abs(e.deltaY) * 800 : Math.abs(e.deltaY);
-      const notches = Math.min(3, Math.max(1, Math.round(px / 120)));
-      for (let i = 0; i < notches; i++) send({ type: 'input', data: seq });
-      scheduleRepaint(); // self-heal any tear once scrolling stops
+      const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 800 : e.deltaY;
+      if (!px) return false; // ignore horizontal / zero-delta
+      if (wheelAccum !== 0 && Math.sign(px) !== Math.sign(wheelAccum)) wheelAccum = 0; // snappy reversals
+      wheelAccum += px;
+      const notches = Math.trunc(wheelAccum / SCROLL_STEP_PX);
+      if (notches !== 0) {
+        wheelAccum -= notches * SCROLL_STEP_PX;
+        const seq = notches < 0 ? '\x1b[<64;1;1M' : '\x1b[<65;1;1M'; // SGR wheel up / down
+        for (let i = 0; i < Math.min(Math.abs(notches), 3); i++) send({ type: 'input', data: seq });
+        scheduleRepaint(); // self-heal any tear once scrolling stops
+      }
       return false;
     });
 
@@ -246,9 +266,9 @@ export function TerminalView({
     });
     if (holderRef.current) ro.observe(holderRef.current);
 
-    // Image drop → save server-side + type the path into claude (mirrors a native terminal's
-    // drag). Native CAPTURE-phase listeners so xterm's inner elements can't swallow the file
-    // drop before us. Logged under "loom-term" so the two stages (drop fired, POST ok) are visible.
+    // File drop → save server-side + type the path into claude (mirrors a native terminal's drag).
+    // Works for ANY file claude can read from a path — images, PDFs, CSVs, etc. Native CAPTURE-phase
+    // listeners so xterm's inner elements can't swallow the drop before us. Logged under "loom-term".
     const holderEl = holderRef.current;
     const onDragOverFiles = (e: DragEvent) => {
       if (Array.from(e.dataTransfer?.types || []).includes('Files')) {
@@ -258,8 +278,8 @@ export function TerminalView({
     };
     const onDragLeaveFiles = () => setDragOver(false);
     const onDropFiles = (e: DragEvent) => {
-      const files = Array.from(e.dataTransfer?.files || []).filter((f) => f.type.startsWith('image/'));
-      console.debug(`[loom-term] drop: ${e.dataTransfer?.files?.length ?? 0} file(s), ${files.length} image(s)`);
+      const files = Array.from(e.dataTransfer?.files || []);
+      console.debug(`[loom-term] drop: ${files.length} file(s)`);
       if (!files.length) return;
       e.preventDefault();
       e.stopPropagation();
@@ -269,13 +289,13 @@ export function TerminalView({
         const reader = new FileReader();
         reader.onload = () => {
           const data = (reader.result as string).split(',')[1] || '';
-          fetch(`/api/terminals/${resume}/paste-image`, {
+          fetch(`/api/terminals/${resume}/upload`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ data, name: f.name }),
           })
-            .then((resp) => console.debug(`[loom-term] image "${f.name}" -> ${resp.ok ? 'ok (path typed into claude)' : 'FAILED ' + resp.status}`))
-            .catch((err) => console.debug('[loom-term] image upload error', err));
+            .then((resp) => console.debug(`[loom-term] file "${f.name}" -> ${resp.ok ? 'ok (path typed into claude)' : 'FAILED ' + resp.status}`))
+            .catch((err) => console.debug('[loom-term] upload error', err));
         };
         reader.readAsDataURL(f);
       }
@@ -335,6 +355,13 @@ export function TerminalView({
             </button>
           </div>
         </header>
+
+        {chatMeta && (chatMeta.branch || (chatMeta.prs?.length ?? 0) > 0) && (
+          <div className="border-b border-edge bg-surface-2/30 px-5 py-1.5 flex flex-wrap items-center gap-2 text-[11px] mono shrink-0">
+            {chatMeta.branch && <span className="px-2 py-0.5 rounded border border-edge text-muted">⎇ {chatMeta.branch}</span>}
+            <PrBadges sid={resume} prs={chatMeta.prs ?? []} repo={chatMeta.pr_repo} />
+          </div>
+        )}
 
         {task && <DevStackBar task={task} />}
 

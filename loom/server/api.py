@@ -6,6 +6,7 @@ import base64
 import contextlib
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 import uuid
@@ -130,9 +131,12 @@ def _cfg_for(task_id: str):
 
 
 @router.post("/tasks/{task_id}/start")
-def start_task(task_id: str) -> dict:
+def start_task(task_id: str, only: str | None = None) -> dict:
+    """Start the task's dev services. `only` = comma-separated service names to (re)start just
+    those (e.g. `?only=frontend` to bring a down port back up without touching the other)."""
     _, cfg = _cfg_for(task_id)
-    return _view(manager.start_task(cfg, task_id))
+    svcs = {s for s in only.split(",") if s} if only else None
+    return _view(manager.start_task(cfg, task_id, only=svcs))
 
 
 @router.post("/tasks/{task_id}/stop")
@@ -319,6 +323,26 @@ def _editor_command(cwd: str) -> str:
     return "cursor --new-window {worktree}"
 
 
+# macOS app-bundle fallbacks for editors whose CLI often isn't on PATH (you have the .app but
+# never ran "install '<cli>' command in PATH"). cli -> .app name; the bin lives at
+# <app>/Contents/Resources/app/bin/<cli> (the VS Code-derived family: Cursor, VS Code, …).
+_EDITOR_APPS = {"cursor": "Cursor", "code": "Visual Studio Code", "codium": "VSCodium", "windsurf": "Windsurf"}
+
+
+def _resolve_cli(cli: str) -> str | None:
+    """Absolute path to an editor CLI: prefer PATH, else look inside the known .app bundle."""
+    found = shutil.which(cli)
+    if found:
+        return found
+    app = _EDITOR_APPS.get(cli)
+    if app:
+        for base in ("/Applications", str(Path.home() / "Applications")):
+            p = Path(base) / f"{app}.app/Contents/Resources/app/bin/{cli}"
+            if p.exists():
+                return str(p)
+    return None
+
+
 @router.post("/ide")
 def open_ide(body: OpenIdeIn) -> dict:
     """Open a worktree folder in the configured editor (the chat header's edit button).
@@ -328,14 +352,23 @@ def open_ide(body: OpenIdeIn) -> dict:
     if not p.is_dir():
         raise HTTPException(400, f"no such directory: {body.cwd}")
     template = _editor_command(body.cwd)
-    # Split the TEMPLATE first, then substitute the path into each arg — so a worktree path
-    # with spaces stays one argv entry. A bare command (no {worktree}) gets the path appended.
+    parts = shlex.split(template)
+    if not parts:
+        raise HTTPException(400, "empty editor command — set `editor:` in .loom.yaml or $LOOM_EDITOR")
+    # Resolve the CLI (PATH or .app bundle) so it works even when the shell command isn't installed.
+    cli = _resolve_cli(parts[0])
+    if not cli:
+        raise HTTPException(
+            400,
+            f"editor '{parts[0]}' not found — install its CLI on PATH (e.g. Cursor → "
+            "“Shell Command: Install 'cursor' command in PATH”), or set `editor:` / $LOOM_EDITOR",
+        )
+    # Substitute the worktree path into the args (not the CLI); split-then-substitute keeps a path
+    # with spaces as one argv entry. A bare command (no {worktree}) gets the path appended.
+    argv = [cli] + [os.path.expandvars(a.replace("{worktree}", str(p))) for a in parts[1:]]
+    if "{worktree}" not in template:
+        argv.append(str(p))
     try:
-        argv = [os.path.expandvars(a.replace("{worktree}", str(p))) for a in shlex.split(template)]
-        if not argv:
-            raise ValueError("empty editor command — check `editor:` / $LOOM_EDITOR")
-        if "{worktree}" not in template:
-            argv.append(str(p))
         r = subprocess.run(argv, capture_output=True, text=True, timeout=20)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, f"could not run editor command ({template!r}): {e}") from e
@@ -364,29 +397,32 @@ def open_native_terminal(chat_id: str) -> dict:
     return {"opened": opened}
 
 
-class PasteImageIn(BaseModel):
-    data: str  # base64-encoded image bytes
+class UploadIn(BaseModel):
+    data: str  # base64-encoded file bytes
     name: str | None = None
 
 
-@router.post("/terminals/{chat_id}/paste-image")
-async def terminal_paste_image(chat_id: str, body: PasteImageIn) -> dict:
-    """Drop an image into a terminal chat: save it server-side and type its path into claude's
-    input — the same mechanism as dragging an image into a native terminal (claude reads it
-    from the path). Runs in the event loop (async) so the PTY write is on the loop thread."""
+@router.post("/terminals/{chat_id}/upload")
+async def terminal_upload(chat_id: str, body: UploadIn) -> dict:
+    """Drop a file (image, PDF, CSV, …) into a terminal chat: save it server-side and type its
+    path into claude's input — the same mechanism as dragging a file into a native terminal
+    (claude reads it from the path). Runs in the event loop (async) so the PTY write is on the
+    loop thread."""
     ts = terminals.get(chat_id)
     if ts is None:
         raise HTTPException(404, "no live terminal session for this chat")
+    # Preserve the original extension (sanitized) so claude reads it as the right type; drop it
+    # if the name has no clean short alphanumeric extension.
     ext = os.path.splitext(body.name or "")[1].lower()
-    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-        ext = ".png"
+    if not (1 < len(ext) <= 8 and ext.startswith(".") and ext[1:].isalnum()):
+        ext = ""
     updir = LOOM_HOME / "uploads"
     updir.mkdir(parents=True, exist_ok=True)
     path = updir / f"{uuid.uuid4().hex}{ext}"
     try:
         path.write_bytes(base64.b64decode(body.data))
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"bad image data: {e}") from e
+        raise HTTPException(400, f"bad file data: {e}") from e
     ts.write((str(path) + " ").encode())  # insert the path at claude's cursor, like a native drag
     return {"path": str(path)}
 

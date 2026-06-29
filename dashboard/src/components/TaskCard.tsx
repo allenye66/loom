@@ -212,7 +212,7 @@ export function TaskCard({ task }: { task: Task }) {
           </button>
         ) : (
           <button
-            onClick={() => a.start.mutate(task.id)}
+            onClick={() => a.start.mutate({ id: task.id })}
             className="text-xs px-2.5 py-1.5 rounded border border-edge text-muted hover:text-ink"
           >
             start

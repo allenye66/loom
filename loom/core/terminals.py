@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import json
 import os
 import pty
 import re
@@ -28,6 +29,7 @@ import time
 from pathlib import Path
 
 from loom.core import sessions as sessions_mod
+from loom.core.config import LOOM_HOME
 from loom.core.runtime import _RESILIENCE_ENV, _loom_runtime
 
 _registry: dict[str, "TerminalSession"] = {}
@@ -51,6 +53,15 @@ def _tmux() -> str | None:
 def session_name(chat_id: str) -> str:
     """tmux session name for a chat — also how a native terminal attaches the same session."""
     return "loomx-" + re.sub(r"[^a-zA-Z0-9_-]", "-", chat_id)[:60]
+
+
+NEEDS_DIR = LOOM_HOME / "needs"  # per-chat "needs you" markers (written/cleared by claude's hooks)
+
+
+def _marker_path(chat_id: str) -> Path:
+    """File whose existence means 'this chat is waiting on you'. Set by the Stop/Notification
+    hooks, cleared by UserPromptSubmit (see _claude_argv); read by list_active()."""
+    return NEEDS_DIR / (re.sub(r"[^a-zA-Z0-9_-]", "-", chat_id)[:80] or "x")
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -88,12 +99,31 @@ class TerminalSession:
         Resume the chat's stable id if it exists on disk, else create it with that id so
         the terminal session is the same resumable conversation loom indexes."""
         _, note = _loom_runtime(self.cwd)
-        # `tui: fullscreen` = the alternate-screen renderer (avoids the inline renderer's
-        # redraw-tearing — upstream bug anthropics/claude-code#29937/#37076). `theme: dark`
-        # forces readable colors for loom's dark terminal: a user whose *global* theme is "light"
-        # otherwise gets dark-text-on-dark, unreadable (esp. question/permission highlights). Both
-        # are per-session via --settings, so the user's global ~/.claude/settings.json is untouched.
-        argv = [_claude(), "--effort", "max", "--settings", '{"tui":"fullscreen","theme":"dark"}']
+        # Per-session settings (via --settings, so the user's global ~/.claude/settings.json is
+        # untouched):
+        #  • `tui: fullscreen` = the alternate-screen renderer (avoids the inline renderer's
+        #    redraw-tearing — upstream bug anthropics/claude-code#29937/#37076).
+        #  • `theme: dark` forces readable colors even if the user's *global* theme is "light"
+        #    (else dark-on-dark, unreadable — esp. question/permission highlights).
+        #  • `hooks` write a "needs you" marker when claude finishes a turn (Stop) or asks for
+        #    input/permission (Notification), and clear it when you reply (UserPromptSubmit).
+        #    list_active() reads it — a reliable signal vs. guessing from output activity.
+        NEEDS_DIR.mkdir(parents=True, exist_ok=True)
+        mark = shlex.quote(str(_marker_path(self.chat_id)))
+        settings = {
+            "tui": "fullscreen",
+            "theme": "dark",
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
+                "Notification": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"rm -f {mark}"}]}],
+            },
+        }
+        # `acceptEdits` = auto-approve file creates/edits inside the worktree (the sandbox) so
+        # claude isn't stopped on the first edit of each session. Non-fs tools (Bash, etc.) still
+        # honor your allow/deny rules, and `.claude/` edits stay gated (Claude Code's separate
+        # guardrail). Mirrors the permission_mode the old SDK chat used.
+        argv = [_claude(), "--effort", "max", "--permission-mode", "acceptEdits", "--settings", json.dumps(settings)]
         if note:
             argv += ["--append-system-prompt", note]
         if sessions_mod._find_transcript(self.chat_id):
@@ -208,6 +238,8 @@ class TerminalSession:
         # The tmux session is gone (user ran /exit or it was killed). Tell attached tabs
         # and drop from the registry so the next open recreates a fresh session.
         await self._broadcast_json({"type": "exit"})
+        with contextlib.suppress(Exception):
+            _marker_path(self.chat_id).unlink(missing_ok=True)
         _registry.pop(self.key, None)
 
     async def close(self) -> None:
@@ -218,6 +250,8 @@ class TerminalSession:
         if tm:
             with contextlib.suppress(Exception):
                 subprocess.run([tm, "kill-session", "-t", self.session], capture_output=True)
+        with contextlib.suppress(Exception):
+            _marker_path(self.chat_id).unlink(missing_ok=True)
         _registry.pop(self.key, None)
 
     # --- I/O from the browser ------------------------------------------------
@@ -315,16 +349,26 @@ def get(key: str) -> TerminalSession | None:
 
 
 def list_active() -> list[dict]:
-    """Per live terminal session: seconds since it last produced output. The sidebar
-    reads this to show a 'working' pulse (recent output) vs a 'needs you' dot (idle).
-    Only includes sessions with a PTY currently attached (i.e. opened this loom run)."""
+    """Per live terminal session: seconds since last output (`idle_sec`) + whether claude has
+    signaled it's waiting on you (`needs`, from the hook marker). The sidebar shows a 'working'
+    pulse from `idle_sec` and a 'needs you' dot from `needs`. Only sessions with a PTY currently
+    attached (i.e. opened this loom run)."""
     now = time.monotonic()
     out: list[dict] = []
     for ts in _registry.values():
         if ts.proc is None or ts.proc.poll() is not None:
             continue  # PTY not attached / claude exited
-        out.append({"chat_id": ts.chat_id, "idle_sec": round(now - ts.last_output, 1)})
+        out.append({
+            "chat_id": ts.chat_id,
+            "idle_sec": round(now - ts.last_output, 1),
+            "needs": _marker_path(ts.chat_id).exists(),
+        })
     return out
+
+
+def active_sessions() -> list["TerminalSession"]:
+    """Live terminal sessions (PTY attached) — used by the dev-stack supervisor (monitor.py)."""
+    return [ts for ts in list(_registry.values()) if ts.proc is not None and ts.proc.poll() is None]
 
 
 async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: int = 32) -> TerminalSession:

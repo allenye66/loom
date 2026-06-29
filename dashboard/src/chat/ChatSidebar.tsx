@@ -63,9 +63,40 @@ export function OpenInIde({ cwd }: { cwd?: string }) {
   );
 }
 
-/** A port chip that opens the service in a new tab — accent when healthy, muted (but
- *  still clickable) otherwise. */
-function PortLink({ label, url, live }: { label: string; url: string; live?: boolean }) {
+/** Poll a URL from the browser every `ms` to see if it's actually serving. Uses `no-cors`:
+ *  the response is opaque (we can't read it), but the fetch RESOLVES when the server answered
+ *  and REJECTS on connection-refused — enough to know the port is live, regardless of whether
+ *  loom started the service. (A failed poll logs a net error to the console, but only while the
+ *  service is down.) */
+function usePing(url: string | undefined, ms = 5000): boolean {
+  const [up, setUp] = useState(false);
+  useEffect(() => {
+    if (!url) {
+      setUp(false);
+      return;
+    }
+    let alive = true;
+    const ping = () => {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 4000);
+      fetch(url, { mode: 'no-cors', cache: 'no-store', signal: ctrl.signal })
+        .then(() => alive && setUp(true))
+        .catch(() => alive && setUp(false))
+        .finally(() => clearTimeout(to));
+    };
+    ping();
+    const id = setInterval(ping, ms);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [url, ms]);
+  return up;
+}
+
+/** A port chip that opens the service in a new tab — purple (accent) when reachable, muted
+ *  otherwise. The parent computes `up` (via usePing) so it can drive the start/stop button too. */
+function PortLink({ label, url, up }: { label: string; url: string; up?: boolean }) {
   return (
     <a
       href={url}
@@ -73,7 +104,7 @@ function PortLink({ label, url, live }: { label: string; url: string; live?: boo
       rel="noreferrer"
       title={`open ${url}`}
       className={`px-2 py-0.5 rounded border inline-flex items-center gap-1 ${
-        live ? 'border-accent-dim text-accent hover:bg-accent/10' : 'border-edge text-muted hover:text-ink'
+        up ? 'border-accent-dim text-accent hover:bg-accent/10' : 'border-edge text-muted hover:text-ink'
       }`}
     >
       {label} ↗
@@ -84,32 +115,55 @@ function PortLink({ label, url, live }: { label: string; url: string; live?: boo
 /** In-chat dev-stack strip: open this worktree's frontend/backend in a new tab, and
  *  start/stop the services without leaving the chat. Only shown when the chat's cwd
  *  maps to a loom task with allocated ports. */
+// Link each chip to the service's configured `health:` URL from .loom.yaml (lets a repo point
+// the BE chip at e.g. /api/health/ instead of a root that 404s); fall back to the bare port.
+// Render the host as `localhost` even though the health *check* uses 127.0.0.1/0.0.0.0 (reliable
+// for probing) — browsers prefer localhost, and an app bound to 127.0.0.1 may behave differently
+// (auth/cookies) than the same URL on localhost.
+const svcLink = (health: string | null | undefined, port: number) =>
+  (health || `http://localhost:${port}`).replace('://127.0.0.1', '://localhost').replace('://0.0.0.0', '://localhost');
+
 export function DevStackBar({ task }: { task: Task }) {
   const a = useTaskActions();
-  if (!task.ports) return null;
   const fe = task.services?.find((s) => s.name === 'frontend');
   const be = task.services?.find((s) => s.name === 'backend');
-  const running = task.state === 'running';
+  // Per-service URLs + liveness (browser ping OR loom's health check). usePing runs before the
+  // early-return so the hook order is stable (it returns false for an undefined URL).
+  const feUrl = task.ports ? svcLink(fe?.health_url, task.ports.frontend) : undefined;
+  const beUrl = task.ports ? svcLink(be?.health_url, task.ports.backend) : undefined;
+  const feUp = usePing(feUrl) || !!fe?.healthy;
+  const beUp = usePing(beUrl) || !!be?.healthy;
+  if (!task.ports) return null;
+
+  const allUp = feUp && beUp;
+  const anyUp = feUp || beUp;
+  // The down services to (re)start when not everything is up. Stop only when both are up.
+  const down = [...(feUp ? [] : ['frontend']), ...(beUp ? [] : ['backend'])];
   const busy = a.start.isPending || a.stop.isPending;
-  // Link each chip to the service's configured `health:` URL from .loom.yaml when running
-  // (lets a repo point the BE chip at e.g. /api/health/ instead of a root that 404s); fall
-  // back to the bare port when stopped (no service record yet).
-  const feUrl = fe?.health_url || `http://localhost:${task.ports.frontend}`;
-  const beUrl = be?.health_url || `http://localhost:${task.ports.backend}`;
+  const [statusTxt, statusCls] = allUp
+    ? ['● running', 'text-ok']
+    : anyUp
+      ? ['◐ partial', 'text-warn']
+      : ['○ stopped', 'text-muted'];
+
   return (
     <div className="border-b border-edge bg-surface-2/40 px-5 py-1.5 flex items-center gap-2 text-[11px] mono shrink-0">
       <span className="text-muted shrink-0">dev stack</span>
-      <PortLink label={`FE :${task.ports.frontend}`} url={feUrl} live={!!fe?.healthy} />
-      <PortLink label={`BE :${task.ports.backend}`} url={beUrl} live={!!be?.healthy} />
+      <PortLink label={`FE :${task.ports.frontend}`} url={feUrl!} up={feUp} />
+      <PortLink label={`BE :${task.ports.backend}`} url={beUrl!} up={beUp} />
       <div className="flex-1" />
-      <span className={running ? 'text-ok' : 'text-muted'}>{running ? '● running' : '○ stopped'}</span>
+      <span className={statusCls}>{statusTxt}</span>
       <button
-        onClick={() => (running ? a.stop.mutate(task.id) : a.start.mutate(task.id))}
+        onClick={() => (allUp ? a.stop.mutate(task.id) : a.start.mutate({ id: task.id, only: down }))}
         disabled={busy}
-        title={running ? 'stop this worktree’s dev services' : 'start this worktree’s dev services'}
+        title={
+          allUp
+            ? 'stop this worktree’s dev services'
+            : `start ${down.join(' + ')} (leaves any running service alone)`
+        }
         className="px-2 py-0.5 rounded border border-edge text-muted hover:text-ink disabled:opacity-40 shrink-0"
       >
-        {busy ? '…' : running ? 'stop' : 'start'}
+        {busy ? '…' : allUp ? 'stop' : 'start'}
       </button>
     </div>
   );
@@ -151,14 +205,17 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         .then((d) => d.chats as Chat[]),
     refetchInterval: 8000,
   });
-  // Live activity per terminal session (seconds idle) → working-pulse vs "needs you".
+  // Live activity per terminal session: `idle_sec` (output recency) drives the working-pulse;
+  // `needs` (claude's own Stop/Notification hook marker) drives "needs you".
   const { data: termData } = useQuery({
     queryKey: ['terminals'],
     queryFn: () =>
-      fetch('/api/terminals').then((r) => r.json()).then((d) => d.terminals as { chat_id: string; idle_sec: number }[]),
+      fetch('/api/terminals')
+        .then((r) => r.json())
+        .then((d) => d.terminals as { chat_id: string; idle_sec: number; needs: boolean }[]),
     refetchInterval: 2000,
   });
-  const idleById = new Map((termData ?? []).map((t) => [t.chat_id, t.idle_sec]));
+  const termById = new Map((termData ?? []).map((t) => [t.chat_id, t]));
   const taskChats = (chatList ?? []).filter((c) => c.cwd && worktreeSet.has(c.cwd));
 
   type Row = { id: string; title: string; cwd?: string | null; starred: boolean; last: number; mode?: 'chat' | 'terminal' | null };
@@ -288,9 +345,9 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         <div className="px-3 text-[11px] text-muted/70">{q ? `no matches for "${q}"` : `no ${tab} chats`}</div>
       )}
       {orderedRows.map((r) => {
-        const idle = idleById.get(r.id); // seconds since last PTY output (undefined = not live this run)
-        const working = idle != null && idle < WORKING_WITHIN_S; // recent output → claude is working
-        const needs = idle != null && !working && r.id !== activeSid; // live + quiet + not the one you're viewing
+        const t = termById.get(r.id); // live terminal activity (undefined = not running this loom session)
+        const working = t != null && t.idle_sec < WORKING_WITHIN_S; // recent output → claude is working
+        const needs = t != null && t.needs && !working && r.id !== activeSid; // claude's hook flagged a wait, it's quiet, and it's not the chat you're viewing
         return (
         <div
           key={r.id}

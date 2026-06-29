@@ -97,6 +97,16 @@ def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> T
     if not task:
         raise ValueError(f"unknown task '{task_id}'")
     ensure_dirs()
+    if only:
+        # Clean (re)start of just the named services: kill any existing instance first, so we
+        # never double-spawn a service that was only *reported* down (a stale/ping false-negative)
+        # — the freshly-bound port stays single. Services not in `only` are left running.
+        for svc in task.services:
+            if svc.name in only:
+                if svc.pid:
+                    process.kill_group(svc.pid)
+                if svc.port:
+                    process.kill_port(svc.port)
     procs: list[ServiceProc] = []
     for svc in cfg.services:
         if only and svc.name not in only:
@@ -114,7 +124,8 @@ def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> T
         procs.append(
             ServiceProc(name=svc.name, pid=pid, port=port, health_url=_render(svc.health, ctx) if svc.health else None)
         )
-    task.services = procs
+    # When starting a subset, keep the services we didn't touch + the ones we just (re)started.
+    task.services = ([s for s in task.services if s.name not in only] + procs) if only else procs
     task.state = TaskState.running
     return registry.upsert(task)
 

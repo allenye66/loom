@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useDoctor, useRepos, useTaskActions, type Repo } from './api';
+import { useDoctor, useRepos, useTasks, useTaskActions, type Repo } from './api';
 import { TasksView } from './components/TasksView';
 import { ChatsView } from './components/ChatsView';
 import { ChatProvider } from './chat/ChatContext';
@@ -42,6 +42,86 @@ function DoctorBadge() {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Header quick-action: type a branch (or worktree slug) and open its worktree in the
+ *  configured editor. Matches against loom's known worktrees; `/api/ide` opens the editor
+ *  ($LOOM_EDITOR / .loom.yaml `editor:` / Cursor) and verifies the dir exists. */
+function OpenWorktree() {
+  const { data: tasks } = useTasks();
+  const [branch, setBranch] = useState('');
+  const [state, setState] = useState<'idle' | 'opening' | 'notfound' | 'error'>('idle');
+  const flash = (s: 'notfound' | 'error') => {
+    setState(s);
+    setTimeout(() => setState('idle'), 2500);
+  };
+
+  const open = async () => {
+    const b = branch.trim();
+    if (!b) return;
+    const lb = b.toLowerCase();
+    const list = (tasks ?? []).filter((t) => t.state !== 'archived' && t.worktree_path);
+    // Exact branch/slug match first; else a *unique* substring match (forgiving but unambiguous).
+    let t = list.find((t) => t.branch.toLowerCase() === lb || t.id.toLowerCase() === lb);
+    if (!t) {
+      const m = list.filter((t) => t.branch.toLowerCase().includes(lb) || t.id.toLowerCase().includes(lb));
+      if (m.length === 1) t = m[0];
+    }
+    if (!t) {
+      flash('notfound');
+      return;
+    }
+    setState('opening');
+    try {
+      const r = await fetch('/api/ide', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cwd: t.worktree_path }),
+      });
+      if (!r.ok) throw new Error(String(r.status));
+      setState('idle');
+      setBranch('');
+    } catch {
+      flash('error');
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <input
+        value={branch}
+        onChange={(e) => {
+          setBranch(e.target.value);
+          if (state === 'notfound' || state === 'error') setState('idle');
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') open();
+        }}
+        placeholder="open branch in editor…"
+        list="loom-worktree-branches"
+        title="type a branch (or worktree slug) → opens that worktree in your editor"
+        className="mono text-xs px-2.5 py-1 rounded-md bg-surface border border-edge outline-none focus:border-accent w-44"
+      />
+      <datalist id="loom-worktree-branches">
+        {(tasks ?? []).filter((t) => t.state !== 'archived').map((t) => (
+          <option key={t.id} value={t.branch} />
+        ))}
+      </datalist>
+      <button
+        onClick={open}
+        disabled={state === 'opening' || !branch.trim()}
+        className={`text-xs mono px-2.5 py-1 rounded-md border bg-surface hover:bg-surface-2 disabled:opacity-40 shrink-0 ${
+          state === 'notfound'
+            ? 'border-warn/40 text-warn'
+            : state === 'error'
+              ? 'border-bad/40 text-bad'
+              : 'border-edge text-muted hover:text-ink'
+        }`}
+      >
+        {state === 'opening' ? '…' : state === 'notfound' ? 'no worktree' : state === 'error' ? 'failed' : '✎ open'}
+      </button>
     </div>
   );
 }
@@ -115,7 +195,10 @@ export default function App() {
               ))}
             </nav>
           </div>
-          <DoctorBadge />
+          <div className="flex items-center gap-3">
+            <OpenWorktree />
+            <DoctorBadge />
+          </div>
         </div>
       </header>
 
