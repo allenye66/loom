@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
@@ -73,7 +74,13 @@ def list_tasks(repo: str | None = None) -> dict:
     tasks = registry.list_tasks()
     if repo:
         tasks = [t for t in tasks if t.repo == repo]
-    views = [_view(t) for t in tasks]
+    # _view → refresh_status shells out git_status (+ health probes) per task; with many worktrees
+    # that's O(N) sequentially, so fan it out (cached results make most calls instant anyway).
+    if tasks:
+        with ThreadPoolExecutor(max_workers=min(12, len(tasks))) as ex:
+            views = list(ex.map(_view, tasks))
+    else:
+        views = []
     # Annotate each task with whether its worktree's most-recent chat is archived,
     # so the UI can split tasks into active vs archived.
     try:

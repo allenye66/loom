@@ -116,7 +116,7 @@ export function TerminalView({
   const { data: tasks } = useQuery({
     queryKey: ['tasks'],
     queryFn: () => fetch('/api/tasks').then((r) => r.json()).then((d) => d.tasks as Task[]),
-    refetchInterval: 2000,
+    refetchInterval: 4000,
   });
   const task = tasks?.find(
     (t) => t.worktree_path && (cwd === t.worktree_path || (cwd?.startsWith(t.worktree_path + '/') ?? false)),

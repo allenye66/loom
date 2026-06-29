@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -145,9 +146,26 @@ def stop_task(task_id: str) -> None:
     registry.upsert(task)
 
 
+# git_status + health probes are the bulk of `GET /api/tasks`, which the UI polls every few
+# seconds. With dozens of worktrees that's O(N) git shell-outs per request, so cache the result
+# briefly: a burst of polls reuses it instead of re-shelling git_status × N every time.
+_status_cache: dict[str, tuple[float, dict, dict]] = {}  # task_id -> (ts, git, {service: healthy})
+_STATUS_TTL = 4.0
+
+
 def refresh_status(task: Task) -> dict:
-    """Update in-memory health/liveness; return git status. Caller persists."""
+    """Update in-memory health/liveness; return git status. Cached per task for _STATUS_TTL so the
+    UI's frequent /api/tasks polling doesn't shell out git_status × N-worktrees on every request."""
+    now = time.monotonic()
+    hit = _status_cache.get(task.id)
+    if hit and now - hit[0] < _STATUS_TTL:
+        _, git, health = hit
+        for svc in task.services:
+            svc.healthy = bool(health.get(svc.name, False))
+        return git
     for svc in task.services:
         alive = process.is_alive(svc.pid) if svc.pid else False
         svc.healthy = process.health_check(svc.health_url) if (alive and svc.health_url) else alive
-    return wt.git_status(task.worktree_path) if Path(task.worktree_path).exists() else {}
+    git = wt.git_status(task.worktree_path) if Path(task.worktree_path).exists() else {}
+    _status_cache[task.id] = (now, git, {s.name: s.healthy for s in task.services})
+    return git
