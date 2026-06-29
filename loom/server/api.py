@@ -384,6 +384,22 @@ def open_ide(body: OpenIdeIn) -> dict:
     return {"opened": True}
 
 
+class ShellIn(BaseModel):
+    cwd: str
+
+
+@router.post("/shell")
+def open_shell(body: ShellIn) -> dict:
+    """Open a plain native shell (Terminal.app) at a directory — e.g. a worktree — WITHOUT
+    claude. The launcher drops the one-shot skip-autoclaude marker so a guarded ~/.zshrc won't
+    auto-start claude in the new window. For quick git/file pokes alongside the running agent."""
+    p = Path(body.cwd).expanduser()
+    if not p.is_dir():
+        raise HTTPException(400, f"no such directory: {body.cwd}")
+    opened = claude_session._launch(f"cd {shlex.quote(str(p))}", label=p.name, prefer="terminal")
+    return {"opened": opened}
+
+
 @router.get("/terminals")
 def list_terminals() -> dict:
     """Live terminal sessions + how long each has been idle — drives the sidebar's

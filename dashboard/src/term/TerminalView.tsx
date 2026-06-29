@@ -18,28 +18,71 @@ const THEME = {
 
 /** Open this terminal chat's SAME live tmux session in a native Terminal.app (tmux attach).
  *  No handoff needed — tmux supports the browser and the real terminal attached at once. */
-function OpenNativeTerminal({ chatId }: { chatId?: string }) {
-  const [state, setState] = useState<'idle' | 'opening' | 'error'>('idle');
+/** Dropdown to open a native Terminal for this worktree — either ATTACH to the live claude
+ *  session (tmux attach; both stay in sync) or open a PLAIN SHELL in the worktree (no claude). */
+function OpenTerminalMenu({ chatId, cwd }: { chatId?: string; cwd?: string }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
   if (!chatId) return null;
-  const go = async () => {
-    setState('opening');
+
+  const run = async (which: 'claude' | 'shell') => {
+    setOpen(false);
+    setBusy(true);
+    setErr(false);
     try {
-      const r = await fetch(`/api/terminals/${chatId}/open-native`, { method: 'POST' });
-      setState(r.ok ? 'idle' : 'error');
+      const r =
+        which === 'claude'
+          ? await fetch(`/api/terminals/${chatId}/open-native`, { method: 'POST' })
+          : await fetch('/api/shell', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ cwd }),
+            });
+      setErr(!r.ok);
     } catch {
-      setState('error');
+      setErr(true);
     }
-    setTimeout(() => setState('idle'), 2000);
+    setBusy(false);
+    setTimeout(() => setErr(false), 2500);
   };
+
   return (
-    <button
-      onClick={go}
-      disabled={state === 'opening'}
-      title="open this same live session in a native Terminal (tmux attach — both stay in sync)"
-      className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 shrink-0 disabled:opacity-50"
-    >
-      {state === 'opening' ? 'opening…' : state === 'error' ? 'no terminal' : '⧉ terminal'}
-    </button>
+    <div ref={ref} className="relative shrink-0">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        disabled={busy}
+        title="open a native Terminal — the live claude session, or a plain shell in this worktree"
+        className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 disabled:opacity-50"
+      >
+        {busy ? 'opening…' : err ? 'failed' : '⧉ terminal ▾'}
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-20 w-56 rounded-md border border-edge bg-surface shadow-xl overflow-hidden">
+          <button onClick={() => run('claude')} className="w-full text-left px-3 py-2 hover:bg-surface-2 flex flex-col gap-0.5">
+            <span className="text-[11px] mono text-ink">❯ attach claude</span>
+            <span className="text-[10px] text-muted">the live session — tmux attach, stays in sync</span>
+          </button>
+          <button
+            onClick={() => run('shell')}
+            disabled={!cwd}
+            className="w-full text-left px-3 py-2 hover:bg-surface-2 border-t border-edge flex flex-col gap-0.5 disabled:opacity-40"
+          >
+            <span className="text-[11px] mono text-ink">$ plain shell</span>
+            <span className="text-[10px] text-muted">no claude — a shell in this worktree</span>
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -344,7 +387,7 @@ export function TerminalView({
             >
               copy text
             </button>
-            <OpenNativeTerminal chatId={resume} />
+            <OpenTerminalMenu chatId={resume} cwd={cwd} />
             <OpenInIde cwd={cwd} />
             <button
               onClick={onClose}
