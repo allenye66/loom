@@ -63,8 +63,15 @@ def kill_group(pid: int, timeout: float = 5.0) -> None:
 
 
 def kill_port(port: int) -> None:
-    """Port-scoped cleanup: kill whatever owns this port (and only this port)."""
-    out = subprocess.run(["lsof", "-ti", f"tcp:{port}"], capture_output=True, text=True)
+    """Kill the process *listening* on this port (and only it).
+
+    CRITICAL: restrict to LISTEN sockets. `lsof -i tcp:PORT` matches any socket whose local OR
+    peer port is PORT — so without `-sTCP:LISTEN` it also returns loom itself (its health-check
+    connections to a dev server) and the browser, and `kill_group` would then SIGTERM loom's own
+    process group, taking the server down. With the supervisor calling this on every restart that
+    self-kill happened constantly.
+    """
+    out = subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"], capture_output=True, text=True)
     for pid in out.stdout.split():
         try:
             kill_group(int(pid))

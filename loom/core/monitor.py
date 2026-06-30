@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 
 from loom.core import manager, process, registry, terminals
 from loom.core.config import load_repo_config
@@ -25,6 +26,10 @@ _INTERVAL = float(os.environ.get("LOOM_SUPERVISE_INTERVAL", "15"))  # seconds be
 # Don't supervise these: `stopped` = you stopped it (respect it); error/archived/created have no
 # usable, ready worktree to run a stack in.
 _SKIP_STATES = {"stopped", "error", "archived", "created"}
+# After (re)starting a task's services, leave it alone for a bit — a dev server takes time to come
+# up, so probing it as "down" on the next sweep and restarting again just thrashes.
+_RESTART_COOLDOWN = 60.0
+_last_restart: dict[str, float] = {}
 
 
 def _down_services(task, cfg) -> list[str]:
@@ -61,12 +66,16 @@ def _sweep() -> None:
         down = _down_services(task, cfg)
         if not down:
             continue
+        # Cooldown: give a just-(re)started service time to come up instead of restarting it again.
+        if time.monotonic() - _last_restart.get(task.id, 0.0) < _RESTART_COOLDOWN:
+            continue
         # Re-read state right before acting, to narrow the race with a concurrent user `stop`.
         fresh = registry.get_task(task.id)
         if not fresh or fresh.state.value in _SKIP_STATES:
             continue
         with contextlib.suppress(Exception):
             manager.start_task(cfg, task.id, only=set(down))
+            _last_restart[task.id] = time.monotonic()
             print(f"[loom supervisor] {task.id}: restarted {', '.join(down)}", flush=True)
 
 
