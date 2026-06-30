@@ -162,7 +162,11 @@ class TerminalSession:
         # the screen (xterm only sees its alternate buffer), so without it the scroll wheel
         # hits xterm's empty scrollback instead of tmux's history. set-clipboard routes copies
         # to the browser clipboard via OSC 52; status off / aggressive-resize keep it clean.
-        for opt in (["status", "off"], ["destroy-unattached", "off"], ["mouse", "on"], ["set-clipboard", "on"]):
+        # `window-size latest` = the pane follows the most-recently-active client (the browser PTY
+        # while you type), so a stale/smaller second client (e.g. a native `tmux attach`) can't pin
+        # the width and desync it from xterm — a width mismatch is what garbles the input line.
+        for opt in (["status", "off"], ["destroy-unattached", "off"], ["mouse", "on"],
+                    ["set-clipboard", "on"], ["window-size", "latest"]):
             subprocess.run([tm, "set-option", "-t", self.session, *opt], capture_output=True)
         subprocess.run([tm, "setw", "-t", self.session, "aggressive-resize", "on"], capture_output=True)
 
@@ -190,6 +194,25 @@ class TerminalSession:
         self.master_fd = master
         loop.add_reader(master, self._on_readable)
         self._pump = asyncio.create_task(self._drain())
+        # Force claude to re-read the terminal width once it's up — see _resync_size.
+        loop.call_later(2.5, self._resync_size)
+
+    def _resync_size(self) -> None:
+        """Nudge the PTY winsize by one column (→ two SIGWINCHes via tmux) so claude's Ink TUI
+        recomputes line-wrap at the *current* width. A resize that lands before claude installs its
+        SIGWINCH handler at startup is silently lost, leaving Ink laying out for a stale width — the
+        cause of the input line wrapping at the wrong column. A plain repaint can't fix that; only a
+        real size change makes Ink recompute. Cheap + idempotent; safe to call on every attach."""
+        fd = self.master_fd
+        if fd is None or self._closed:
+            return
+        _set_winsize(fd, self.rows, max(self.cols - 1, 1))  # shrink 1 col → SIGWINCH
+        if self._loop:
+            self._loop.call_later(0.15, self._restore_size)  # then restore → second SIGWINCH
+
+    def _restore_size(self) -> None:
+        if self.master_fd is not None and not self._closed:
+            _set_winsize(self.master_fd, self.rows, self.cols)
 
     def _on_readable(self) -> None:
         try:

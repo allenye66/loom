@@ -190,11 +190,6 @@ export function TerminalView({
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(holderRef.current!);
-    try {
-      fit.fit();
-    } catch {
-      /* container not measured yet */
-    }
     term.focus();
 
     let ws: WebSocket | null = null;
@@ -257,7 +252,20 @@ export function TerminalView({
       };
     };
 
-    connect();
+    // Defer the FIRST fit + connect until the browser has laid out the flex container. Fitting
+    // before layout reports a wrong `cols`, and that first value is what creates the tmux session
+    // (and launches claude) at the wrong width → claude's input line then wraps at the wrong
+    // column (the "text jumps to the next row / garbles" bug). A rAF runs after layout; the
+    // ResizeObserver below still catches any later size changes.
+    requestAnimationFrame(() => {
+      if (disposed) return;
+      try {
+        fit.fit();
+      } catch {
+        /* container not measured yet */
+      }
+      connect();
+    });
 
     // Drive scrollback deterministically: translate the browser wheel into tmux mouse-wheel
     // events ourselves and tell xterm to ignore it (return false). The xterm<->tmux mouse-mode
