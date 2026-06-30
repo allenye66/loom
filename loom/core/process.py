@@ -47,6 +47,12 @@ def kill_group(pid: int, timeout: float = 5.0) -> None:
         pgid = os.getpgid(pid)
     except ProcessLookupError:
         return
+    # NEVER signal loom's OWN process group. A stale/reused pid — e.g. a short-lived `lsof`/`tmux`/
+    # `git` helper loom spawned via subprocess.run (which shares loom's group, no setsid) that
+    # happened to land on a dead service's pid — would otherwise make killpg SIGTERM loom itself.
+    # That's the "something keeps killing my loom" self-shutdown.
+    if pgid == os.getpgrp():
+        return
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:

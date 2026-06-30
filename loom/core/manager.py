@@ -99,15 +99,13 @@ def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> T
         raise ValueError(f"unknown task '{task_id}'")
     ensure_dirs()
     if only:
-        # Clean (re)start of just the named services: kill any existing instance first, so we
-        # never double-spawn a service that was only *reported* down (a stale/ping false-negative)
-        # — the freshly-bound port stays single. Services not in `only` are left running.
+        # Clean (re)start of just the named services: free their port from whatever is actually
+        # LISTENING now (kill_port is LISTEN-only). Do NOT kill_group(svc.pid) — a stored pid can be
+        # stale/reused and the supervisor calls this on a loop, so acting on current port state
+        # (not a remembered pid) avoids killing an unrelated process. Other services stay running.
         for svc in task.services:
-            if svc.name in only:
-                if svc.pid:
-                    process.kill_group(svc.pid)
-                if svc.port:
-                    process.kill_port(svc.port)
+            if svc.name in only and svc.port:
+                process.kill_port(svc.port)
     procs: list[ServiceProc] = []
     for svc in cfg.services:
         if only and svc.name not in only:
