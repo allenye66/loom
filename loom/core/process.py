@@ -85,7 +85,10 @@ def kill_port(port: int) -> None:
             pass
 
 
-def health_check(url: str, timeout: float = 2.0) -> bool:
+def health_check(url: str, timeout: float = 1.0) -> bool:
+    # 1s is plenty for a local dev server (responds in <100ms); a down port refuses instantly.
+    # The timeout only bites on a hung/half-open port, and this runs on the background sweep for
+    # every running task — a longer wait there just wastes the sweep's time budget.
     try:
         return httpx.get(url, timeout=timeout, follow_redirects=True).status_code < 500
     except Exception:

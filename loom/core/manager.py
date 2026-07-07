@@ -144,26 +144,83 @@ def stop_task(task_id: str) -> None:
     registry.upsert(task)
 
 
-# git_status + health probes are the bulk of `GET /api/tasks`, which the UI polls every few
-# seconds. With dozens of worktrees that's O(N) git shell-outs per request, so cache the result
-# briefly: a burst of polls reuses it instead of re-shelling git_status × N every time.
+# git_status + health probes are the bulk of `GET /api/tasks` — and with dozens of worktrees they
+# were O(N) git shell-outs (3 spawns each) + HTTP health probes ON THE REQUEST PATH, every poll.
+# That storm ran in the server threadpool and starved the asyncio loop that drives the terminal
+# PTY (measured: /api/tasks taking 4–21s, with matching event-loop stalls → laggy typing).
+#
+# Now the probing runs OFF the request path: a background sweeper (server lifespan) calls
+# refresh_status_all() every few seconds to warm this cache; refresh_status() (request path) only
+# READS it and never shells out. So /api/tasks is just cache reads + a warm build_index.
 _status_cache: dict[str, tuple[float, dict, dict]] = {}  # task_id -> (ts, git, {service: healthy})
-_STATUS_TTL = 4.0
+# `git status` on these worktrees runs 0.5–9s each (large trees on disk), so re-probing all N every
+# sweep would keep git churning the disk continuously. Skip any task whose cache is younger than
+# this — the sweeper then only refreshes the stale ones each tick, spreading the load.
+_MIN_REFRESH_AGE = 15.0
+
+
+def _probe(task: Task, *, git: bool = True) -> None:
+    """Liveness/health (+ optionally git) probe for one task → writes _status_cache. Runs on the
+    background sweeper thread, never the request path. `git=False` skips the slow `git status`
+    worktree walk and keeps whatever git value was last cached — used for running-but-not-open
+    tasks, where we still want a live health dot but the branch/dirty state isn't worth re-walking."""
+    for svc in task.services:
+        alive = process.is_alive(svc.pid) if svc.pid else False
+        svc.healthy = process.health_check(svc.health_url) if (alive and svc.health_url) else alive
+    if git and Path(task.worktree_path).exists():
+        git_val = wt.git_status(task.worktree_path)
+    else:
+        prev = _status_cache.get(task.id)
+        git_val = prev[1] if prev else {}  # keep last-known git when not re-walking
+    _status_cache[task.id] = (time.monotonic(), git_val, {s.name: s.healthy for s in task.services})
+
+
+def _safe_probe(task: Task, *, git: bool = True) -> None:
+    try:
+        _probe(task, git=git)
+    except Exception:  # noqa: BLE001 — one bad worktree must not stop the sweep
+        pass
+
+
+def sweep_status(tasks: list[Task], active_cwds: set[str], cold_batch: int = 3) -> None:
+    """Background status sweep — the ONLY place `git status` runs (never the request path).
+
+    The slow part is `git status`, which on these worktrees takes 0.5–9s each; re-walking all N
+    every tick was the CPU/disk storm that starved the terminal loop. So we walk git only for
+    worktrees with an **open terminal session** (`active_cwds`) — the ones you're actually looking
+    at — throttled to `_MIN_REFRESH_AGE`. Running-but-not-open tasks get a cheap health-only refresh
+    (dev-stack dot stays live) with NO git walk. Idle tasks get a one-time cold fill (`cold_batch`
+    per sweep) so their cards aren't blank, then keep that value until you open them.
+
+    Sequential on purpose — subprocess.run releases the GIL while git runs, so one-at-a-time lets
+    the event loop breathe between spawns (a 12-wide fan-out was itself a GIL storm)."""
+    now = time.monotonic()
+    cold = 0
+    for task in tasks:
+        cached = _status_cache.get(task.id)
+        fresh = cached is not None and now - cached[0] < _MIN_REFRESH_AGE
+        if task.worktree_path in active_cwds:
+            if not fresh:
+                _safe_probe(task, git=True)  # open terminal → keep git fresh
+        elif task.services:
+            if not fresh:
+                _safe_probe(task, git=False)  # running stack → health only, skip the slow git walk
+        elif cached is None and cold < cold_batch:
+            _safe_probe(task, git=True)  # idle + never probed → fill once so the card isn't blank
+            cold += 1
 
 
 def refresh_status(task: Task) -> dict:
-    """Update in-memory health/liveness; return git status. Cached per task for _STATUS_TTL so the
-    UI's frequent /api/tasks polling doesn't shell out git_status × N-worktrees on every request."""
-    now = time.monotonic()
+    """Request path: return the sweeper's cached git status + apply cached service health. Never
+    shells out. Returns {} (git unknown) until the first background sweep warms the cache — a
+    brief cold-start window, not a per-request cost."""
     hit = _status_cache.get(task.id)
-    if hit and now - hit[0] < _STATUS_TTL:
+    if hit:
         _, git, health = hit
         for svc in task.services:
             svc.healthy = bool(health.get(svc.name, False))
         return git
+    # Not warmed yet — cheap PID liveness only (no git subprocess, no HTTP health probe).
     for svc in task.services:
-        alive = process.is_alive(svc.pid) if svc.pid else False
-        svc.healthy = process.health_check(svc.health_url) if (alive and svc.health_url) else alive
-    git = wt.git_status(task.worktree_path) if Path(task.worktree_path).exists() else {}
-    _status_cache[task.id] = (now, git, {s.name: s.healthy for s in task.services})
-    return git
+        svc.healthy = process.is_alive(svc.pid) if svc.pid else False
+    return {}

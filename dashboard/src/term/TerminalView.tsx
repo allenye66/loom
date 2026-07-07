@@ -275,7 +275,8 @@ export function TerminalView({
     // SCROLL_STEP_PX, rather than forcing >=1 notch per raw wheel event. Trackpad momentum
     // fires a flood of tiny events, so the old per-event minimum flew through the buffer;
     // accumulating decouples scroll speed from event count. Larger SCROLL_STEP_PX = less sensitive.
-    const SCROLL_STEP_PX = 80;
+    const SCROLL_STEP_PX = 40; // px of wheel travel per tmux scroll notch — lower = more sensitive
+    const MAX_NOTCHES_PER_EVENT = 6; // cap per DOM wheel event so a fast flick still can't flood tmux
     let wheelAccum = 0;
     term.attachCustomWheelEventHandler((e) => {
       const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 800 : e.deltaY;
@@ -286,7 +287,7 @@ export function TerminalView({
       if (notches !== 0) {
         wheelAccum -= notches * SCROLL_STEP_PX;
         const seq = notches < 0 ? '\x1b[<64;1;1M' : '\x1b[<65;1;1M'; // SGR wheel up / down
-        for (let i = 0; i < Math.min(Math.abs(notches), 3); i++) send({ type: 'input', data: seq });
+        for (let i = 0; i < Math.min(Math.abs(notches), MAX_NOTCHES_PER_EVENT); i++) send({ type: 'input', data: seq });
         scheduleRepaint(); // self-heal any tear once scrolling stops
       }
       return false;

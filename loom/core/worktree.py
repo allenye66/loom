@@ -53,13 +53,24 @@ def git_status(worktree_path: str) -> dict:
     # --no-optional-locks: this runs on loom's poll loop, so it must never take git's index
     # lock — otherwise a poll can collide with the user's own `git add`/`commit` in the same
     # worktree ("Unable to create '…/index.lock': File exists").
-    g = ["git", "--no-optional-locks"]
-    dirty = bool(_run([*g, "status", "--porcelain"], cwd=worktree_path).stdout.strip())
-    branch = _run([*g, "rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree_path).stdout.strip()
-    ab = _run([*g, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"], cwd=worktree_path)
+    #
+    # ONE `status --porcelain=v2 --branch` instead of the old three spawns (status + rev-parse +
+    # rev-list): with dozens of worktrees polled continuously, 3× the git process spawns was a
+    # major source of the CPU/GIL storm that starved the terminal event loop. v2 --branch carries
+    # branch + ahead/behind (`# branch.ab +A -B`) + dirtiness (any non-`#` line) in a single call.
+    cp = _run(["git", "--no-optional-locks", "status", "--porcelain=v2", "--branch"], cwd=worktree_path)
+    branch = ""
     ahead = behind = 0
-    if ab.returncode == 0 and ab.stdout.strip():
-        parts = ab.stdout.split()
-        if len(parts) == 2:
-            behind, ahead = int(parts[0]), int(parts[1])
+    dirty = False
+    for line in cp.stdout.splitlines():
+        if line.startswith("# branch.head "):
+            branch = line[14:].strip()
+        elif line.startswith("# branch.ab "):
+            for p in line[12:].split():
+                if p.startswith("+"):
+                    ahead = int(p[1:])
+                elif p.startswith("-"):
+                    behind = int(p[1:])
+        elif line and not line.startswith("#"):
+            dirty = True
     return {"branch": branch, "dirty": dirty, "ahead": ahead, "behind": behind}
