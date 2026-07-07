@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -17,7 +18,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from loom import __version__
-from loom.core import claude_session, doctor, github, manager, registry, repos, sessions, terminals
+from loom.core import claude_session, doctor, github, manager, perf, registry, repos, sessions, terminals
 from loom.core.config import LOGS_DIR, LOOM_HOME, load_repo_config
 from loom.core.tests import build_test_run, serialize_lock
 
@@ -33,9 +34,22 @@ def health() -> dict:
     return {"ok": True, "version": __version__}
 
 
+# doctor shells out to `gh auth status` (up to a 10s network timeout) + `docker info` + several
+# `which` lookups — 3–9s per call in practice, and the UI polls it. These results barely change,
+# so cache them: a slow probe runs at most once per _DOCTOR_TTL instead of on every poll.
+_doctor_cache: tuple[float, dict] | None = None
+_DOCTOR_TTL = 120.0
+
+
 @router.get("/doctor")
 def get_doctor() -> dict:
-    return {"checks": doctor.run_checks()}
+    global _doctor_cache
+    now = time.monotonic()
+    if _doctor_cache and now - _doctor_cache[0] < _DOCTOR_TTL:
+        return _doctor_cache[1]
+    result = {"checks": doctor.run_checks()}
+    _doctor_cache = (now, result)
+    return result
 
 
 # --- repos --------------------------------------------------------------------
@@ -480,7 +494,8 @@ async def term_ws(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "message": str(e)})
             await websocket.close()
         return
-    await ts.subscribe(websocket)
+    perf.log(f"WS open {chat_id} subs={len(ts.subscribers) + 1}")
+    await ts.subscribe(websocket)  # forces a full tmux redraw for the newcomer
     try:
         while True:
             m = await websocket.receive_json()
@@ -490,10 +505,17 @@ async def term_ws(websocket: WebSocket) -> None:
             elif t == "resize":
                 ts.resize(int(m.get("cols") or cols), int(m.get("rows") or rows))
             elif t == "repaint":
+                perf.log(f"WS repaint {chat_id}")  # full redraw — a burst here == flicker on typing
                 await ts.repaint()  # force a clean tmux redraw (clears scroll/resize tearing)
             elif t == "ping":
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         pass
+    except RuntimeError:
+        # An abnormal close (browser reload / dropped socket) can surface as receive_json()
+        # raising "WebSocket is not connected" instead of WebSocketDisconnect — same meaning
+        # (the client is gone), so treat it as a normal disconnect rather than a 500.
+        pass
     finally:
         ts.unsubscribe(websocket)
+        perf.log(f"WS close {chat_id} subs={len(ts.subscribers)}")

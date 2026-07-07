@@ -53,8 +53,24 @@ def _write_json(path: Path, data) -> None:
 
 
 # --- overlay (user-owned state) ----------------------------------------------
+# mtime/size-keyed cache of the parsed overlay. `get_overlay` was called once PER CHAT from
+# `_merge` (so `list_chats` re-read + re-parsed chats.json N times per request) — a big GIL-bound
+# cost that starved the terminal's event loop. Reads reuse this until the file changes.
+_overlay_cache: tuple[tuple[float, int], dict] | None = None
+
+
 def overlay_all() -> dict:
-    return _read_json(OVERLAY_PATH, {})
+    global _overlay_cache
+    try:
+        st = OVERLAY_PATH.stat()
+    except OSError:
+        return {}
+    key = (st.st_mtime, st.st_size)
+    if _overlay_cache is not None and _overlay_cache[0] == key:
+        return _overlay_cache[1]
+    data = _read_json(OVERLAY_PATH, {})
+    _overlay_cache = (key, data)
+    return data
 
 
 def get_overlay(sid: str) -> dict:
@@ -62,11 +78,13 @@ def get_overlay(sid: str) -> dict:
 
 
 def set_overlay(sid: str, patch: dict) -> dict:
-    data = overlay_all()
+    global _overlay_cache
+    data = _read_json(OVERLAY_PATH, {})  # fresh read → never mutate the cached dict in place
     cur = data.get(sid, {})
     cur.update(patch)
     data[sid] = cur
     _write_json(OVERLAY_PATH, data)
+    _overlay_cache = None  # invalidate; next overlay_all() reloads what we just wrote
     return cur
 
 
@@ -189,22 +207,34 @@ def build_index(force: bool = False) -> list[dict]:
 
 # --- repo / task linkage ------------------------------------------------------
 def _repo_task_for_cwd(cwd: str | None) -> tuple[str | None, str | None]:
-    if not cwd:
+    return _cwd_resolver()(cwd)
+
+
+def _cwd_resolver():
+    """Build a cwd → (repo, task_id) resolver ONCE. `list_chats` maps N chats through this;
+    doing the registry/repo lookup per chat (the old `_repo_task_for_cwd`) re-read the task
+    registry + repo list N times per request — the dominant cost of listing chats. Snapshot
+    both lists here, then resolve each chat against the in-memory snapshot."""
+    tasks = [(t.worktree_path.rstrip("/"), t.repo, t.id) for t in registry.list_tasks() if t.worktree_path]
+    roots = [(r["root"].rstrip("/"), r["name"]) for r in repos_mod.list_repos()]
+
+    def resolve(cwd: str | None) -> tuple[str | None, str | None]:
+        if not cwd:
+            return None, None
+        for wp, repo, tid in tasks:
+            if cwd == wp or cwd.startswith(wp + "/"):
+                return repo, tid
+        for root, name in roots:
+            if cwd == root or cwd.startswith(root + "/"):
+                return name, None
         return None, None
-    for t in registry.list_tasks():
-        wp = t.worktree_path.rstrip("/")
-        if cwd == wp or cwd.startswith(wp + "/"):
-            return t.repo, t.id
-    for r in repos_mod.list_repos():
-        root = r["root"].rstrip("/")
-        if cwd == root or cwd.startswith(root + "/"):
-            return r["name"], None
-    return None, None
+
+    return resolve
 
 
-def _merge(s: dict) -> dict:
+def _merge(s: dict, resolve=None) -> dict:
     ov = get_overlay(s["id"])
-    repo_name, task_id = _repo_task_for_cwd(s.get("cwd"))
+    repo_name, task_id = (resolve or _repo_task_for_cwd)(s.get("cwd"))
     title = ov.get("name") or s.get("title") or (s.get("first_prompt") or "")[:64] or s["id"][:8]
     return {
         **s,
@@ -245,7 +275,8 @@ def list_chats(
     branch: str | None = None,
     starred: bool | None = None,
 ) -> list[dict]:
-    rows = [_merge(s) for s in build_index()]
+    resolve = _cwd_resolver()  # snapshot task/repo lists once, not once per chat
+    rows = [_merge(s, resolve) for s in build_index()]
 
     if scope == "repo" and repo:
         rows = [r for r in rows if r["repo"] == repo]
