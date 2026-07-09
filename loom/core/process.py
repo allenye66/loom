@@ -15,6 +15,11 @@ from pathlib import Path
 
 import httpx
 
+# Pids spawned by THIS loom process. A pid loaded from the registry was recorded by an
+# EARLIER loom run and may have been reused by an unrelated process since — teardown paths
+# use spawned_this_run() to decide "trust the pid" (group-kill) vs "act on current port state".
+_spawned_this_run: set[int] = set()
+
 
 def spawn(command: str, cwd: str, env: dict[str, str], log_path: str) -> int:
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -29,7 +34,14 @@ def spawn(command: str, cwd: str, env: dict[str, str], log_path: str) -> int:
         stderr=subprocess.STDOUT,
         start_new_session=True,  # own process group
     )
+    _spawned_this_run.add(proc.pid)
     return proc.pid
+
+
+def spawned_this_run(pid: int) -> bool:
+    """True iff this loom process spawned `pid` via spawn() — i.e. the pid is safe to
+    group-kill without risking a reused pid that now belongs to someone else."""
+    return pid in _spawned_this_run
 
 
 def is_alive(pid: int) -> bool:

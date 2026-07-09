@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import time
 import uuid
@@ -11,7 +12,7 @@ from pathlib import Path
 from loom.core import ports as ports_mod
 from loom.core import process, registry
 from loom.core import worktree as wt
-from loom.core.config import DEFAULT_WORKTREE_BASE, LOGS_DIR, RepoConfig, ensure_dirs
+from loom.core.config import DEFAULT_WORKTREE_BASE, LOGS_DIR, LOOM_HOME, RepoConfig, ensure_dirs
 from loom.models import ServiceProc, Task, TaskState
 
 
@@ -84,6 +85,10 @@ def remove_task(task_id: str, force: bool = False) -> None:
     if not task:
         return
     stop_task(task_id)
+    # Per-task scratch caches live under ~/.loom/cache/<task_id>/ (a repo's .loom.yaml points
+    # tools there via {slug}, e.g. the per-worktree vite dep cache) — they die with the task,
+    # so caches can't outlive their worktrees and quietly pile up.
+    shutil.rmtree(LOOM_HOME / "cache" / task_id, ignore_errors=True)
     try:
         wt.remove_worktree(task.repo_root, task.worktree_path, force=force)
     except Exception:
@@ -134,7 +139,11 @@ def stop_task(task_id: str) -> None:
     if not task:
         return
     for svc in task.services:
-        if svc.pid:
+        # Trust a stored pid only if THIS process spawned it: a pid recorded by an earlier
+        # loom run may have been reused by an unrelated process by now (the reaper acts on
+        # weeks-old records). For those, the port kill below — current LISTEN state, same
+        # policy as start_task's `only=` path — is the safe teardown.
+        if svc.pid and process.spawned_this_run(svc.pid):
             process.kill_group(svc.pid)
         if svc.port:
             process.kill_port(svc.port)
