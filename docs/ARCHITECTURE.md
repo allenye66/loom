@@ -11,14 +11,16 @@ Browser (React dashboard)
   ▼                               ▼
 FastAPI app (loom/server)  ──────────────────────────────┐
   ├── REST API (tasks, repos, chats, transcript, doctor)  │
-  └── TerminalSession per chat ── PTY ── tmux ── `claude` ─┘  (one per chat)
+  └── one session per chat, two hosts:                    │
+        pty (default) ── AF_UNIX ── pty_server daemon ── `claude` (inline)
+        tmux (classic) ── PTY ──── tmux `loomx-<id>` ─── `claude` (fullscreen)
         │
 loom/core (logic)                      ~/.loom/ (state, gitignored)
   ├── manager  → worktree, ports,        ├── registry.json     (tasks)
   │             process, tests           ├── chats.json        (chat overlay)
   ├── sessions → ~/.claude transcripts   ├── sessions_index.json(chat index cache)
-  ├── terminals → tmux/PTY bridge        ├── repos.json        (registered repos)
-  └── registry/repos → JSON stores       ├── trash/  logs/  worktrees/
+  ├── terminals → pty/tmux bridge        ├── repos.json        (registered repos)
+  └── registry/repos → JSON stores       ├── trash/ logs/ worktrees/ pty-sockets/
 ```
 
 loom manages two things: **worktree tasks** (isolated dev/test stacks) and
@@ -44,7 +46,8 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `core/sessions.py` | **Chat manager**: index `~/.claude/projects/**/*.jsonl` (mtime-cached), merge a local overlay, search, soft-trash, and `get_transcript()` (reconstruct a session into render items). |
 | `core/runtime.py` | Per-worktree runtime context: if a session's cwd is inside a worktree, build its `LOOM_*` env (ports/log dir) + the `<loom-runtime>` system-prompt note. Project-agnostic. |
 | `core/claude_session.py` | Native launcher (`open_session`/`resume_session` via tmux/Terminal.app). Powers the `loom claude` CLI and the `⧉ terminal` (native attach) button. |
-| `core/terminals.py` | **The chat surface**: the *real* `claude` TUI in the browser. Runs `claude` in a per-chat **tmux** session (`loomx-<chat_id>`) and bridges its PTY to WebSocket subscribers as raw bytes (xterm.js renders them). tmux makes it survive loom restarts + browser disconnects. Uses `core/runtime.py` for the worktree env + system-prompt note. |
+| `core/terminals.py` | **The chat surface**: the *real* `claude` TUI in the browser, bridged to WebSocket subscribers as raw bytes (xterm.js renders them). Two hosts behind one interface: `PtyTerminalSession` (default, "smooth scroll" — a detached `pty_server` daemon, inline renderer, xterm owns scrollback) and `TmuxTerminalSession` ("classic" — fullscreen `claude` in `loomx-<chat_id>`). Both survive loom restarts + browser disconnects; per-chat choice in the overlay (`terminal_backend`), switchable via kill + `--resume`. Uses `core/runtime.py` for the worktree env + system-prompt note. |
+| `core/pty_server.py` | The pty backend's **persistence daemon**: runs one command under a PTY on an AF_UNIX socket, detached (`start_new_session`) so it outlives loom. Escape-protocol relay (`\x1c` framing: resize / snapshot / literal), 1 MB replay ring (alt-screen-filtered on replay), DA1/DA2 interception (answers device-attribute queries itself so xterm's auto-reply can't echo as garbage), and settle-aware snapshots (waits for the TUI to go quiescent before capturing). Stdlib-only; runnable standalone as `python -m loom.core.pty_server`. |
 
 ## Frontend code map (`dashboard/src/`)
 
@@ -57,7 +60,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `components/ChatsView.tsx` | Chat manager UI: Active/Archived/Trash tabs, ★ starred, search, inline rename/tag, keyboard nav; `open` (→ terminal chat, resume). |
 | `chat/ChatContext.tsx` | `ChatProvider` + `useOpenChat()` — opens a full-screen `TerminalView` overlay; restores `?chat=<id>` on load. |
 | `chat/ChatSidebar.tsx` | The per-worktree chat rail (`ChatSidebar`) + the in-chat `DevStackBar` and `OpenInIde` button. Shared by the terminal overlay. |
-| `term/TerminalView.tsx` | The terminal overlay: xterm.js bound to `/api/ws/term`, wheel→tmux scroll, image drop, selectable copy-text panel, `⧉ terminal` native attach. |
+| `term/TerminalView.tsx` | The terminal overlay: xterm.js bound to `/api/ws/term`. Branches on the server-reported backend — pty: smooth wheel scroll over xterm's own scrollback, snap-to-bottom on input, `snapshot-start/end` bracketed repaints (reset + atomic rewrite); tmux: wheel→SGR forwarding + tmux redraws. Plus renderer switcher, image drop, selectable copy-text panel, `⧉ terminal` native attach (tmux only). |
 
 ## Data flows
 
@@ -78,20 +81,36 @@ to `~/.loom/trash/`. See `SESSIONS_DESIGN.md`.
 ### Terminal chat (`/api/ws/term` ↔ `core/terminals.py`)
 
 The in-browser chat is the **actual** interactive `claude` CLI, so every slash
-command / permission prompt / feature works with zero reimplementation. A
-`TerminalSession` runs
+command / permission prompt / feature works with zero reimplementation. Each chat
+runs
 
 ```
-claude --effort max --settings '{"tui":"fullscreen","theme":"dark"}'
+claude --effort max --permission-mode acceptEdits --settings '{...theme,hooks[,tui]}'
        [--append-system-prompt <loom-runtime note>] (--resume|--session-id <chat_id>)
 ```
 
-inside a tmux session (`loomx-<chat_id>`) and holds one PTY attached to it, fanning
-its bytes out to N WebSocket subscribers. **tmux is the persistence layer**: the
-session outlives the loom server (no hot-reload → every backend edit restarts it)
-and any browser; reattach is just `tmux attach`. The chat's `cwd` and worktree
-ports/logs come from `core/runtime.py`; the chat id is the stable `~/.claude`
-session id, so terminal output and the indexed transcript are the same conversation.
+under one of two hosts (per-chat `terminal_backend` overlay field; default `pty`):
+
+- **pty** ("smooth scroll"): a detached `core/pty_server.py` daemon owns the PTY on
+  `~/.loom/pty-sockets/loomx-<id>.sock` and outlives loom restarts. claude uses its
+  default **inline** renderer (no `tui:fullscreen`, no alt-screen), so xterm.js owns a
+  real scrollback — native smooth scroll and drag-select/copy, and no Ink↔tmux↔xterm
+  width desync to garble text. Repaint/reconnect use the daemon's **settled snapshot**,
+  which loom brackets to the browser as `snapshot-start`/`snapshot-end` (the client
+  resets and applies it atomically).
+- **tmux** ("classic"): fullscreen `claude` inside `loomx-<chat_id>`, loom attached via
+  one PTY. tmux owns the screen (xterm only sees the alt buffer), so the browser
+  forwards the wheel as SGR mouse events and repaints are `refresh-client` redraws.
+  Kept as a fallback during the pty migration; also what native `tmux attach` shares.
+
+Both hosts are the persistence layer (the loom server has no hot-reload → every
+backend edit restarts it). Switching an existing chat = kill the host + relaunch with
+`--resume` (`POST /terminals/{chat_id}/backend`): the conversation lives in the
+transcript, so only the live process restarts. Chats that already had a live tmux
+session before the pty default keep tmux until switched (never two claudes on one
+session id). The chat's `cwd` and worktree ports/logs come from `core/runtime.py`;
+the chat id is the stable `~/.claude` session id, so terminal output and the indexed
+transcript are the same conversation.
 
 WS protocol (`/api/ws/term`):
 
@@ -99,8 +118,9 @@ WS protocol (`/api/ws/term`):
 |---|---|---|
 | browser → loom | first msg (JSON) | `{chat_id, cwd?, cols, rows}` — attach + initial size |
 | browser → loom | JSON | `{type:"input", data}` · `{type:"resize", cols, rows}` · `{type:"repaint"}` · `{type:"ping"}` |
+| loom → browser | JSON (on open) | `{type:"backend", backend:"pty"\|"tmux"}` — client picks its wheel/repaint path |
 | loom → browser | **binary** | raw terminal output (xterm writes it) |
-| loom → browser | JSON | `{type:"exit"}` (claude quit) · `{type:"error", message}` · `{type:"pong"}` |
+| loom → browser | JSON | `{type:"snapshot-start"}` / `{type:"snapshot-end"}` (pty repaint bracket — binary frames between them are one atomic settled snapshot) · `{type:"exit"}` (claude quit) · `{type:"error", message}` · `{type:"pong"}` |
 
 Status/cost/token readouts are **not** surfaced (they'd require scraping the byte
 stream); a future option is a Claude Code `Notification` hook + transcript-tailing.
@@ -112,14 +132,15 @@ GET/POST  /api/repos
 GET/POST/DELETE  /api/tasks ;  POST /api/tasks/{id}/{start,stop,test} ;  GET /api/tasks/{id}/{test,logs,chat}
 GET  /api/chats ;  PATCH /api/chats/{id} ;  POST /api/chats/{id}/restore ;  DELETE /api/chats/{id}
 GET  /api/chats-trash ;  POST /api/chats/reindex ;  GET /api/chats/{id}/{transcript,prs}
-POST /api/ide ;  POST /api/terminals/{chat_id}/{open-native,paste-image}
+POST /api/ide ;  POST /api/terminals/{chat_id}/{open-native,upload,backend}
 WS   /api/ws/term      (terminal mode — raw PTY bytes; core/terminals.py)
 ```
 
 ## State files (`~/.loom/`, gitignored)
-`registry.json` (tasks) · `chats.json` (chat overlay) · `sessions_index.json`
-(index cache) · `repos.json` · `trash/` (deleted transcripts) · `logs/`
-(`<task>-<service>.log`, `<task>-test.log`) · `worktrees/` (default base).
+`registry.json` (tasks) · `chats.json` (chat overlay, incl. `terminal_backend`) ·
+`sessions_index.json` (index cache) · `repos.json` · `trash/` (deleted transcripts) ·
+`logs/` (`<task>-<service>.log`, `<task>-test.log`, `loomx-<chat>-pty.log`) ·
+`worktrees/` (default base) · `pty-sockets/` (pty daemon sockets + PID sidecars).
 
 ## Ports / isolation model
 Per task: backend `<base>+offset`, frontend `<base>+offset` (`ports.py`; bases come
@@ -130,9 +151,12 @@ default — see `DECISIONS.md`).
 
 ## Roadmap
 ✅ **Worktree tasks** — isolated worktree/ports/test runs per branch.
-✅ **In-browser terminal** — the real `claude` TUI over tmux (`terminals.py`), surviving
-browser disconnects + loom restarts; a per-worktree chat **sidebar** with click-to-switch
+✅ **In-browser terminal** — the real `claude` TUI (`terminals.py`), surviving browser
+disconnects + loom restarts; a per-worktree chat **sidebar** with click-to-switch
 and `?chat=<id>` deep links; per-worktree dev-stack start/stop from the task card.
+✅ **Smooth-scroll (pty) renderer** — tmux-free default host (`pty_server.py` daemon,
+inline claude): native xterm scrollback/select/copy, per-chat switchable back to
+classic tmux. Retire tmux once pty is proven.
 
 **Next:** richer per-worktree status in the sidebar (e.g. a Claude Code `Notification`
 hook + transcript-tailing to recover idle/needs-you state without scraping bytes).

@@ -13,12 +13,13 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from loom import __version__
-from loom.core import claude_session, doctor, github, manager, perf, registry, repos, sessions, terminals
+from loom.core import claude_session, doctor, github, manager, monitor, perf, registry, repos, sessions, terminals
 from loom.core.config import LOGS_DIR, LOOM_HOME, load_repo_config
 from loom.core.tests import build_test_run, serialize_lock
 
@@ -244,6 +245,10 @@ class ChatPatch(BaseModel):
     description: str | None = None
     pr: int | None = None
     mode: str | None = None  # "chat" (SDK UI) | "terminal" (xterm); fixed once chosen
+    # Which host runs the terminal: "pty" (smooth scroll, default) | "tmux" (classic).
+    # Orthogonal to `mode` — only applies within terminal mode; switchable (see
+    # /terminals/{chat_id}/backend).
+    terminal_backend: Literal["pty", "tmux"] | None = None
 
 
 @router.get("/chats")
@@ -260,7 +265,16 @@ def list_chats(
 
 @router.patch("/chats/{sid}")
 def patch_chat(sid: str, body: ChatPatch) -> dict:
-    return sessions.set_overlay(sid, body.model_dump(exclude_none=True))
+    out = sessions.set_overlay(sid, body.model_dump(exclude_none=True))
+    if body.archived:
+        # An archived chat's task shouldn't keep a dev stack running (see monitor.py reaper).
+        # Best-effort — never fail the archive because a stop did. Sync route → threadpool,
+        # so the blocking kills stay off the event loop.
+        with contextlib.suppress(Exception):
+            tid = monitor.stop_for_archived_chat(sid)
+            if tid:
+                print(f"[loom reaper] {tid}: stopped dev stack (chat archived)", flush=True)
+    return out
 
 
 @router.delete("/chats/{sid}")
@@ -426,12 +440,31 @@ def open_native_terminal(chat_id: str) -> dict:
     """Open the SAME live tmux session in a native Terminal.app (`tmux attach`). The
     in-browser xterm and the real terminal then share one live session — terminal mode's
     counterpart to chat mode's `claude --resume` handoff (here no handoff is needed; tmux
-    supports multiple clients on one session)."""
+    supports multiple clients on one session). tmux-backend sessions only (a pty daemon
+    has no attachable multiplexer; the UI hides this action there)."""
     session = terminals.session_name(chat_id)
     if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode != 0:
-        raise HTTPException(404, "no live terminal session yet — open this terminal chat first")
+        raise HTTPException(
+            404,
+            "no live tmux session for this chat — open the terminal first (and note the "
+            "smooth-scroll/pty renderer can't be attached natively; switch it to classic/tmux)",
+        )
     opened = claude_session._launch(f"tmux attach -t {shlex.quote(session)}", label=chat_id, prefer="terminal")
     return {"opened": opened}
+
+
+class BackendIn(BaseModel):
+    target: Literal["pty", "tmux"]
+
+
+@router.post("/terminals/{chat_id}/backend")
+async def switch_terminal_backend(chat_id: str, body: BackendIn) -> dict:
+    """Switch this chat's terminal host (pty ⇄ tmux). Kill + resume, not a live flip:
+    stops the current host, persists the choice; the client then reconnects its WS and
+    open_terminal relaunches claude under the new host with `--resume` (conversation
+    kept — only the live process restarts). Best done while the session is idle."""
+    await terminals.switch_backend(chat_id, body.target)
+    return {"backend": body.target}
 
 
 class UploadIn(BaseModel):
@@ -482,8 +515,10 @@ async def term_ws(websocket: WebSocket) -> None:
             await websocket.close()
         return
     cwd = start.get("cwd")
-    cols = int(start.get("cols") or 120)
-    rows = int(start.get("rows") or 32)
+    # Floor the initial session size: a first frame from a zero-size / collapsed pane would create
+    # the session (and launch claude) at a few columns and permanently mis-wrap the TUI.
+    cols = max(int(start.get("cols") or 120), 20)
+    rows = max(int(start.get("rows") or 32), 5)
     # Lock this chat to terminal mode (persisted; the UI won't offer a switch afterward).
     with contextlib.suppress(Exception):
         sessions.set_overlay(chat_id, {"mode": "terminal"})
@@ -494,8 +529,12 @@ async def term_ws(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "message": str(e)})
             await websocket.close()
         return
-    perf.log(f"WS open {chat_id} subs={len(ts.subscribers) + 1}")
-    await ts.subscribe(websocket)  # forces a full tmux redraw for the newcomer
+    perf.log(f"WS open {chat_id} backend={ts.backend} subs={len(ts.subscribers) + 1}")
+    # Tell the client which host backs this session BEFORE any output: it branches the
+    # wheel path (tmux = forward SGR wheel; pty = scroll xterm's own scrollback).
+    with contextlib.suppress(Exception):
+        await websocket.send_json({"type": "backend", "backend": ts.backend})
+    await ts.subscribe(websocket)  # repaint/snapshot for the newcomer
     try:
         while True:
             m = await websocket.receive_json()
@@ -506,7 +545,7 @@ async def term_ws(websocket: WebSocket) -> None:
                 ts.resize(int(m.get("cols") or cols), int(m.get("rows") or rows))
             elif t == "repaint":
                 perf.log(f"WS repaint {chat_id}")  # full redraw — a burst here == flicker on typing
-                await ts.repaint()  # force a clean tmux redraw (clears scroll/resize tearing)
+                await ts.repaint()  # tmux: refresh-client redraw; pty: settled snapshot bracket
             elif t == "ping":
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:

@@ -82,6 +82,50 @@ server-side tmux session and bridged to xterm.js (`core/terminals.py`).
 a large surface that always lagged the CLI. The chat **manager** (`sessions.py`,
 read-only index + overlay) and the worktree/test core are unchanged. Supersedes D6–D11.
 
+## D13 — Terminal host: pty daemon by default; tmux demoted to fallback (2026-07-07)
+The tmux-hosted terminal garbled text on scroll / wrap / resize: tmux enters the
+**alternate screen** on attach, so xterm never owns scrollback, and three emulators
+(Ink, tmux, xterm) each track width and desync. New default host is a small detached
+**`pty_server` daemon** (`core/pty_server.py`, stdlib-only, AF_UNIX socket) running
+claude's **inline** renderer — xterm owns a real scrollback (smooth wheel scroll,
+drag-select/copy), and the daemon provides the same restart-persistence tmux did
+(that was tmux's only real job). Non-obvious load-bearing pieces: alt-screen
+filtering of the replay ring, DA1/DA2 query interception, settle-aware snapshots
+(bracketed to the browser as `snapshot-start/end`; the client resets + applies
+atomically), and partial-frame reassembly on the socket. tmux stays as a per-chat
+fallback (`terminal_backend` overlay field; switch = kill + `--resume`) and for
+native `tmux attach`; pre-existing live tmux chats stay tmux until switched, so one
+session id never runs two claudes. Remove tmux once pty is proven.
+
+## D14 — Dev stacks are reaped when their chat is done (2026-07-08)
+Archiving a chat now stops its task's dev stack (`PATCH /chats` → `monitor.stop_for_archived_chat`),
+and a **reaper** pass in `core/monitor.py` (startup + every 10 min) stops any task holding services
+that has no live terminal session and whose chat is archived — or whose worktree has had no chat
+activity for 12h (`LOOM_REAP=0` to disable, `LOOM_REAP_IDLE_HOURS` to tune). **Why:** nothing ever
+stopped a stack except the explicit stop button and worktree deletion, so archived/abandoned tasks
+kept Django+Vite running for weeks — ~37 leaked stacks (on top of a health-probe restart loop)
+exhausted 48 GB RAM + swap into a machine-wide OOM (2026-07-07). A reaped task lands on state
+`stopped` like a user stop, so the supervisor won't resurrect it; reopening the chat needs a manual
+start from the task card. Teardown safety: `stop_task` now group-kills only pids spawned by THIS
+loom process (`process.spawned_this_run`) — a pid recorded by an earlier run may have been *reused*
+by an unrelated process — and otherwise tears down by current port listeners, the same
+current-state-not-remembered-pid policy `start_task` already used.
+
+## D15 — Supervisor probes tolerate busy servers; vite caches are per-worktree (2026-07-08)
+Two amplifiers behind the 121 GB vite-cache / OOM incident. (1) The supervisor treated one missed
+1s health probe as "down" and killed the service — but a busy-but-alive vite (mid dep-optimization,
+or a loaded machine) routinely misses 1s, so healthy servers were killed in a loop (4k+ restarts
+per task), each kill stranding a `deps_temp_*` staging dir in the cache. Now: 5s probe timeout +
+`_DOWN_STREAK` consecutive failed sweeps (~45s) before a restart; a crashed port still refuses
+instantly and comes back within ~1 min. (2) Kalendir worktrees symlink `node_modules` to the main
+checkout, so every worktree's vite shared ONE `node_modules/.vite` — concurrent servers clobbered
+each other's dep cache (stale-chunk Lazy/Suspense errors), and Kalendir's config also set
+`optimizeDeps.force` for all of development (full ~1 GB esbuild re-scan on every start). Fix lives
+mostly repo-side (that's the right layer — loom stays generic): `vite.config.ts` honors
+`VITE_CACHE_DIR`, `.loom.yaml` points it at `~/.loom/cache/{slug}/vite` and its start command
+sweeps stale `deps_temp_*` (age-gated) from the shared cache for branches that predate the hook.
+loom's part: `remove_task` wipes `~/.loom/cache/<task_id>/`, so per-task caches die with the task.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

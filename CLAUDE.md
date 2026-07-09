@@ -11,7 +11,8 @@ Two halves:
    deterministic ports + isolated test runs, so you can work/test several
    branches in parallel without checkout conflicts.
 2. **In-browser Claude Code client** — the **real** interactive `claude` TUI,
-   hosted in a server-side **tmux** session and bridged to xterm.js over a
+   hosted server-side (default: a detached `pty_server` daemon, "smooth scroll";
+   fallback: a **tmux** session, "classic") and bridged to xterm.js over a
    WebSocket (so every slash command / permission prompt / feature works with zero
    reimplementation), plus a chat manager that indexes your `~/.claude` history.
    The goal is to **replace the Claude Code terminal as a UI** and let you
@@ -43,18 +44,22 @@ A personal tool, shared as-is. Repo: `github.com/allenye66/loom`.
 - **Frontend** (`dashboard/`): React + Vite + Tailwind v4 (bun). TanStack Query
   for REST, a raw WebSocket for the live terminal.
 - **Live terminal** (`loom/core/terminals.py` ↔ `dashboard/src/term/`): each chat
-  is a real `claude` CLI running inside a server-side **tmux** session (`loomx-<chat_id>`),
-  so it survives browser disconnects *and* loom restarts. loom holds one PTY on that
-  tmux session; `/api/ws/term` attaches as a subscriber, fanning its raw bytes to
-  xterm.js. Per-worktree ports/logs are injected via `core/runtime.py`.
+  is a real `claude` CLI hosted by one of two backends so it survives browser
+  disconnects *and* loom restarts — **pty** (default): a detached
+  `loom/core/pty_server.py` daemon on `~/.loom/pty-sockets/`, inline renderer,
+  xterm owns scrollback (smooth scroll/select); **tmux** (fallback): fullscreen
+  claude in `loomx-<chat_id>`. `/api/ws/term` attaches as a subscriber, fanning raw
+  bytes to xterm.js; per-chat choice in the overlay (`terminal_backend`), switchable
+  (kill + `--resume`). Per-worktree ports/logs are injected via `core/runtime.py`.
 
 Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 
 ## Key conventions / gotchas (don't relearn these the hard way)
 
-- **Terminal mode needs `tmux`** — `claude` runs inside a tmux session so it survives
-  browser disconnects and loom restarts. The PTY scrubs `CLAUDECODE`/`CLAUDE_CODE_*` from
-  the child so the nested `claude` doesn't inherit auto-approve (see
+- **Terminal sessions have two hosts** — the default **pty** backend needs no tmux
+  (a detached `pty_server` daemon keeps `claude` alive across loom restarts); the
+  **classic tmux** backend still needs `tmux`. Both scrub `CLAUDECODE`/`CLAUDE_CODE_*`
+  from the child so the nested `claude` doesn't inherit auto-approve (see
   `docs/CLAUDE_AGENT_SDK_NOTES.md`).
 - Terminal sessions launch `claude --effort max` by default.
 - The chat manager treats `~/.claude/projects/**/*.jsonl` as **read-only** truth
