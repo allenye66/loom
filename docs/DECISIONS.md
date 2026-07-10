@@ -126,6 +126,21 @@ mostly repo-side (that's the right layer — loom stays generic): `vite.config.t
 sweeps stale `deps_temp_*` (age-gated) from the shared cache for branches that predate the hook.
 loom's part: `remove_task` wipes `~/.loom/cache/<task_id>/`, so per-task caches die with the task.
 
+## D16 — Transcripts are sacred: overlay-only trash, and loom never forwards /clear (2026-07-09)
+Five /clears silently executed against a live session via a stale-rendering tab whose INPUT
+path was still alive (the nastiest freeze variant), each spawning a junk "<local-command-
+caveat…" chat: /clear hops to a NEW session id whose transcript starts with the local-command
+marker, and the indexer leaked that into first_prompt. Three rules now hold: (1) `trash_chat`
+sets an overlay flag ONLY — loom never moves/deletes/modifies anything under
+~/.claude/projects (the old behavior moved the jsonl to ~/.loom/trash; restore keeps a legacy
+path for files already there). (2) The terminal input funnel (`_SessionBase.write` →
+`_guard_input`) swallows the Enter that would submit `/clear` — exact-line match tracked from
+the keystroke stream incl. backspace edits and bracketed paste; unknown composer states
+(cursor keys / history recall) fail OPEN so real work is never false-blocked; a BEL beeps the
+terminal instead. Native `tmux attach` / `⧉ terminal` bypass loom and are out of scope.
+(3) The indexer skips local-command noise when deriving first_prompt, so command-headed
+sessions can never render as junk chats again.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

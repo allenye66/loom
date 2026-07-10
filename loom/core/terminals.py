@@ -156,6 +156,11 @@ class _SessionBase:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wbuf = bytearray()  # pending input writes — drained completely (big pastes short-write)
         self._writer_on = False
+        # /clear guard (see _guard_input): reconstruction of the composer's current line.
+        # bytearray = known contents; None = unknowable (cursor keys / history recall) → fail open.
+        self._line_buf: bytearray | None = bytearray()
+        self._paste_depth = 0        # inside bracketed paste (ESC[200~ … ESC[201~)
+        self._guard_carry = b""      # partial paste marker split across write() chunks
         self.subscribers: set = set()
         self.backlog = bytearray()
         self.outq: asyncio.Queue = asyncio.Queue()
@@ -180,9 +185,96 @@ class _SessionBase:
         """Transport framing for terminal input (pty escapes \\x1c; tmux is raw)."""
         return data
 
+    # Submissions loom must NEVER forward to the CLI. /clear is client-side in claude: it
+    # wipes the conversation and hops to a NEW session id, orphaning loom's chat↔task
+    # mapping — and the only way it ever arrived through loom was keystrokes typed into a
+    # stale-rendering tab (2026-07-09: five /clears silently executed against a live
+    # session mid-work). Exact-line match on submit; prose merely containing "/clear"
+    # is unaffected.
+    _BLOCKED_SUBMITS = (b"/clear",)
+    _PASTE_ON, _PASTE_OFF = b"\x1b[200~", b"\x1b[201~"
+    _GUARD_LINE_CAP = 256  # longer lines can't equal a blocked command — stop tracking
+
+    def _guard_input(self, data: bytes) -> bytes:
+        """Swallow the Enter that would submit a blocked local command (today: /clear).
+
+        Tracks the composer's current line from the raw keystroke stream: printable
+        bytes append, backspace trims, ^C/^U reset, Enter submits. Bracketed-paste
+        payload counts as typed text (so paste-then-Enter is guarded); any OTHER
+        escape sequence makes the line unknowable (cursor moves, history recall) and
+        the guard fails OPEN — never false-block real work. On a blocked submit the
+        Enter is dropped and a BEL is fanned to subscribers: the terminal beeps, the
+        typed text stays put unsent.
+        """
+        data = self._guard_carry + data
+        self._guard_carry = b""
+        out = bytearray()
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if b == 0x1B:
+                rest = data[i:i + 6]
+                if data.startswith(self._PASTE_ON, i):
+                    self._paste_depth += 1
+                    out += self._PASTE_ON
+                    i += 6
+                    continue
+                if data.startswith(self._PASTE_OFF, i):
+                    self._paste_depth = max(0, self._paste_depth - 1)
+                    out += self._PASTE_OFF
+                    i += 6
+                    continue
+                # Split paste marker at chunk end? Hold ≥2-byte prefixes for the next
+                # chunk. A LONE trailing ESC is forwarded immediately — it's claude's
+                # interrupt key and must never be delayed (costs us: taint, fail open).
+                if 2 <= len(rest) < 6 and (self._PASTE_ON.startswith(rest) or self._PASTE_OFF.startswith(rest)):
+                    self._guard_carry = bytes(data[i:])
+                    return bytes(out)
+                self._line_buf = None  # real escape sequence → composer state unknowable
+                out.append(b)
+                i += 1
+                continue
+            if b in (0x0D, 0x0A):
+                if self._paste_depth:  # literal newline inside a paste → composer newline
+                    self._line_buf = bytearray()
+                elif self._line_buf is not None and bytes(self._line_buf).strip() in self._BLOCKED_SUBMITS:
+                    with contextlib.suppress(Exception):  # beep, best-effort
+                        self.outq.put_nowait(("data", b"\x07"))
+                    i += 1
+                    continue  # swallow the Enter; typed text stays in the composer
+                else:
+                    self._line_buf = bytearray()  # normal submit → fresh line
+                out.append(b)
+                i += 1
+                continue
+            if b in (0x7F, 0x08) and not self._paste_depth:  # backspace
+                if self._line_buf:
+                    del self._line_buf[-1:]
+                out.append(b)
+                i += 1
+                continue
+            if b in (0x03, 0x15) and not self._paste_depth:  # ^C / ^U clear the line
+                self._line_buf = bytearray()
+                out.append(b)
+                i += 1
+                continue
+            if self._line_buf is not None:
+                if b >= 0x20:  # printable ASCII + any UTF-8 continuation
+                    self._line_buf.append(b)
+                    if len(self._line_buf) > self._GUARD_LINE_CAP:
+                        self._line_buf = None
+                else:
+                    self._line_buf = None  # other control byte → unknowable
+            out.append(b)
+            i += 1
+        return bytes(out)
+
     # --- I/O from the browser ------------------------------------------------
     def write(self, data: bytes) -> None:
         if self._write_fd() is None or not data:
+            return
+        data = self._guard_input(data)
+        if not data:
             return
         self._wbuf += self._frame_input(data)
         self._flush_writes()
