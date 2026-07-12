@@ -200,13 +200,161 @@ def test_status(task_id: str) -> dict:
     return _test_runs.get(task_id) or {"running": False, "exit_code": None}
 
 
+# --- service / test logs (efficient tail + live SSE follow) -------------------
 @router.get("/tasks/{task_id}/logs")
-def get_logs(task_id: str, kind: str = "test", lines: int = 300) -> dict:
-    path = Path(LOGS_DIR) / f"{task_id}-{kind}.log"
-    if not path.exists():
-        return {"log": ""}
-    tail = path.read_text(errors="replace").splitlines()[-lines:]
-    return {"log": "\n".join(tail)}
+def get_logs(
+    task_id: str,
+    kind: str = "test",
+    lines: int = 2000,
+    max_bytes: int = 262_144,
+) -> dict:
+    """Tail a task log without loading multi‑MB files into memory.
+
+    `kind` is the service name (`backend`, `frontend`, …) or `test`.
+    """
+    if not registry.get_task(task_id):
+        raise HTTPException(404, f"unknown task '{task_id}'")
+    try:
+        from loom.core import logs as logmod
+
+        return logmod.tail(task_id, kind, max_bytes=max_bytes, max_lines=lines)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@router.get("/tasks/{task_id}/logs/kinds")
+def list_log_kinds(task_id: str) -> dict:
+    """List available log streams for a task (configured services + files on disk)."""
+    task = registry.get_task(task_id)
+    if not task:
+        raise HTTPException(404, f"unknown task '{task_id}'")
+    from loom.core import logs as logmod
+
+    service_names: list[str] = []
+    try:
+        cfg = load_repo_config(task.repo_root)
+        service_names = [s.name for s in cfg.services]
+    except Exception:
+        # Fall back to whatever the task last ran + common defaults.
+        service_names = [s.name for s in (task.services or [])] or ["backend", "frontend"]
+    return {"kinds": logmod.list_kinds(task_id, service_names)}
+
+
+@router.get("/tasks/{task_id}/logs/since")
+def get_logs_since(task_id: str, kind: str = "backend", offset: int = 0) -> dict:
+    """Incremental read for polling clients — bytes written after `offset`."""
+    if not registry.get_task(task_id):
+        raise HTTPException(404, f"unknown task '{task_id}'")
+    try:
+        from loom.core import logs as logmod
+
+        return logmod.read_since(task_id, kind, offset)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@router.delete("/tasks/{task_id}/logs")
+def clear_logs(task_id: str, kind: str = "backend") -> dict:
+    """Truncate a log file (running services keep writing into the same path)."""
+    if not registry.get_task(task_id):
+        raise HTTPException(404, f"unknown task '{task_id}'")
+    try:
+        from loom.core import logs as logmod
+
+        return {"ok": True, **logmod.clear(task_id, kind)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@router.get("/tasks/{task_id}/logs/stream")
+async def stream_logs(task_id: str, kind: str = "backend", offset: int | None = None):
+    """Server-Sent Events live tail. First event is a full tail (or resume from offset);
+    subsequent events append new bytes as the file grows.
+
+    Event payloads (JSON):
+      {type:"ready", offset, size, path, truncated?, log?}  — initial state
+      {type:"append", log, offset, size}
+      {type:"reset", log, offset, size, truncated?}         — file truncated; full re-tail
+      {type:"ping"}                                         — keepalive
+    """
+    import asyncio
+    import json
+
+    from fastapi.responses import StreamingResponse
+
+    from loom.core import logs as logmod
+
+    if not registry.get_task(task_id):
+        raise HTTPException(404, f"unknown task '{task_id}'")
+    try:
+        logmod.log_path(task_id, kind)  # validate kind early
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+    async def gen():
+        # Initial snapshot (or resume mid-file if the client already has an offset).
+        try:
+            if offset is None:
+                snap = logmod.tail(task_id, kind)
+                payload = {
+                    "type": "ready",
+                    "log": snap["log"],
+                    "offset": snap["offset"],
+                    "size": snap["size"],
+                    "path": snap["path"],
+                    "truncated": snap.get("truncated", False),
+                    "exists": snap["exists"],
+                }
+                cur = int(snap["offset"])
+            else:
+                cur = max(0, int(offset))
+                payload = {
+                    "type": "ready",
+                    "log": "",
+                    "offset": cur,
+                    "size": cur,
+                    "path": str(logmod.log_path(task_id, kind)),
+                    "exists": logmod.log_path(task_id, kind).exists(),
+                }
+            yield f"data: {json.dumps(payload)}\n\n"
+        except Exception as e:  # noqa: BLE001
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            return
+
+        idle = 0
+        while True:
+            try:
+                chunk = await asyncio.to_thread(logmod.read_since, task_id, kind, cur)
+            except Exception as e:  # noqa: BLE001
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                return
+
+            if chunk.get("reset") and chunk.get("log"):
+                cur = int(chunk["offset"])
+                yield f"data: {json.dumps({'type': 'reset', 'log': chunk['log'], 'offset': cur, 'size': chunk['size'], 'truncated': chunk.get('truncated', False)})}\n\n"
+                idle = 0
+            elif chunk.get("log"):
+                cur = int(chunk["offset"])
+                yield f"data: {json.dumps({'type': 'append', 'log': chunk['log'], 'offset': cur, 'size': chunk['size']})}\n\n"
+                idle = 0
+            else:
+                cur = int(chunk["offset"])
+                idle += 1
+                # Keepalive every ~15s so proxies don't drop the connection.
+                if idle % 30 == 0:
+                    yield f"data: {json.dumps({'type': 'ping', 'offset': cur, 'size': chunk['size']})}\n\n"
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _task_chat_id(task) -> str | None:

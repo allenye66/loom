@@ -65,7 +65,26 @@ export const useDoctor = () =>
     refetchInterval: 15000,
   });
 
-export const getLogs = (id: string, kind = 'test') => jget<{ log: string }>(`/tasks/${id}/logs?kind=${kind}`);
+/** Tail a task log (service name or `test`). Efficient end-of-file read on the server. */
+export const getLogs = (id: string, kind = 'test', lines = 2000) =>
+  jget<{ log: string; offset: number; size: number; path: string; truncated?: boolean; exists: boolean }>(
+    `/tasks/${id}/logs?kind=${encodeURIComponent(kind)}&lines=${lines}`,
+  );
+
+export type LogKindInfo = {
+  kind: string;
+  source: string;
+  exists: boolean;
+  size: number;
+  mtime: number | null;
+  path: string;
+};
+
+export const getLogKinds = (id: string) =>
+  jget<{ kinds: LogKindInfo[] }>(`/tasks/${id}/logs/kinds`).then((d) => d.kinds);
+
+export const clearTaskLogs = (id: string, kind: string) =>
+  jsend<{ ok: boolean }>(`/tasks/${id}/logs?kind=${encodeURIComponent(kind)}`, 'DELETE');
 
 export function useTaskActions() {
   const qc = useQueryClient();

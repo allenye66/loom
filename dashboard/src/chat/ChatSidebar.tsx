@@ -123,7 +123,16 @@ function PortLink({ label, url, up }: { label: string; url: string; up?: boolean
 const svcLink = (health: string | null | undefined, port: number) =>
   (health || `http://localhost:${port}`).replace('://127.0.0.1', '://localhost').replace('://0.0.0.0', '://localhost');
 
-export function DevStackBar({ task }: { task: Task }) {
+export function DevStackBar({
+  task,
+  logsOpen,
+  onToggleLogs,
+}: {
+  task: Task;
+  /** Whether the live log drawer is open (highlights the logs button). */
+  logsOpen?: boolean;
+  onToggleLogs?: () => void;
+}) {
   const a = useTaskActions();
   const fe = task.services?.find((s) => s.name === 'frontend');
   const be = task.services?.find((s) => s.name === 'backend');
@@ -153,6 +162,20 @@ export function DevStackBar({ task }: { task: Task }) {
       <PortLink label={`BE :${task.ports.backend}`} url={beUrl!} up={beUp} />
       <div className="flex-1" />
       <span className={statusCls}>{statusTxt}</span>
+      {onToggleLogs && (
+        <button
+          onClick={onToggleLogs}
+          title="Live frontend / backend / test logs — follow, filter, copy. Esc closes."
+          className={`px-2 py-0.5 rounded border shrink-0 inline-flex items-center gap-1.5 ${
+            logsOpen
+              ? 'border-accent-dim text-accent bg-accent/10'
+              : 'border-edge text-muted hover:text-ink'
+          }`}
+        >
+          <span className={`w-1.5 h-1.5 rounded-full ${logsOpen ? 'bg-accent' : anyUp ? 'bg-ok/70' : 'bg-muted/40'}`} />
+          logs
+        </button>
+      )}
       <button
         onClick={() => (allUp ? a.stop.mutate(task.id) : a.start.mutate({ id: task.id, only: down }))}
         disabled={busy}

@@ -5,6 +5,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { ChatSidebar, DevStackBar, OpenInIde } from '../chat/ChatSidebar';
 import { PrBadges } from '../components/PrBadges';
+import { ServiceLogsPanel, useLogsPanel } from '../components/ServiceLogsPanel';
 import type { Task } from '../api';
 
 // Match the app palette (index.css @theme tokens) so the TUI feels native.
@@ -338,6 +339,8 @@ export function TerminalView({
   const task = tasks?.find(
     (t) => t.worktree_path && (cwd === t.worktree_path || (cwd?.startsWith(t.worktree_path + '/') ?? false)),
   );
+  // Live service/test logs drawer (shared open/kind state with DevStackBar).
+  const logsPanel = useLogsPanel(task?.id);
 
   // The chat's branch + auto-detected PRs (from the transcript's pr-link records), with live
   // GitHub merge status (open / tests passing / ready to merge / error / merged …).
@@ -698,12 +701,27 @@ export function TerminalView({
           </div>
         )}
 
-        {task && <DevStackBar task={task} />}
+        {task && (
+          <DevStackBar
+            task={task}
+            logsOpen={logsPanel.open}
+            onToggleLogs={() => logsPanel.setOpen((v) => !v)}
+          />
+        )}
 
         <div
           ref={holderRef}
           className={`flex-1 min-h-0 px-2 py-1.5 overflow-hidden ${dragOver ? 'ring-2 ring-inset ring-accent-dim' : ''}`}
         />
+
+        {task && logsPanel.open && (
+          <ServiceLogsPanel
+            task={task}
+            kind={logsPanel.kind}
+            onKindChange={logsPanel.setKind}
+            onClose={() => logsPanel.setOpen(false)}
+          />
+        )}
 
         {showText && resume && <CopyTextPanel chatId={resume} onClose={() => setShowText(false)} />}
       </div>

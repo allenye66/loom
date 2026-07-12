@@ -57,6 +57,8 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `api.ts` | REST types + TanStack Query hooks (`useTasks`, `useRepos`, `useDoctor`, `useChats`, `useTaskActions`, `useChatActions`, …). |
 | `components/TasksView.tsx` | New-task input + grid of `TaskCard`. |
 | `components/TaskCard.tsx` | Per-worktree card: state, ports, git status, test runner+logs, `open` (→ terminal chat). |
+| `components/ServiceLogsPanel.tsx` | Live FE/BE/test log drawer in the terminal chat (SSE follow, filter, resize, clear). |
+| `core/logs.py` | Efficient end-of-file tail + incremental follow for `~/.loom/logs/{task}-{kind}.log`. |
 | `components/ChatsView.tsx` | Chat manager UI: Active/Archived/Trash tabs, ★ starred, search, inline rename/tag, keyboard nav; `open` (→ terminal chat, resume). |
 | `chat/ChatContext.tsx` | `ChatProvider` + `useOpenChat()` — opens a full-screen `TerminalView` overlay; restores `?chat=<id>` on load. |
 | `chat/ChatSidebar.tsx` | The per-worktree chat rail (`ChatSidebar`) + the in-chat `DevStackBar` and `OpenInIde` button. Shared by the terminal overlay. |
@@ -130,6 +132,8 @@ stream); a future option is a Claude Code `Notification` hook + transcript-taili
 GET  /api/health, /api/doctor
 GET/POST  /api/repos
 GET/POST/DELETE  /api/tasks ;  POST /api/tasks/{id}/{start,stop,test} ;  GET /api/tasks/{id}/{test,logs,chat}
+GET  /api/tasks/{id}/logs?kind=  (efficient tail: backend|frontend|test|…)
+GET  /api/tasks/{id}/logs/kinds · /logs/since · SSE /logs/stream ;  DELETE /logs?kind=
 GET  /api/chats ;  PATCH /api/chats/{id} ;  POST /api/chats/{id}/restore ;  DELETE /api/chats/{id}
 GET  /api/chats-trash ;  POST /api/chats/reindex ;  GET /api/chats/{id}/{transcript,prs}
 POST /api/ide ;  POST /api/terminals/{chat_id}/{open-native,upload,backend}
