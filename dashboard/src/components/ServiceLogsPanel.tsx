@@ -62,6 +62,16 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
 
+// Strip ANSI/VT escape sequences (CSI colour/cursor codes + OSC) so structlog's colorized
+// console output (Django dev server writes `\x1b[36m…\x1b[0m` straight to the file) reads as
+// plain text instead of escape-code garbage. Run over the whole accumulated buffer, never a
+// single SSE chunk — a colour code can straddle two `append` frames.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g;
+function stripAnsi(s: string): string {
+  return s.indexOf('\u001b') === -1 ? s : s.replace(ANSI_RE, '');
+}
+
 /** Classify a log line for subtle coloring (best-effort; never hide content). */
 function lineTone(line: string): string {
   const s = line.toLowerCase();
@@ -340,11 +350,14 @@ export function ServiceLogsPanel({ task, kind, onKindChange, onClose }: Props) {
     return () => window.removeEventListener('keydown', onKey);
   }, [filter, onClose]);
 
+  // Strip ANSI once over the full buffer (structlog/Django write colorized output to the file).
+  const clean = useMemo(() => stripAnsi(text), [text]);
+
   const lines = useMemo(() => {
-    if (!text) return [] as string[];
+    if (!clean) return [] as string[];
     // Keep empty trailing line visible if the stream ends with \n mid-write.
-    return text.split('\n');
-  }, [text]);
+    return clean.split('\n');
+  }, [clean]);
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -363,7 +376,7 @@ export function ServiceLogsPanel({ task, kind, onKindChange, onClose }: Props) {
   };
 
   const copyAll = async () => {
-    const body = filter ? filtered.join('\n') : text;
+    const body = filter ? filtered.join('\n') : clean;
     try {
       await navigator.clipboard.writeText(body);
       setCopied(true);
