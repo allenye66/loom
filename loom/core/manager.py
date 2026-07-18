@@ -9,8 +9,10 @@ import time
 import uuid
 from pathlib import Path
 
+from loom.core import agents
 from loom.core import ports as ports_mod
 from loom.core import process, registry
+from loom.core import sessions as sessions_mod
 from loom.core import worktree as wt
 from loom.core.config import DEFAULT_WORKTREE_BASE, LOGS_DIR, LOOM_HOME, RepoConfig, ensure_dirs
 from loom.models import ServiceProc, Task, TaskState
@@ -36,7 +38,13 @@ def _render(s: str, ctx: dict) -> str:
 
 
 # --- create / remove ----------------------------------------------------------
-def create_task(cfg: RepoConfig, branch: str, base_branch: str | None = None, note: str | None = None) -> Task:
+def create_task(
+    cfg: RepoConfig,
+    branch: str,
+    base_branch: str | None = None,
+    note: str | None = None,
+    agent: str | None = None,
+) -> Task:
     branch = (branch or "").strip()
     # Reject anything git can't use as a branch (spaces are the usual culprit) *before*
     # persisting, so a typo never leaves a broken task pointing at a worktree that the
@@ -58,13 +66,17 @@ def create_task(cfg: RepoConfig, branch: str, base_branch: str | None = None, no
     taken = {t.ports.offset for t in registry.list_tasks() if t.ports}
     alloc = ports_mod.allocate(slug, cfg.ports.get("backend", 8000), cfg.ports.get("frontend", 3000), taken)
 
+    chat_id = str(uuid.uuid4())  # the task's one chat, created with this id on first open
+    locked_agent = agents.normalize_agent(agent)
     task = Task(
         id=slug, repo=cfg.name, repo_root=cfg.root, branch=branch, base_branch=base,
         worktree_path=wt_path, state=TaskState.created, ports=alloc,
         created_at=registry.now_iso(), updated_at=registry.now_iso(), note=note,
-        chat_id=str(uuid.uuid4()),  # the task's one chat, created with this id on first open
+        chat_id=chat_id,
     )
     registry.upsert(task)
+    # Lock agent + terminal mode before first open so resume launches the right CLI.
+    sessions_mod.set_overlay(chat_id, {"agent": locked_agent, "mode": "terminal"})
     try:
         wt.add_worktree(cfg.root, branch, wt_path, base)
         _run_setup(cfg, task)

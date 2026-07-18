@@ -10,6 +10,8 @@ export type Ports = {
 export type ServiceProc = { name: string; pid?: number | null; port?: number | null; healthy: boolean; health_url?: string | null };
 export type Git = { branch?: string; dirty?: boolean; ahead?: number; behind?: number };
 export type TestRun = { running: boolean; exit_code: number | null; command?: string } | null;
+export type AgentId = 'claude' | 'grok';
+
 export type Task = {
   id: string;
   repo: string;
@@ -26,6 +28,7 @@ export type Task = {
   chat_archived?: boolean;
   chat_id?: string | null;
   chat_mode?: 'chat' | 'terminal' | null; // locked surface for this task's chat (null = unchosen)
+  chat_agent?: AgentId | null; // locked CLI for this task's chat
 };
 export type Repo = { name: string; root: string; base_branch: string };
 export type Check = { name: string; ok: boolean; hint: string };
@@ -91,7 +94,7 @@ export function useTaskActions() {
   const invTasks = () => qc.invalidateQueries({ queryKey: ['tasks'] });
   return {
     create: useMutation({
-      mutationFn: (b: { repo_root: string; branch: string; base_branch?: string }) =>
+      mutationFn: (b: { repo_root: string; branch: string; base_branch?: string; agent?: AgentId }) =>
         jsend<Task>('/tasks', 'POST', b),
       onSuccess: invTasks,
     }),
@@ -143,6 +146,7 @@ export type Chat = {
   archived: boolean;
   hidden: boolean;
   mode?: 'chat' | 'terminal' | null;
+  agent?: AgentId | null;
 };
 
 export type ChatQuery = { repo?: string; scope: string; tab: string; q?: string; starred?: boolean };

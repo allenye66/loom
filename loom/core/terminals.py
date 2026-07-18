@@ -1,24 +1,25 @@
-"""Server-side persistent *terminal* sessions — the real `claude` TUI in the browser.
+"""Server-side persistent *terminal* sessions — the real agent TUI in the browser.
 
-loom runs the **actual** interactive `claude` CLI under a PTY and streams its raw bytes
-to xterm.js, so every slash command / permission prompt / feature works with zero
-reimplementation. This is the only chat surface loom exposes (see docs/ARCHITECTURE.md).
+loom runs the **actual** interactive CLI (`claude` or `grok`) under a PTY and streams
+its raw bytes to xterm.js, so every slash command / permission prompt / feature works
+with zero reimplementation. This is the only chat surface loom exposes (see
+docs/ARCHITECTURE.md). Agent choice is per-chat (`agent` in the sessions overlay).
 
-Two interchangeable hosts keep `claude` alive across browser disconnects *and* loom
+Two interchangeable hosts keep the agent alive across browser disconnects *and* loom
 restarts (there's no hot-reload — every backend edit restarts the server; a bare PTY
 would die with it):
 
-- **pty** (default — "smooth scroll"): `claude` under a detached `loom.core.pty_server`
+- **pty** (default — "smooth scroll"): agent under a detached `loom.core.pty_server`
   daemon on a Unix socket, using the *inline* renderer. No alternate screen, so xterm.js
   owns a real scrollback — native wheel scroll, drag-select/copy, and none of the
   three-emulator (Ink↔tmux↔xterm) width desync that garbled the tmux mode.
-- **tmux** ("classic"): the original fullscreen-pinned mode — `claude` inside a tmux
+- **tmux** ("classic"): the original fullscreen-pinned mode — agent inside a tmux
   session (`loomx-<chat_id>`), loom attached via one PTY. Kept as a per-session fallback
   during the pty migration; also what a native `tmux attach` shares.
 
-The per-chat choice is persisted in the sessions overlay (`terminal_backend`) and is
-switchable via `switch_backend()` — a kill + `claude --resume` relaunch (the transcript
-is the durable state), so the conversation survives the hop.
+The per-chat host choice is persisted in the sessions overlay (`terminal_backend`) and is
+switchable via `switch_backend()` — a kill + `--resume` relaunch (the transcript is the
+durable state), so the conversation survives the hop.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
-import json
 import os
 import pty
 import re
@@ -40,6 +40,7 @@ import termios
 import time
 from pathlib import Path
 
+from loom.core import agents
 from loom.core import sessions as sessions_mod
 from loom.core.config import LOGS_DIR, LOOM_HOME
 from loom.core.pty_server import (
@@ -58,16 +59,12 @@ _SEND_TIMEOUT = 5.0          # max seconds to push a frame to one subscriber bef
 _BACKLOG_MAX = 256 * 1024    # bytes of recent output kept for replay-on-attach
 _READ_CHUNK = 65536
 _SOCK_DIR = LOOM_HOME / "pty-sockets"   # one AF_UNIX socket per pty-backed session
-# "I'm running inside Claude Code" markers — scrub them from the child so the nested
+# "I'm running inside Claude Code" markers — scrub them from the child so a nested
 # `claude` doesn't inherit auto-approve (see CLAUDE.md). Auth/API-key vars are untouched.
 _SCRUB = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")
 
 BACKENDS = ("pty", "tmux")
 DEFAULT_BACKEND = "pty"
-
-
-def _claude() -> str:
-    return shutil.which("claude") or "claude"
 
 
 def _tmux() -> str | None:
@@ -84,61 +81,28 @@ def _socket_path(chat_id: str) -> str:
     return str(_SOCK_DIR / (session_name(chat_id) + ".sock"))
 
 
-NEEDS_DIR = LOOM_HOME / "needs"  # per-chat "needs you" markers (written/cleared by claude's hooks)
+NEEDS_DIR = agents.NEEDS_DIR  # per-chat "needs you" markers (written/cleared by agent hooks)
 
 
 def _marker_path(chat_id: str) -> Path:
-    """File whose existence means 'this chat is waiting on you'. Set by the Stop/Notification
-    hooks, cleared by UserPromptSubmit (see _claude_argv); read by list_active()."""
-    return NEEDS_DIR / (re.sub(r"[^a-zA-Z0-9_-]", "-", chat_id)[:80] or "x")
+    """File whose existence means 'this chat is waiting on you'. Set by Stop/Notification
+    hooks, cleared by UserPromptSubmit; read by list_active()."""
+    return agents._marker_path(chat_id)
+
+
+def _agent_for(chat_id: str) -> agents.AgentId:
+    """Locked agent for this chat (overlay); defaults to claude for legacy chats."""
+    return agents.normalize_agent(sessions_mod.get_overlay(chat_id).get("agent"))
+
+
+def _agent_argv(chat_id: str, cwd: str | None, *, fullscreen: bool) -> list[str]:
+    """Build argv for the chat's locked agent (resume if transcript exists, else mint id)."""
+    return agents.build_argv(_agent_for(chat_id), chat_id, cwd, fullscreen=fullscreen)
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
     with contextlib.suppress(Exception):
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", max(rows, 1), max(cols, 1), 0, 0))
-
-
-def _claude_argv(chat_id: str, cwd: str | None, *, fullscreen: bool) -> list[str]:
-    """`claude` flags mirroring the SDK chat: max effort + the worktree runtime note.
-    Resume the chat's stable id if it exists on disk, else create it with that id so
-    the terminal session is the same resumable conversation loom indexes."""
-    _, note = _loom_runtime(cwd)
-    # Per-session settings (via --settings, so the user's global ~/.claude/settings.json is
-    # untouched):
-    #  • `tui: fullscreen` (tmux backend only) = the alternate-screen renderer (avoids the
-    #    inline renderer's redraw-tearing — upstream bug anthropics/claude-code#29937/#37076).
-    #    The pty backend deliberately OMITS it: the inline renderer is the whole point there —
-    #    no alt-screen means xterm owns a real scrollback (smooth scroll, native select/copy),
-    #    and the pty daemon's settled-snapshot repaint covers the inline redraw artifacts.
-    #  • `theme: dark` forces readable colors even if the user's *global* theme is "light"
-    #    (else dark-on-dark, unreadable — esp. question/permission highlights).
-    #  • `hooks` write a "needs you" marker when claude finishes a turn (Stop) or asks for
-    #    input/permission (Notification), and clear it when you reply (UserPromptSubmit).
-    #    list_active() reads it — a reliable signal vs. guessing from output activity.
-    NEEDS_DIR.mkdir(parents=True, exist_ok=True)
-    mark = shlex.quote(str(_marker_path(chat_id)))
-    settings: dict = {
-        "theme": "dark",
-        "hooks": {
-            "Stop": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
-            "Notification": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"rm -f {mark}"}]}],
-        },
-    }
-    if fullscreen:
-        settings["tui"] = "fullscreen"
-    # `acceptEdits` = auto-approve file creates/edits inside the worktree (the sandbox) so
-    # claude isn't stopped on the first edit of each session. Non-fs tools (Bash, etc.) still
-    # honor your allow/deny rules, and `.claude/` edits stay gated (Claude Code's separate
-    # guardrail). Mirrors the permission_mode the old SDK chat used.
-    argv = [_claude(), "--effort", "max", "--permission-mode", "acceptEdits", "--settings", json.dumps(settings)]
-    if note:
-        argv += ["--append-system-prompt", note]
-    if sessions_mod._find_transcript(chat_id):
-        argv += ["--resume", chat_id]
-    else:
-        argv += ["--session-id", chat_id]
-    return argv
 
 
 class _SessionBase:
@@ -385,17 +349,20 @@ class TmuxTerminalSession(_SessionBase):
         has = subprocess.run([tm, "has-session", "-t", self.session], capture_output=True)
         if has.returncode != 0:  # not alive yet → create it (else just re-apply options + re-attach)
             cwd = self.cwd or os.path.expanduser("~")
+            agent = _agent_for(self.chat_id)
             env, _ = _loom_runtime(self.cwd)
-            full_env = {**_RESILIENCE_ENV, **env}
+            # Claude-only resilience knobs; grok ignores unknown vars but keep env clean.
+            res = _RESILIENCE_ENV if agent == "claude" else {}
+            full_env = agents.child_env(agent, self.chat_id, {**res, **env})
             scrub = "unset " + " ".join(_SCRUB) + " 2>/dev/null"
             # Grow scrollback BEFORE creating the pane — history-limit only applies to NEW
             # windows, so setting it after (as before) was a no-op and left it at tmux's
             # 2000-line default. 1,000,000 is effectively "infinite" for a chat; tmux stores
             # lines lazily, so memory scales with actual output, not this cap.
             subprocess.run([tm, "set-option", "-g", "history-limit", "1000000"], capture_output=True)
-            # `exec claude` so the pane IS claude (no extra shell layer); `sh -c` (not a login
+            # `exec <agent>` so the pane IS the CLI (no extra shell layer); `sh -c` (not a login
             # shell) avoids sourcing ~/.zshrc, whose guarded auto-`claude` would double-launch.
-            argv = _claude_argv(self.chat_id, self.cwd, fullscreen=True)
+            argv = _agent_argv(self.chat_id, self.cwd, fullscreen=True)
             pane = f"{scrub}; exec {' '.join(shlex.quote(a) for a in argv)}"
             cmd = [tm, "new-session", "-d", "-s", self.session, "-x", str(self.cols), "-y", str(self.rows), "-c", cwd]
             for k, v in full_env.items():
@@ -672,8 +639,10 @@ class PtyTerminalSession(_SessionBase):
             os.unlink(self.socket_path)
 
         cwd = self.cwd or os.path.expanduser("~")
+        agent = _agent_for(self.chat_id)
         env, _ = _loom_runtime(self.cwd)
-        child_env = {**os.environ, **_RESILIENCE_ENV, **env, "TERM": "xterm-256color"}
+        res = _RESILIENCE_ENV if agent == "claude" else {}
+        child_env = agents.child_env(agent, self.chat_id, {**os.environ, **res, **env})
         for k in _SCRUB:
             child_env.pop(k, None)
 
@@ -681,7 +650,7 @@ class PtyTerminalSession(_SessionBase):
             sys.executable, "-m", "loom.core.pty_server", self.socket_path,
             "--rows", str(self.rows), "--cols", str(self.cols),
             "--cwd", cwd, "--",
-            *_claude_argv(self.chat_id, self.cwd, fullscreen=False),
+            *_agent_argv(self.chat_id, self.cwd, fullscreen=False),
         ]
         # Daemon logs (its stderr) go to a per-session file — with DEVNULL a failed
         # launch would be undiagnosable.

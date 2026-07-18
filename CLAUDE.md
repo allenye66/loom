@@ -5,18 +5,19 @@ first, then the deeper docs in `docs/`.
 
 ## What loom is
 
-A **local-first orchestrator for working on many Claude Code tasks at once**.
+A **local-first orchestrator for working on many agent coding tasks at once**.
 Two halves:
 1. **Worktree tasks** — each task = a git worktree on its own branch, with
    deterministic ports + isolated test runs, so you can work/test several
    branches in parallel without checkout conflicts.
-2. **In-browser Claude Code client** — the **real** interactive `claude` TUI,
-   hosted server-side (default: a detached `pty_server` daemon, "smooth scroll";
+2. **In-browser agent TUI client** — the **real** interactive `claude` or
+   `grok` CLI (chosen at task/session create, locked per chat), hosted
+   server-side (default: a detached `pty_server` daemon, "smooth scroll";
    fallback: a **tmux** session, "classic") and bridged to xterm.js over a
    WebSocket (so every slash command / permission prompt / feature works with zero
-   reimplementation), plus a chat manager that indexes your `~/.claude` history.
-   The goal is to **replace the Claude Code terminal as a UI** and let you
-   run/▸switch between multiple chats.
+   reimplementation), plus a chat manager that indexes `~/.claude` and
+   `~/.grok/sessions` history. The goal is to **replace the agent terminal as a
+   UI** and let you run/▸switch between multiple chats.
 
 A personal tool, shared as-is. Repo: `github.com/allenye66/loom`.
 
@@ -44,11 +45,12 @@ A personal tool, shared as-is. Repo: `github.com/allenye66/loom`.
 - **Frontend** (`dashboard/`): React + Vite + Tailwind v4 (bun). TanStack Query
   for REST, a raw WebSocket for the live terminal.
 - **Live terminal** (`loom/core/terminals.py` ↔ `dashboard/src/term/`): each chat
-  is a real `claude` CLI hosted by one of two backends so it survives browser
+  is a real agent CLI (`claude` or `grok`, from overlay `agent` via
+  `core/agents.py`) hosted by one of two backends so it survives browser
   disconnects *and* loom restarts — **pty** (default): a detached
   `loom/core/pty_server.py` daemon on `~/.loom/pty-sockets/`, inline renderer,
   xterm owns scrollback (smooth scroll/select); **tmux** (fallback): fullscreen
-  claude in `loomx-<chat_id>`. `/api/ws/term` attaches as a subscriber, fanning raw
+  agent in `loomx-<chat_id>`. `/api/ws/term` attaches as a subscriber, fanning raw
   bytes to xterm.js; per-chat choice in the overlay (`terminal_backend`), switchable
   (kill + `--resume`). Per-worktree ports/logs are injected via `core/runtime.py`.
 
@@ -61,9 +63,12 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   **classic tmux** backend still needs `tmux`. Both scrub `CLAUDECODE`/`CLAUDE_CODE_*`
   from the child so the nested `claude` doesn't inherit auto-approve (see
   `docs/CLAUDE_AGENT_SDK_NOTES.md`).
-- Terminal sessions launch `claude --effort max` by default.
-- The chat manager treats `~/.claude/projects/**/*.jsonl` as **read-only** truth
-  and keeps user state (star/archive/tags/name) in `~/.loom/chats.json`.
+- Terminal sessions launch with `--effort max` (and agent-specific flags from
+  `core/agents.py`). Agent is chosen when creating a task (`agent: claude|grok`)
+  and stored sticky in the chat overlay — never switch mid-session.
+- The chat manager treats agent transcripts as **read-only** truth
+  (`~/.claude/projects/**/*.jsonl` and `~/.grok/sessions/**`) and keeps user
+  state (star/archive/tags/name/agent) in `~/.loom/chats.json`.
 - Match the existing code style; keep Python imports at top of file.
 
 ## Docs

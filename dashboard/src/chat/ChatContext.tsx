@@ -16,13 +16,21 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [active, setActive] = useState<ActiveChat | null>(null);
 
   // Restore from ?chat=<session_id> on first load (refresh / deep link). Fetch the chat's
-  // locked mode so a terminal chat restores into the terminal surface, not the chat UI.
+  // locked mode/agent so a terminal chat restores into the right surface + CLI.
   useEffect(() => {
     const sid = new URLSearchParams(location.search).get('chat');
     if (!sid) return;
     fetch(`/api/chats/${sid}`)
       .then((r) => r.json())
-      .then((d) => setActive({ resume: sid, title: sid.slice(0, 8), mode: d.mode ?? undefined, cwd: d.chat?.cwd ?? undefined }))
+      .then((d) =>
+        setActive({
+          resume: sid,
+          title: sid.slice(0, 8),
+          mode: d.mode ?? undefined,
+          cwd: d.chat?.cwd ?? undefined,
+          agent: d.agent ?? d.chat?.agent ?? undefined,
+        }),
+      )
       .catch(() => setActive({ resume: sid, title: sid.slice(0, 8) }));
   }, []);
 
@@ -39,13 +47,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     <ChatCtx.Provider value={open}>
       {children}
       {active && (
-        // Terminal is the only surface now — every chat opens into the real claude TUI.
+        // Terminal is the only surface now — every chat opens into the real agent TUI.
         <TerminalView
           // remount (fresh socket) when switching chats
           key={active.resume ?? active.cwd ?? active.title}
           resume={active.resume}
           cwd={active.cwd}
           title={active.title}
+          agent={active.agent}
           onClose={close}
         />
       )}

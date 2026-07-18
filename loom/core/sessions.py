@@ -1,28 +1,35 @@
-"""Chat/session index over Claude Code transcripts + a local organization overlay.
+"""Chat/session index over Claude + Grok transcripts + a local organization overlay.
 
 Claude writes append-only transcripts to ~/.claude/projects/<slug>/<id>.jsonl with
-ai-title / last-prompt / gitBranch / pr-link records. loom READS those (never edits)
-to build a fast, cached index, and keeps its OWN overlay (~/.loom/chats.json) for
-user-controlled state: star / archive / hide / name / tags / description.
+ai-title / last-prompt / gitBranch / pr-link records. Grok stores sessions under
+~/.grok/sessions/<encoded-cwd>/<id>/ (summary.json + updates.jsonl). loom READS
+those (never edits) to build a fast, cached index, and keeps its OWN overlay
+(~/.loom/chats.json) for user-controlled state: star / archive / hide / name /
+tags / description / agent.
 
-Delete = soft-trash (move the file to ~/.loom/trash, restorable).
+Delete = soft-trash (overlay flag; transcripts stay for the native CLI).
 Search depth = metadata + prompts (title, branch, PR, tags, description, first/last
 prompt) — not full message bodies.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 
+from loom.core import agents
 from loom.core import registry
 from loom.core import repos as repos_mod
 from loom.core.config import LOOM_HOME, ensure_dirs
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+GROK_SESSIONS = Path.home() / ".grok" / "sessions"
 TRASH_DIR = LOOM_HOME / "trash"
 OVERLAY_PATH = LOOM_HOME / "chats.json"
 INDEX_CACHE = LOOM_HOME / "sessions_index.json"
@@ -177,6 +184,7 @@ def _parse_transcript(path: Path) -> dict:
     st = path.stat()
     return {
         "id": path.stem,
+        "agent": "claude",
         "title": title,
         "preview": preview,
         "first_prompt": first_prompt,
@@ -192,30 +200,189 @@ def _parse_transcript(path: Path) -> dict:
     }
 
 
+def _parse_iso_ts(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        # Grok uses Z-suffixed UTC timestamps.
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_grok_session(sess_dir: Path, group_name: str) -> dict:
+    """Index a Grok session directory from summary.json (+ light prompt peek)."""
+    summary_path = sess_dir / "summary.json"
+    title = preview = first_prompt = branch = cwd = created = None
+    n_user = n_assistant = 0
+    last_active = 0.0
+    size = 0
+    try:
+        st = summary_path.stat()
+        last_active = st.st_mtime
+        size = st.st_size
+        data = json.loads(summary_path.read_text())
+        info = data.get("info") or {}
+        cwd = info.get("cwd")
+        title = data.get("generated_title") or data.get("session_summary")
+        branch = data.get("head_branch")
+        created = data.get("created_at")
+        n_user = int(data.get("num_chat_messages") or 0) // 2  # rough; refined below
+        n_assistant = int(data.get("num_chat_messages") or 0) - n_user
+        la = _parse_iso_ts(data.get("last_active_at") or data.get("updated_at"))
+        if la:
+            last_active = la
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    if not cwd:
+        # Decode the URL-encoded cwd group name (Grok's grouping key).
+        with contextlib.suppress(Exception):
+            cwd = unquote(group_name) or None
+    # First / last user prompt from chat_history or the updates stream (best-effort, capped).
+    # Skip system/developer rows — chat_history starts with a long system prompt that must
+    # not leak into first_prompt / list previews.
+    hist = sess_dir / "chat_history.jsonl"
+    if hist.exists():
+        try:
+            with hist.open("r", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    role = (rec.get("type") or rec.get("role") or "").lower()
+                    if role in ("system", "developer", "tool"):
+                        continue
+                    if role and role not in ("user", "human"):
+                        continue
+                    text = rec.get("display") or rec.get("text") or rec.get("prompt")
+                    if not text and isinstance(rec.get("content"), str):
+                        text = rec["content"]
+                    if not text and isinstance(rec.get("message"), dict):
+                        text = _extract_text(rec["message"])
+                    if text and isinstance(text, str) and text.strip() and not _is_local_command_noise(text):
+                        if first_prompt is None:
+                            first_prompt = text[:240]
+                        preview = text[:240]
+        except OSError:
+            pass
+    # Prefer a short title-adjacent preview from updates (user_message_chunk) when history
+    # didn't yield anything useful.
+    try:
+        ups = sess_dir / "updates.jsonl"
+        if ups.exists():
+            size = max(size, ups.stat().st_size)
+            nu = na = 0
+            with ups.open("r", errors="replace") as f:
+                for line in f:
+                    if "user_message" in line:
+                        nu += 1
+                        if first_prompt is None:
+                            try:
+                                rec = json.loads(line)
+                                upd = ((rec.get("params") or {}).get("update") or {})
+                                content = (upd.get("content") or {})
+                                text = content.get("text") if isinstance(content, dict) else None
+                                if text and isinstance(text, str) and text.strip():
+                                    first_prompt = text[:240]
+                                    preview = preview or first_prompt
+                            except (json.JSONDecodeError, TypeError, AttributeError):
+                                pass
+                    elif "agent_message" in line:
+                        na += 1
+            if not n_user and not n_assistant:
+                n_user, n_assistant = nu, na
+    except OSError:
+        pass
+    return {
+        "id": sess_dir.name,
+        "agent": "grok",
+        "title": title,
+        "preview": preview,
+        "first_prompt": first_prompt,
+        "branch": branch,
+        "cwd": cwd,
+        "prs": [],
+        "pr_repo": None,
+        "created": created,
+        "last_active": last_active,
+        "size": size,
+        "n_user": n_user,
+        "n_assistant": n_assistant,
+    }
+
+
 def build_index(force: bool = False) -> list[dict]:
-    """Re-parse only transcripts whose size/mtime changed; cache the rest."""
+    """Re-parse only transcripts whose size/mtime changed; cache the rest.
+
+    Cache keys are `claude:<id>` / `grok:<id>` so the two stores never collide.
+    The public `id` field remains the raw session UUID.
+    """
     cache = _read_json(INDEX_CACHE, {})
     out: dict[str, dict] = {}
     changed = force
+
+    def _put(key: str, st_size: int, st_mtime: float, parse) -> None:
+        nonlocal changed
+        cached = cache.get(key)
+        unchanged = (
+            cached
+            and not force
+            and cached.get("size") == st_size
+            and abs(cached.get("last_active", 0) - st_mtime) < 0.001
+            # Re-parse if a pre-agent cache entry lacks the agent tag.
+            and cached.get("agent")
+        )
+        if unchanged:
+            out[key] = cached
+        else:
+            out[key] = parse()
+            changed = True
+
     if CLAUDE_PROJECTS.exists():
         for proj in CLAUDE_PROJECTS.iterdir():
             if not proj.is_dir():
                 continue
             for f in proj.glob("*.jsonl"):
-                sid = f.stem
-                st = f.stat()
-                cached = cache.get(sid)
-                unchanged = (
-                    cached
-                    and not force
-                    and cached.get("size") == st.st_size
-                    and abs(cached.get("last_active", 0) - st.st_mtime) < 0.001
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                key = f"claude:{f.stem}"
+                _put(key, st.st_size, st.st_mtime, lambda f=f: _parse_transcript(f))
+
+    if GROK_SESSIONS.exists():
+        for group in GROK_SESSIONS.iterdir():
+            if not group.is_dir() or group.name.startswith("."):
+                continue
+            # Skip non-session files (e.g. session_search.sqlite lives at sessions root).
+            try:
+                children = list(group.iterdir())
+            except OSError:
+                continue
+            for sess in children:
+                if not sess.is_dir():
+                    continue
+                summary = sess / "summary.json"
+                if not summary.exists():
+                    continue
+                try:
+                    st = summary.stat()
+                except OSError:
+                    continue
+                key = f"grok:{sess.name}"
+                _put(
+                    key,
+                    st.st_size,
+                    st.st_mtime,
+                    lambda sess=sess, group=group: _parse_grok_session(sess, group.name),
                 )
-                if unchanged:
-                    out[sid] = cached
-                else:
-                    out[sid] = _parse_transcript(f)
-                    changed = True
+
     # Only rewrite the cache when a transcript was added / removed / re-parsed. Under the
     # sidebar's polling this is usually a no-op, which avoids a concurrent-write storm.
     if changed or out.keys() != cache.keys():
@@ -254,8 +421,11 @@ def _merge(s: dict, resolve=None) -> dict:
     ov = get_overlay(s["id"])
     repo_name, task_id = (resolve or _repo_task_for_cwd)(s.get("cwd"))
     title = ov.get("name") or s.get("title") or (s.get("first_prompt") or "")[:64] or s["id"][:8]
+    # Overlay agent wins once locked; else the index source (claude/grok scan).
+    agent = agents.normalize_agent(ov.get("agent") or s.get("agent"))
     return {
         **s,
+        "agent": agent,
         "repo": repo_name,
         "task": task_id,
         "name": ov.get("name"),
@@ -417,11 +587,14 @@ def get_transcript(sid: str) -> list[dict]:
 
 # --- trash (soft delete) ------------------------------------------------------
 def _find_transcript(sid: str) -> Path | None:
-    if CLAUDE_PROJECTS.exists():
-        for proj in CLAUDE_PROJECTS.iterdir():
-            f = proj / f"{sid}.jsonl"
-            if f.exists():
-                return f
+    """Locate a Claude transcript jsonl (legacy name — used by get_transcript).
+
+    Grok sessions are directories, not single jsonl files; get_transcript only
+    reconstructs Claude's format today. Prefer agents.find_* for existence checks.
+    """
+    found = agents.find_claude_transcript(sid)
+    if found:
+        return found
     return None
 
 

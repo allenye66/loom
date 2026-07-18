@@ -303,29 +303,33 @@ function CopyTextPanel({ chatId, onClose }: { chatId: string; onClose: () => voi
 }
 
 /**
- * Terminal mode: the *real* interactive `claude` TUI, bridged from a server-side PTY to
- * xterm.js. No reimplementation — every slash command / permission prompt is claude's own.
- * Two hosts (see loom/core/terminals.py): `pty` (default) = a detached daemon, inline
- * renderer, xterm owns scrollback → native smooth scroll + select/copy; `tmux` (classic) =
- * fullscreen-pinned, scroll forwarded as SGR wheel events. Both outlive this tab and loom
- * restarts, so a dropped socket just reconnects to the running session. Wraps the
- * conversation pane in loom's shell (the `ChatSidebar` + dev-stack bar).
+ * Terminal mode: the *real* interactive agent TUI (claude or grok), bridged from a
+ * server-side PTY to xterm.js. No reimplementation — every slash command / permission
+ * prompt is the CLI's own. Two hosts (see loom/core/terminals.py): `pty` (default) = a
+ * detached daemon, inline renderer, xterm owns scrollback → native smooth scroll +
+ * select/copy; `tmux` (classic) = fullscreen-pinned, scroll forwarded as SGR wheel events.
+ * Both outlive this tab and loom restarts, so a dropped socket just reconnects to the
+ * running session. Wraps the conversation pane in loom's shell (the `ChatSidebar` +
+ * dev-stack bar).
  */
 export function TerminalView({
   resume,
   cwd,
   title,
+  agent,
   onClose,
 }: {
   resume?: string;
   cwd?: string;
   title?: string;
+  agent?: 'claude' | 'grok';
   onClose: () => void;
 }) {
   const holderRef = useRef<HTMLDivElement>(null);
   // Which host backs this session — reported by the server on WS open. Drives the header
   // label/menus; the live wheel/snapshot branching uses the effect-local mirror below.
   const [backend, setBackend] = useState<TermBackend | null>(null);
+  const [liveAgent, setLiveAgent] = useState<'claude' | 'grok' | null>(agent ?? null);
   // Bumped after a renderer switch → remounts the whole terminal (fresh xterm state — the
   // old host's alt-screen/scrollback state must not leak into the new one) + a fresh WS.
   const [termEpoch, setTermEpoch] = useState(0);
@@ -378,6 +382,7 @@ export function TerminalView({
     // Branches the wheel path: tmux owns the screen (forward SGR wheel events), pty gives
     // xterm its own scrollback (scroll locally). Default pty = the server's default.
     let liveBackend: TermBackend = 'pty';
+    let sessionAgent: 'claude' | 'grok' = agent === 'grok' ? 'grok' : 'claude';
     // Persistent streaming UTF-8 decoder. claude's TUI is mostly box-drawing/Unicode; a multibyte
     // char split across two WS frames would decode to U+FFFD if each frame were decoded on its own.
     // decode(…, {stream:true}) carries the partial bytes into the next frame; flushed on reconnect
@@ -429,9 +434,9 @@ export function TerminalView({
       ws.binaryType = 'arraybuffer';
       ws.onopen = () => {
         retry = 0;
-        // First frame carries the chat id + cwd + initial size; the server (re)attaches
-        // the session and replays its recent output.
-        send({ chat_id: resume, cwd, cols: term.cols, rows: term.rows });
+        // First frame carries the chat id + cwd + initial size + agent; the server
+        // (re)attaches the session and replays its recent output.
+        send({ chat_id: resume, cwd, cols: term.cols, rows: term.rows, agent });
         lastSentDims = `${term.cols}x${term.rows}`; // session is (re)attached at this size — seed the dedup
         pingTimer = window.setInterval(() => send({ type: 'ping' }), 25000);
       };
@@ -442,8 +447,12 @@ export function TerminalView({
             if (m.type === 'backend') {
               liveBackend = m.backend === 'tmux' ? 'tmux' : 'pty';
               setBackend(liveBackend);
+              if (m.agent === 'claude' || m.agent === 'grok') {
+                sessionAgent = m.agent;
+                setLiveAgent(m.agent);
+              }
             } else if (m.type === 'exit') {
-              term.write('\r\n\x1b[2m[claude exited — close and reopen to start a new session]\x1b[0m\r\n');
+              term.write(`\r\n\x1b[2m[${sessionAgent} exited — close and reopen to start a new session]\x1b[0m\r\n`);
             } else if (m.type === 'error') {
               term.write(`\r\n\x1b[31m[loom] ${m.message}\x1b[0m\r\n`);
             } else if (m.type === 'snapshot-start') {
@@ -657,7 +666,7 @@ export function TerminalView({
       }
       term.dispose();
     };
-  }, [resume, cwd, termEpoch]);
+  }, [resume, cwd, termEpoch, agent]);
 
   return (
     <div className="fixed inset-0 z-50 bg-canvas/95 backdrop-blur flex">
@@ -668,9 +677,14 @@ export function TerminalView({
             <span className="text-[10.5px] mono px-2 py-0.5 rounded-full border border-accent-dim text-accent shrink-0">
               ❯ terminal
             </span>
-            <span className="mono text-sm text-ink truncate">{title ?? 'claude'}</span>
+            <span className="mono text-sm text-ink truncate">{title ?? liveAgent ?? 'session'}</span>
+            {liveAgent && (
+              <span className="text-[10px] mono px-1.5 py-0.5 rounded border border-edge text-muted shrink-0">
+                {liveAgent}
+              </span>
+            )}
             <span className="text-[10.5px] mono text-muted hidden sm:block shrink-0">
-              real claude TUI · {backend === 'tmux' ? 'classic (tmux)' : backend === 'pty' ? 'smooth scroll (pty)' : '…'}
+              real {liveAgent ?? 'agent'} TUI · {backend === 'tmux' ? 'classic (tmux)' : backend === 'pty' ? 'smooth scroll (pty)' : '…'}
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">

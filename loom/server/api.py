@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from loom import __version__
-from loom.core import claude_session, doctor, github, manager, monitor, perf, registry, repos, sessions, terminals
+from loom.core import agents, claude_session, doctor, github, manager, monitor, perf, registry, repos, sessions, terminals
 from loom.core.config import LOGS_DIR, LOOM_HOME, load_repo_config
 from loom.core.tests import build_test_run, serialize_lock
 
@@ -79,8 +79,10 @@ def _view(task) -> dict:
     d = task.model_dump()
     d["git"] = git
     d["test"] = _test_runs.get(task.id)
+    ov = sessions.get_overlay(task.chat_id) if task.chat_id else {}
     # The task chat's locked surface ("chat"/"terminal"/None) — drives the open picker.
-    d["chat_mode"] = sessions.get_overlay(task.chat_id).get("mode") if task.chat_id else None
+    d["chat_mode"] = ov.get("mode")
+    d["chat_agent"] = agents.normalize_agent(ov.get("agent")) if task.chat_id else None
     return d
 
 
@@ -127,13 +129,14 @@ class TaskIn(BaseModel):
     branch: str
     base_branch: str | None = None
     note: str | None = None
+    agent: Literal["claude", "grok"] | None = None  # CLI for this task's chat; locked at create
 
 
 @router.post("/tasks")
 def create_task(body: TaskIn) -> dict:
     try:
         cfg = load_repo_config(body.repo_root)
-        return _view(manager.create_task(cfg, body.branch, body.base_branch, body.note))
+        return _view(manager.create_task(cfg, body.branch, body.base_branch, body.note, agent=body.agent))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, str(e)) from e
 
@@ -376,11 +379,16 @@ def _task_chat_id(task) -> str | None:
 
 @router.get("/tasks/{task_id}/chat")
 def task_chat(task_id: str) -> dict:
-    """This task's single chat id (1:1) + its locked mode — powers 'open' from a task card.
-    `mode` is null until the user first picks chat vs terminal (then it's fixed)."""
+    """This task's single chat id (1:1) + locked mode/agent — powers 'open' from a task card.
+    `mode` is null until the user first picks chat vs terminal (then it's fixed).
+    `agent` is claude|grok (defaults claude for legacy chats)."""
     cid = _task_chat_id(registry.get_task(task_id))
-    mode = sessions.get_overlay(cid).get("mode") if cid else None
-    return {"chat_id": cid, "mode": mode}
+    ov = sessions.get_overlay(cid) if cid else {}
+    return {
+        "chat_id": cid,
+        "mode": ov.get("mode"),
+        "agent": agents.normalize_agent(ov.get("agent")) if cid else None,
+    }
 
 
 # --- chats / sessions ---------------------------------------------------------
@@ -393,6 +401,8 @@ class ChatPatch(BaseModel):
     description: str | None = None
     pr: int | None = None
     mode: str | None = None  # "chat" (SDK UI) | "terminal" (xterm); fixed once chosen
+    # Which CLI powers the terminal: "claude" | "grok". Locked once set (create-time).
+    agent: Literal["claude", "grok"] | None = None
     # Which host runs the terminal: "pty" (smooth scroll, default) | "tmux" (classic).
     # Orthogonal to `mode` — only applies within terminal mode; switchable (see
     # /terminals/{chat_id}/backend).
@@ -457,12 +467,14 @@ def get_one_chat(sid: str) -> dict:
     """The chat's index entry + overlay (name/starred/archived), or null if it has no
     transcript yet. Powers the in-overlay rename/star/archive actions. `mode` is the
     locked surface (chat/terminal), surfaced top-level too so a ?chat= deep link can
-    restore the right one even before any transcript exists."""
-    mode = sessions.get_overlay(sid).get("mode")
+    restore the right one even before any transcript exists. `agent` is claude|grok."""
+    ov = sessions.get_overlay(sid)
+    mode = ov.get("mode")
+    agent = agents.normalize_agent(ov.get("agent"))
     chat = sessions.get_chat(sid)
     if chat is not None:
-        chat = {**chat, "mode": mode}
-    return {"chat": chat, "mode": mode}
+        chat = {**chat, "mode": mode, "agent": agent}
+    return {"chat": chat, "mode": mode, "agent": agent}
 
 
 @router.get("/chats/{sid}/prs")
@@ -664,24 +676,36 @@ async def term_ws(websocket: WebSocket) -> None:
         return
     cwd = start.get("cwd")
     # Floor the initial session size: a first frame from a zero-size / collapsed pane would create
-    # the session (and launch claude) at a few columns and permanently mis-wrap the TUI.
+    # the session (and launch the agent) at a few columns and permanently mis-wrap the TUI.
     cols = max(int(start.get("cols") or 120), 20)
     rows = max(int(start.get("rows") or 32), 5)
-    # Lock this chat to terminal mode (persisted; the UI won't offer a switch afterward).
+    # Lock terminal mode; set agent only if not already locked (create-time wins).
+    # Prefer client → index-derived agent → claude default so external grok transcripts
+    # still open under grok when the overlay hasn't been written yet.
     with contextlib.suppress(Exception):
-        sessions.set_overlay(chat_id, {"mode": "terminal"})
+        ov = sessions.get_overlay(chat_id)
+        patch: dict = {"mode": "terminal"}
+        if not ov.get("agent"):
+            indexed = None
+            with contextlib.suppress(Exception):
+                chat = sessions.get_chat(chat_id)
+                if chat:
+                    indexed = chat.get("agent")
+            patch["agent"] = agents.normalize_agent(start.get("agent") or indexed)
+        sessions.set_overlay(chat_id, patch)
+    agent = agents.normalize_agent(sessions.get_overlay(chat_id).get("agent"))
     try:
         ts = await terminals.open_terminal(chat_id, cwd, cols, rows)
-    except Exception as e:  # noqa: BLE001 — surface a tmux/claude launch failure to the client
+    except Exception as e:  # noqa: BLE001 — surface a launch failure to the client
         with contextlib.suppress(Exception):
             await websocket.send_json({"type": "error", "message": str(e)})
             await websocket.close()
         return
-    perf.log(f"WS open {chat_id} backend={ts.backend} subs={len(ts.subscribers) + 1}")
-    # Tell the client which host backs this session BEFORE any output: it branches the
+    perf.log(f"WS open {chat_id} agent={agent} backend={ts.backend} subs={len(ts.subscribers) + 1}")
+    # Tell the client which host + agent backs this session BEFORE any output: it branches the
     # wheel path (tmux = forward SGR wheel; pty = scroll xterm's own scrollback).
     with contextlib.suppress(Exception):
-        await websocket.send_json({"type": "backend", "backend": ts.backend})
+        await websocket.send_json({"type": "backend", "backend": ts.backend, "agent": agent})
     await ts.subscribe(websocket)  # repaint/snapshot for the newcomer
     try:
         while True:

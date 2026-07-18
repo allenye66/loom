@@ -62,6 +62,9 @@ function ChatRow({ chat, selected, onSelect }: { chat: Chat; selected: boolean; 
 
           <div className="flex flex-wrap items-center gap-1.5 mt-1.5 text-[10.5px] mono text-muted">
             {chat.branch && <span className="px-1.5 py-0.5 rounded border border-edge">{chat.branch}</span>}
+            {chat.agent && (
+              <span className="px-1.5 py-0.5 rounded border border-edge">{chat.agent}</span>
+            )}
             {chat.mode === 'terminal' && (
               <span className="px-1.5 py-0.5 rounded border border-accent-dim text-accent">● term</span>
             )}
@@ -99,7 +102,15 @@ function ChatRow({ chat, selected, onSelect }: { chat: Chat; selected: boolean; 
           onClick={(e) => e.stopPropagation()}
         >
           <button
-            onClick={() => openChat({ cwd: chat.cwd ?? undefined, resume: chat.id, title: chat.display_title, mode: chat.mode ?? undefined })}
+            onClick={() =>
+              openChat({
+                cwd: chat.cwd ?? undefined,
+                resume: chat.id,
+                title: chat.display_title,
+                mode: chat.mode ?? undefined,
+                agent: chat.agent ?? undefined,
+              })
+            }
             className={`${ACTION} text-accent`}
             title={chat.mode === 'terminal' ? 'open / resume (terminal)' : 'open / resume'}
           >
@@ -186,7 +197,14 @@ export function ChatsView({ repoRoot, repoName }: { repoRoot: string; repoName?:
       else {
         const c = chats[sel];
         if (!c) return;
-        if (e.key === 'o' || e.key === 'Enter') openChat({ cwd: c.cwd ?? undefined, resume: c.id, title: c.display_title, mode: c.mode ?? undefined });
+        if (e.key === 'o' || e.key === 'Enter')
+          openChat({
+            cwd: c.cwd ?? undefined,
+            resume: c.id,
+            title: c.display_title,
+            mode: c.mode ?? undefined,
+            agent: c.agent ?? undefined,
+          });
         else if (e.key === 's') a.patch.mutate({ id: c.id, patch: { starred: !c.starred } });
         else if (e.key === 'e') a.patch.mutate({ id: c.id, patch: { archived: !c.archived } });
         else if (e.key === 'x') a.patch.mutate({ id: c.id, patch: { hidden: true } });

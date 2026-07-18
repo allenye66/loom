@@ -49,8 +49,11 @@ export function TaskCard({ task }: { task: Task }) {
   // falling back to a new one if there isn't yet.
   const onOpen = async (mode: 'chat' | 'terminal') => {
     let resume: string | undefined;
+    let agent: 'claude' | 'grok' | undefined = task.chat_agent ?? undefined;
     try {
-      resume = (await fetch(`/api/tasks/${task.id}/chat`).then((r) => r.json())).chat_id || undefined;
+      const d = await fetch(`/api/tasks/${task.id}/chat`).then((r) => r.json());
+      resume = d.chat_id || undefined;
+      if (d.agent === 'claude' || d.agent === 'grok') agent = d.agent;
     } catch { /* fall back to a new chat */ }
     if (resume) {
       try {
@@ -61,7 +64,7 @@ export function TaskCard({ task }: { task: Task }) {
         });
       } catch { /* best-effort lock */ }
     }
-    openChat({ cwd: task.worktree_path, resume, title: task.branch, mode });
+    openChat({ cwd: task.worktree_path, resume, title: task.branch, mode, agent });
   };
 
   const testing = task.test?.running ?? false;
@@ -196,10 +199,10 @@ export function TaskCard({ task }: { task: Task }) {
         ) : (
           <button
             onClick={() => onOpen('terminal')}
-            title="open the claude terminal"
+            title={`open the ${task.chat_agent ?? 'agent'} terminal`}
             className="text-xs px-2.5 py-1.5 rounded bg-accent/15 text-accent border border-accent-dim hover:bg-accent/25"
           >
-            open
+            open{task.chat_agent ? ` · ${task.chat_agent}` : ''}
           </button>
         )}
         <div className="flex-1" />

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useOpenChat } from './openChat';
-import { useChatActions, useRepos, useTasks, useTaskActions, type Chat, type Task } from '../api';
+import { useChatActions, useDoctor, useRepos, useTasks, useTaskActions, type AgentId, type Chat, type Task } from '../api';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
 // opening a chat triggers (otherwise clicking a chat would snap the tab back to 'active').
@@ -200,6 +200,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const { patch } = useChatActions();
   const { create, remove } = useTaskActions();
   const { data: repos } = useRepos();
+  const { data: doctor } = useDoctor();
   const [tab, setTabState] = useState<'active' | 'archived'>(_sidebarTab);
   const setTab = (t: 'active' | 'archived') => {
     _sidebarTab = t; // persist across the remount that opening a chat causes
@@ -214,7 +215,10 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const dragId = useRef<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [branch, setBranch] = useState('');
+  const [agent, setAgent] = useState<AgentId>('claude');
   const repoRoot = repos?.[0]?.root || '';
+  const hasClaude = doctor?.some((c) => c.name === 'claude CLI' && c.ok) ?? true;
+  const hasGrok = doctor?.some((c) => c.name === 'grok CLI' && c.ok) ?? false;
   // This sidebar shows *loom's* work — one chat per task worktree — so filter the chat
   // index down to chats whose cwd is a current task worktree.
   const { data: tasks } = useTasks();
@@ -241,7 +245,15 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const termById = new Map((termData ?? []).map((t) => [t.chat_id, t]));
   const taskChats = (chatList ?? []).filter((c) => c.cwd && worktreeSet.has(c.cwd));
 
-  type Row = { id: string; title: string; cwd?: string | null; starred: boolean; last: number; mode?: 'chat' | 'terminal' | null };
+  type Row = {
+    id: string;
+    title: string;
+    cwd?: string | null;
+    starred: boolean;
+    last: number;
+    mode?: 'chat' | 'terminal' | null;
+    agent?: AgentId | null;
+  };
   const rows: Row[] = taskChats.map((c) => ({
     id: c.id,
     title: c.name || c.display_title || c.id.slice(0, 8),
@@ -249,6 +261,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     starred: c.starred,
     last: c.last_active,
     mode: c.mode,
+    agent: c.agent,
   }));
 
   // Stable, user-controlled order: each chat keeps its saved slot; brand-new chats sit at the
@@ -307,7 +320,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     setBranch('');
     setCreating(false);
     try {
-      const task = await create.mutateAsync({ repo_root: repoRoot, branch: b });
+      const task = await create.mutateAsync({ repo_root: repoRoot, branch: b, agent });
       // Only open a chat for a healthy task — a worktree that failed to create would just
       // produce repeated "working directory does not exist" errors.
       if (task?.state === 'error') {
@@ -315,7 +328,13 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         return;
       }
       if (task?.worktree_path)
-        openChat({ cwd: task.worktree_path, resume: task.chat_id ?? undefined, title: task.branch, mode: 'terminal' });
+        openChat({
+          cwd: task.worktree_path,
+          resume: task.chat_id ?? undefined,
+          title: task.branch,
+          mode: 'terminal',
+          agent: task.chat_agent ?? agent,
+        });
     } catch (e: any) {
       alert(`Couldn’t create the task:\n\n${e?.message ?? e}`);
     }
@@ -335,26 +354,51 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       </div>
 
       {creating && (
-        <div className="px-3 pb-2 flex gap-1">
-          <input
-            autoFocus
-            value={branch}
-            onChange={(e) => setBranch(sanitizeBranch(e.target.value))}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') createTask();
-              if (e.key === 'Escape') setCreating(false);
-            }}
-            placeholder={repoRoot ? 'new branch name…' : 'add a repo first'}
-            disabled={!repoRoot}
-            className="flex-1 min-w-0 mono text-[11px] px-2 py-1 rounded bg-surface border border-edge outline-none focus:border-accent"
-          />
-          <button
-            onClick={createTask}
-            disabled={!branch || !repoRoot || create.isPending}
-            className="text-[11px] px-2 py-1 rounded bg-accent/15 text-accent border border-accent-dim disabled:opacity-40"
-          >
-            {create.isPending ? '…' : 'go'}
-          </button>
+        <div className="px-3 pb-2 flex flex-col gap-1.5">
+          <div className="flex gap-1">
+            <input
+              autoFocus
+              value={branch}
+              onChange={(e) => setBranch(sanitizeBranch(e.target.value))}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') createTask();
+                if (e.key === 'Escape') setCreating(false);
+              }}
+              placeholder={repoRoot ? 'new branch name…' : 'add a repo first'}
+              disabled={!repoRoot}
+              className="flex-1 min-w-0 mono text-[11px] px-2 py-1 rounded bg-surface border border-edge outline-none focus:border-accent"
+            />
+            <button
+              onClick={createTask}
+              disabled={!branch || !repoRoot || create.isPending}
+              className="text-[11px] px-2 py-1 rounded bg-accent/15 text-accent border border-accent-dim disabled:opacity-40"
+            >
+              {create.isPending ? '…' : 'go'}
+            </button>
+          </div>
+          <div className="flex rounded-md border border-edge overflow-hidden text-[10px] mono">
+            {([
+              { id: 'claude' as const, label: 'claude', ok: hasClaude },
+              { id: 'grok' as const, label: 'grok', ok: hasGrok },
+            ]).map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                disabled={!opt.ok}
+                title={opt.ok ? `use ${opt.label}` : `${opt.label} CLI not on PATH`}
+                onClick={() => setAgent(opt.id)}
+                className={`flex-1 px-1.5 py-0.5 ${
+                  agent === opt.id
+                    ? 'bg-accent/15 text-accent'
+                    : opt.ok
+                      ? 'bg-surface text-muted hover:text-ink'
+                      : 'bg-surface text-muted/40 cursor-not-allowed'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
@@ -407,20 +451,42 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           onDragEnd={() => {
             dragId.current = null;
           }}
-          onClick={() => openChat({ resume: r.id, cwd: r.cwd ?? undefined, title: r.title, mode: r.mode ?? undefined })}
+          onClick={() =>
+            openChat({
+              resume: r.id,
+              cwd: r.cwd ?? undefined,
+              title: r.title,
+              mode: r.mode ?? undefined,
+              agent: r.agent ?? undefined,
+            })
+          }
           className={`group w-full text-left px-3 py-2 flex items-center gap-2 border-l-2 ${
             q ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
           } ${r.id === activeSid ? 'bg-surface-2 border-accent' : 'border-transparent hover:bg-surface-2/60'}`}
         >
           <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${working ? 'bg-accent animate-pulse' : needs ? 'bg-ok' : 'bg-muted/40'}`} />
           <span className="text-xs text-ink truncate flex-1">{r.title}</span>
-          {working && <span title="claude is working (recent output)" className="text-[9px] mono text-accent shrink-0 animate-pulse">working</span>}
-          {needs && <span title="idle — claude may be waiting on you" className="text-[9px] mono text-ok shrink-0">needs you</span>}
-          {r.mode === 'terminal' && !working && !needs && <span title="terminal chat (real claude TUI)" className="text-[9px] mono text-accent shrink-0">❯</span>}
+          {r.agent && (
+            <span title={`${r.agent} session`} className="text-[9px] mono text-muted shrink-0 opacity-70">
+              {r.agent === 'grok' ? 'g' : 'c'}
+            </span>
+          )}
+          {working && <span title="agent is working (recent output)" className="text-[9px] mono text-accent shrink-0 animate-pulse">working</span>}
+          {needs && <span title="idle — agent may be waiting on you" className="text-[9px] mono text-ok shrink-0">needs you</span>}
+          {r.mode === 'terminal' && !working && !needs && <span title="terminal chat (real agent TUI)" className="text-[9px] mono text-accent shrink-0">❯</span>}
           {/* Open this chat as a terminal (resumes the same transcript in the real claude TUI). */}
           {r.mode !== 'terminal' && (
             <button
-              onClick={(e) => { e.stopPropagation(); openChat({ resume: r.id, cwd: r.cwd ?? undefined, title: r.title, mode: 'terminal' }); }}
+              onClick={(e) => {
+                e.stopPropagation();
+                openChat({
+                  resume: r.id,
+                  cwd: r.cwd ?? undefined,
+                  title: r.title,
+                  mode: 'terminal',
+                  agent: r.agent ?? undefined,
+                });
+              }}
               title="open as a terminal (real claude TUI)"
               className="opacity-0 group-hover:opacity-100 text-muted hover:text-accent shrink-0 text-[9px] mono leading-none"
             >

@@ -1,12 +1,11 @@
-"""Per-worktree runtime context for Claude sessions.
+"""Per-worktree runtime context for agent sessions (Claude / Grok).
 
 When a chat/terminal's cwd is inside a loom worktree, loom injects that task's
 ports + log dir as environment variables (so the agent's Bash/curl target the
 worktree's own dev stack, not a default dev port) and appends a short note to
-Claude Code's system prompt describing them. Both the terminal launcher
-(`terminals.py`) use this; it's deliberately project-agnostic — anything
-app-specific lives in the repo's `.loom.yaml`, never here. The terminal
-launcher (`terminals.py`) uses this to build each session's environment.
+the agent system prompt describing them. The terminal launcher (`terminals.py`)
+uses this; it's deliberately project-agnostic — anything app-specific lives in
+the repo's `.loom.yaml`, never here.
 """
 
 from __future__ import annotations
