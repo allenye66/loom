@@ -92,6 +92,43 @@ def _run_setup(cfg: RepoConfig, task: Task) -> None:
         subprocess.run(_render(cmd, ctx), shell=True, cwd=task.worktree_path, capture_output=True, text=True)
 
 
+def task_for_chat(chat_id: str) -> Task | None:
+    """The task linked to a chat (strict 1:1 via chat_id), falling back to matching the
+    chat's recorded cwd to a worktree for legacy tasks created before the link existed."""
+    task = next((t for t in registry.list_tasks() if t.chat_id == chat_id), None)
+    if task is None:
+        cwd = next((s.get("cwd") for s in sessions_mod.build_index() if s["id"] == chat_id), None)
+        if cwd:
+            task = next((t for t in registry.list_tasks() if t.worktree_path == cwd), None)
+    return task
+
+
+def release_ports(task_id: str) -> Task | None:
+    """Return a task's port offset to the pool (offsets are only 1..90). Called when a chat is
+    archived: an archived worktree's dev stack is already stopped, so it has no business holding
+    an offset — otherwise dead tasks pile up and eventually starve `allocate()`. A fresh offset is
+    handed out again on unarchive / next start (see `reallocate_ports`, `start_task`)."""
+    task = registry.get_task(task_id)
+    if not task or not task.ports:
+        return task
+    task.ports = None
+    task.updated_at = registry.now_iso()
+    return registry.upsert(task)
+
+
+def reallocate_ports(cfg: RepoConfig, task_id: str) -> Task | None:
+    """Give a task a fresh port offset if it has none (unarchive path). Deterministic per branch,
+    dodging offsets other live tasks currently hold — so an unarchived worktree may land on a
+    different offset than it had before it was archived."""
+    task = registry.get_task(task_id)
+    if not task or task.ports:
+        return task
+    taken = {t.ports.offset for t in registry.list_tasks() if t.ports}
+    task.ports = ports_mod.allocate(task.id, cfg.ports.get("backend", 8000), cfg.ports.get("frontend", 3000), taken)
+    task.updated_at = registry.now_iso()
+    return registry.upsert(task)
+
+
 def remove_task(task_id: str, force: bool = False) -> None:
     task = registry.get_task(task_id)
     if not task:
@@ -115,6 +152,10 @@ def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> T
     if not task:
         raise ValueError(f"unknown task '{task_id}'")
     ensure_dirs()
+    # An archived task had its offset released (see `release_ports`); starting a stack needs one
+    # back, or `{offset}`/`{backend_port}` render literally and the commands break.
+    if not task.ports:
+        task = reallocate_ports(cfg, task_id) or task
     if only:
         # Clean (re)start of just the named services: free their port from whatever is actually
         # LISTENING now (kill_port is LISTEN-only). Do NOT kill_group(svc.pid) — a stored pid can be

@@ -423,15 +423,35 @@ def list_chats(
 
 @router.patch("/chats/{sid}")
 def patch_chat(sid: str, body: ChatPatch) -> dict:
-    out = sessions.set_overlay(sid, body.model_dump(exclude_none=True))
-    if body.archived:
-        # An archived chat's task shouldn't keep a dev stack running (see monitor.py reaper).
-        # Best-effort — never fail the archive because a stop did. Sync route → threadpool,
-        # so the blocking kills stay off the event loop.
+    patch = body.model_dump(exclude_none=True)
+    # Agent is sticky once locked — ignore attempts to flip after first set.
+    if "agent" in patch:
+        existing = sessions.get_overlay(sid).get("agent")
+        if existing:
+            patch.pop("agent", None)
+        else:
+            patch["agent"] = agents.normalize_agent(patch["agent"])
+    out = sessions.set_overlay(sid, patch)
+    if body.archived is not None:
+        # Archiving frees the task's port offset (the pool is only 1..90, so dead worktrees can't
+        # squat one forever); unarchiving hands a fresh offset back. Best-effort — never fail the
+        # overlay write because the port bookkeeping did. Sync route → threadpool, so the blocking
+        # stop/allocate stays off the event loop.
+        task = None
         with contextlib.suppress(Exception):
-            tid = monitor.stop_for_archived_chat(sid)
-            if tid:
-                print(f"[loom reaper] {tid}: stopped dev stack (chat archived)", flush=True)
+            task = manager.task_for_chat(sid)
+        if body.archived:
+            # An archived chat's task shouldn't keep a dev stack running (see monitor.py reaper).
+            with contextlib.suppress(Exception):
+                tid = monitor.stop_for_archived_chat(sid)
+                if tid:
+                    print(f"[loom reaper] {tid}: stopped dev stack (chat archived)", flush=True)
+            if task:
+                with contextlib.suppress(Exception):
+                    manager.release_ports(task.id)
+        elif task and not task.ports:  # explicit unarchive → give it ports again
+            with contextlib.suppress(Exception):
+                manager.reallocate_ports(load_repo_config(task.repo_root), task.id)
     return out
 
 
