@@ -167,7 +167,7 @@ function RepoPicker({ value, onChange }: { value: string; onChange: (v: string) 
 
 export default function App() {
   const { data: repos } = useRepos();
-  const [view, setView] = useState<'tasks' | 'chats'>('tasks');
+  const [view, setView] = useState<'tasks' | 'chats'>('chats');
   const [repoRoot, setRepoRoot] = useState('');
 
   const activeRoot = repoRoot || repos?.[0]?.root || '';
