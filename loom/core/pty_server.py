@@ -220,6 +220,17 @@ class PtyServer:
         # select loop's write set — NEVER by a blocking write.
         self._pty_write_buf = bytearray()
         self._running = True
+        # Optional raw-input capture, for diagnosing stray /clear submissions (what bytes reach
+        # claude right before a /clear-offspring session appears). Enabled by creating
+        # ~/.loom/pty-debug-input BEFORE a daemon (re)launch; off by default → zero cost.
+        self._input_log: Path | None = None
+        try:
+            if (Path.home() / ".loom" / "pty-debug-input").exists():
+                logdir = Path.home() / ".loom" / "logs"
+                logdir.mkdir(parents=True, exist_ok=True)
+                self._input_log = logdir / f"{Path(self.socket_path).stem}-input.log"
+        except OSError:
+            self._input_log = None
 
     # --- startup -------------------------------------------------------------
     def start(self):
@@ -457,6 +468,14 @@ class PtyServer:
         slow network regularly splits the 6-byte frame across boundaries, and
         writing the partial bytes to the PTY corrupts what the user is typing.
         """
+        if self._input_log is not None:
+            try:
+                if self._input_log.stat().st_size < 8_000_000 if self._input_log.exists() else True:
+                    with open(self._input_log, "ab") as f:
+                        f.write(f"{time.time():.3f} {data!r}\n".encode())
+            except OSError:
+                pass
+
         if self._pending:
             buf = bytes(self._pending) + data
             self._pending.clear()
