@@ -441,6 +441,23 @@ def _merge(s: dict, resolve=None) -> dict:
     }
 
 
+def _is_contentless_junk(r: dict) -> bool:
+    """A `/clear` (or other slash-command) offspring: a fresh session id whose only records are
+    local-command plumbing — no overlay name, no ai-title, no first prompt, no preview, no
+    assistant turn, AND at least one user record that's pure command noise (n_user > 0 while
+    first_prompt stays None, e.g. the `<local-command-caveat>` + `<command-name>/clear` pair). Hide
+    those; they'd list as a bare UUID and are noise.
+
+    A brand-new session the user just opened but hasn't typed in yet has n_user == 0 — NOT junk.
+    Keep it so it persists in the sidebar until the first message (a real prompt/reply also makes
+    it non-empty and it stays on its own). Starred always survives."""
+    if r.get("starred"):
+        return False
+    if r.get("name") or r.get("title") or r.get("first_prompt") or r.get("preview") or r.get("n_assistant"):
+        return False
+    return (r.get("n_user") or 0) > 0
+
+
 def _haystack(r: dict) -> str:
     parts = [
         r.get("display_title", ""),
@@ -469,6 +486,10 @@ def list_chats(
     # Trashed chats are unlisted in every tab (the transcript itself is untouched — see
     # trash_chat; now that trashing no longer moves the file, the index still sees it).
     rows = [r for r in rows if not r["deleted"]]
+    # Drop /clear-offspring & empty aborted sessions (bare-UUID, zero human content) — see
+    # _is_contentless_junk. They'd otherwise clutter the list and invite a misclick that opens
+    # an orphan session.
+    rows = [r for r in rows if not _is_contentless_junk(r)]
 
     if scope == "repo" and repo:
         rows = [r for r in rows if r["repo"] == repo]
