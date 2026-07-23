@@ -549,7 +549,15 @@ export function TerminalView({
     const MAX_NOTCHES_PER_EVENT = 6; // cap per DOM wheel event so a fast flick still can't flood tmux
     let wheelAccum = 0;
     term.attachCustomWheelEventHandler((e) => {
-      if (liveBackend === 'tmux') {
+      // Forward the wheel as SGR mouse events whenever the SERVER-SIDE app owns the screen and
+      // xterm has no local scrollback to move:
+      //  • tmux: always (tmux is fullscreen-pinned, xterm only ever sees its alt buffer).
+      //  • pty + alt-screen: claude 2.x runs as a fullscreen alt-screen TUI (\x1b[?1049h → no
+      //    xterm scrollback). It enables mouse tracking (?1000/1002/1003/1006h), so forwarding the
+      //    wheel makes claude scroll its OWN conversation — the only thing that CAN scroll there.
+      // Otherwise (pty inline / main buffer): xterm owns a real scrollback — glide over it locally.
+      const appOwnsScreen = liveBackend === 'tmux' || term.buffer?.active?.type === 'alternate';
+      if (appOwnsScreen) {
         const px = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 800 : e.deltaY;
         if (!px) return false; // ignore horizontal / zero-delta
         if (wheelAccum !== 0 && Math.sign(px) !== Math.sign(wheelAccum)) wheelAccum = 0; // snappy reversals
@@ -559,11 +567,11 @@ export function TerminalView({
           wheelAccum -= notches * SCROLL_STEP_PX;
           const seq = notches < 0 ? '\x1b[<64;1;1M' : '\x1b[<65;1;1M'; // SGR wheel up / down
           for (let i = 0; i < Math.min(Math.abs(notches), MAX_NOTCHES_PER_EVENT); i++) send({ type: 'input', data: seq });
-          scheduleRepaint(); // self-heal any tear once scrolling stops
+          if (liveBackend === 'tmux') scheduleRepaint(); // tmux needs a repaint nudge; claude redraws itself
         }
         return false;
       }
-      // pty: scroll xterm's own buffer. Return false so xterm does NOT also apply its
+      // pty inline: scroll xterm's own buffer. Return false so xterm does NOT also apply its
       // default wheel handling (we own the motion); trackpads fall through to native.
       if (isMouseWheelEvent(e.deltaY, e.deltaMode)) {
         const lineHeight =
@@ -572,7 +580,7 @@ export function TerminalView({
         animateWheelScroll(term, lines, wheelAnim);
         return false;
       }
-      return true; // trackpad → native xterm scroll (OS momentum)
+      return true; // trackpad, inline → native xterm scroll (OS momentum)
     });
 
     const onData = term.onData((d) => {

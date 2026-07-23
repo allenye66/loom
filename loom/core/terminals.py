@@ -696,6 +696,16 @@ class PtyTerminalSession(_SessionBase):
         child_env = agents.child_env(agent, self.chat_id, {**os.environ, **res, **env})
         for k in _SCRUB:
             child_env.pop(k, None)
+        if agent == "claude":
+            # Render INLINE on the main screen instead of the alternate screen. The alt screen has
+            # no scrollback (by spec), which is why the wheel scrolled nothing under the pty host
+            # for claude 2.x; inline, xterm.js keeps its native scrollback (scrollback:12000) so the
+            # wheel + drag-select/copy just work, and loom's normal-buffer wheel path handles it.
+            # Also dissolves the alt-screen + mouse-tracking interaction that let /clear be
+            # mouse-selected into firing. Set AFTER _SCRUB so it can't be stripped. pty host only —
+            # the tmux backend keeps the alt screen (tmux owns its own scrollback). Validated
+            # 2026-07 (deep-research): claude honors this and emits no scrollback-purging clears.
+            child_env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
 
         full_cmd = [
             sys.executable, "-m", "loom.core.pty_server", self.socket_path,
