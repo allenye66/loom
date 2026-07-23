@@ -159,6 +159,38 @@ class _SessionBase:
     _PASTE_ON, _PASTE_OFF = b"\x1b[200~", b"\x1b[201~"
     _GUARD_LINE_CAP = 256  # longer lines can't equal a blocked command — stop tracking
 
+    @staticmethod
+    def _mouse_seq_end(data: bytes, i: int) -> int | None:
+        """If a terminal MOUSE report starts at data[i] (== ESC), return its end index (exclusive);
+        else None; or -1 if it starts like one but is truncated at the buffer end (caller carries).
+
+        claude enables mouse tracking (?1000/1002/1003/1006h), so these stream constantly as you
+        move/click over the terminal:
+            SGR (1006):    ESC [ < digits ; digits ; digits (M|m)
+            legacy (1000): ESC [ M  <btn> <col> <row>            (3 bytes after M)
+        They are NOT composer input. Letting them null _line_buf makes the /clear guard fail OPEN
+        (mouse mode = permanent taint), which is how /clear kept sailing through. Match them so the
+        caller passes them through WITHOUT tainting line-tracking."""
+        n = len(data)
+        if i + 1 >= n or data[i + 1] != 0x5B:      # need "ESC ["
+            return None
+        if i + 2 >= n:
+            return -1
+        c = data[i + 2]
+        if c == 0x4D:                              # legacy: ESC [ M + 3 bytes
+            end = i + 6
+            return end if end <= n else -1
+        if c == 0x3C:                              # SGR: ESC [ < params (M|m)
+            j = i + 3
+            while j < n and (0x30 <= data[j] <= 0x39 or data[j] == 0x3B):  # digit / ';'
+                j += 1
+                if j - (i + 3) > 24:               # far longer than any real report → not mouse
+                    return None
+            if j >= n:
+                return -1                          # truncated mid-params
+            return j + 1 if data[j] in (0x4D, 0x6D) else None
+        return None
+
     def _guard_input(self, data: bytes) -> bytes:
         """Swallow the Enter that would submit a blocked local command (today: /clear).
 
@@ -194,7 +226,18 @@ class _SessionBase:
                 if 2 <= len(rest) < 6 and (self._PASTE_ON.startswith(rest) or self._PASTE_OFF.startswith(rest)):
                     self._guard_carry = bytes(data[i:])
                     return bytes(out)
-                self._line_buf = None  # real escape sequence → composer state unknowable
+                # Mouse reports flood in while claude has mouse tracking on. Pass them through
+                # verbatim WITHOUT tainting _line_buf, else the guard fails open (see below) and
+                # /clear sails through — the confirmed cause of stray /clear-offspring sessions.
+                mend = self._mouse_seq_end(data, i)
+                if mend == -1:                      # truncated mouse report → carry the tail
+                    self._guard_carry = bytes(data[i:])
+                    return bytes(out)
+                if mend is not None:                # complete mouse report → transparent
+                    out += data[i:mend]
+                    i = mend
+                    continue
+                self._line_buf = None  # real (non-mouse) escape sequence → composer state unknowable
                 out.append(b)
                 i += 1
                 continue
@@ -202,10 +245,18 @@ class _SessionBase:
                 if self._paste_depth:  # literal newline inside a paste → composer newline
                     self._line_buf = bytearray()
                 elif self._line_buf is not None and bytes(self._line_buf).strip() in self._BLOCKED_SUBMITS:
+                    # Swallow the Enter AND erase the command from claude's composer, so it can't
+                    # linger and fire later. Just dropping the Enter left "/clear" sitting in the
+                    # composer; a reconnect/loom-restart resets _line_buf, and the next Enter on
+                    # that still-present "/clear" sailed through the guard (empty buf → fail open)
+                    # and executed — spawning the stray /clear-offspring chats. Backspaces == the
+                    # exact tracked length; the cursor is known at end (any cursor escape → None).
+                    out += b"\x7f" * len(self._line_buf)
+                    self._line_buf = bytearray()
                     with contextlib.suppress(Exception):  # beep, best-effort
                         self.outq.put_nowait(("data", b"\x07"))
                     i += 1
-                    continue  # swallow the Enter; typed text stays in the composer
+                    continue  # swallow the Enter; composer is now cleared of the blocked command
                 else:
                     self._line_buf = bytearray()  # normal submit → fresh line
                 out.append(b)
