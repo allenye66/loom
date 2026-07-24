@@ -431,6 +431,11 @@ def patch_chat(sid: str, body: ChatPatch) -> dict:
             patch.pop("agent", None)
         else:
             patch["agent"] = agents.normalize_agent(patch["agent"])
+    # Stamp the archive time so the archived tab can sort most-recently-archived first (a stale
+    # value from a prior archive is harmless — it's only read while archived, and re-archiving
+    # overwrites it).
+    if body.archived is True:
+        patch["archived_at"] = time.time()
     out = sessions.set_overlay(sid, patch)
     if body.archived is not None:
         # Archiving frees the task's port offset (the pool is only 1..90, so dead worktrees can't

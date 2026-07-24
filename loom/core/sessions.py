@@ -435,6 +435,7 @@ def _merge(s: dict, resolve=None) -> dict:
         "pr_manual": ov.get("pr"),
         "starred": ov.get("starred", False),
         "archived": ov.get("archived", False),
+        "archived_at": ov.get("archived_at"),  # epoch stamp; sorts the archived tab (may be None)
         "hidden": ov.get("hidden", False),
         "deleted": ov.get("deleted", False),  # trashed = unlisted everywhere (transcript untouched)
         "mode": ov.get("mode"),  # "chat" | "terminal" | None (not yet chosen)
@@ -538,7 +539,12 @@ def list_chats(
         ql = q.lower()
         rows = [r for r in rows if ql in _haystack(r)]
 
-    rows.sort(key=lambda r: (not r["starred"], -r["last_active"]))
+    if tab == "archived":
+        # Most-recently-archived first. Fall back to last activity for chats archived before
+        # archived_at was recorded (forward-looking stamp).
+        rows.sort(key=lambda r: (not r["starred"], -(r.get("archived_at") or r["last_active"])))
+    else:
+        rows.sort(key=lambda r: (not r["starred"], -r["last_active"]))
     return rows
 
 
