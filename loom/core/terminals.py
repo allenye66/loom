@@ -901,10 +901,14 @@ async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: in
         ts = cls(chat_id, cwd)
         ts.cols, ts.rows = cols or 120, rows or 32
         _registry[chat_id] = ts
-        # Persist the effective choice so this session keeps its host even if the
-        # default changes later (idempotent re-write on reopen).
+        # Persist the effective choice so this session keeps its host even if the default changes
+        # later, plus `opened_at` — a wall-clock stamp marking "loom actually attached a terminal
+        # to this chat" (distinct from mode:terminal, which create_task also sets). It's what lets
+        # list_chats keep a just-opened, not-yet-typed chat in the sidebar before claude writes any
+        # transcript (see _pending_chat_rows).
         await loop.run_in_executor(
-            None, sessions_mod.set_overlay, chat_id, {"terminal_backend": backend}
+            None, sessions_mod.set_overlay, chat_id,
+            {"terminal_backend": backend, "opened_at": time.time()},
         )
     await ts.open()
     return ts

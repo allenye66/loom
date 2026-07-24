@@ -473,6 +473,35 @@ def _haystack(r: dict) -> str:
     return " ".join(parts).lower()
 
 
+def _pending_chat_rows(indexed_ids: set, resolve) -> list[dict]:
+    """Chats loom has OPENED (their overlay carries `opened_at`) but that have no transcript yet.
+    claude writes nothing until the first message, so a just-opened, not-yet-typed chat is absent
+    from the index and would vanish from the sidebar the moment you click away. Surface a synthetic
+    row for each so it persists; the real indexed row takes over once the first message lands.
+    Only OPENED overlays qualify (a task's chat gets mode:terminal at create time too — opened_at
+    is written solely when a terminal actually attaches), so this never floods with never-opened
+    task chats."""
+    task_by_chat = {t.chat_id: t for t in registry.list_tasks() if t.chat_id}
+    out = []
+    for cid, ov in overlay_all().items():
+        if cid in indexed_ids or not ov.get("opened_at"):
+            continue
+        if ov.get("deleted") or ov.get("archived") or ov.get("hidden"):
+            continue
+        t = task_by_chat.get(cid)
+        out.append(_merge({
+            "id": cid, "agent": ov.get("agent"),
+            # Fall back to the branch name so a not-yet-typed chat reads as its worktree, not a
+            # bare UUID; the real ai-title/first-prompt replaces it once the first message lands.
+            "title": (t.branch if t else None), "preview": None, "first_prompt": None,
+            "branch": (t.branch if t else None), "cwd": (t.worktree_path if t else None),
+            "prs": [], "pr_repo": None, "created": None,
+            "last_active": float(ov.get("opened_at") or 0.0), "size": 0,
+            "n_user": 0, "n_assistant": 0,
+        }, resolve))
+    return out
+
+
 def list_chats(
     repo: str | None = None,
     scope: str = "repo",
@@ -482,7 +511,9 @@ def list_chats(
     starred: bool | None = None,
 ) -> list[dict]:
     resolve = _cwd_resolver()  # snapshot task/repo lists once, not once per chat
-    rows = [_merge(s, resolve) for s in build_index()]
+    indexed = [_merge(s, resolve) for s in build_index()]
+    # Keep just-opened, not-yet-typed chats visible (they have no transcript yet — see above).
+    rows = indexed + _pending_chat_rows({r["id"] for r in indexed}, resolve)
     # Trashed chats are unlisted in every tab (the transcript itself is untouched — see
     # trash_chat; now that trashing no longer moves the file, the index still sees it).
     rows = [r for r in rows if not r["deleted"]]
