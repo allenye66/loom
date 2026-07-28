@@ -4,7 +4,6 @@ import { ChatProvider } from './chat/ChatContext';
 import { useChatShell } from './chat/openChat';
 import { ChatSidebar } from './chat/ChatSidebar';
 import { TerminalView } from './term/TerminalView';
-import { NotesButton } from './notes/NotesButton';
 
 function Logo() {
   return (
@@ -190,7 +189,6 @@ function EmptyState() {
       )}
       <div className="flex items-center gap-2">
         <OpenWorktree />
-        <NotesButton />
         <DoctorBadge />
       </div>
     </div>

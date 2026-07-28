@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import json
 import os
 import shlex
 import shutil
@@ -33,6 +34,43 @@ _test_runs: dict[str, dict] = {}
 @router.get("/health")
 def health() -> dict:
     return {"ok": True, "version": __version__}
+
+
+@router.get("/usage")
+def usage() -> dict:
+    """Claude Code subscription usage, captured by loom's statusLine hook
+    (~/.loom/statusline-usage.sh, wired into ~/.claude/settings.json). Returns the same
+    5-hour / weekly `used_percentage` + reset times Claude Code itself reports via the
+    statusLine JSON — the official, token-free source. `available` is False until a chat
+    turn has run (Claude only includes `rate_limits` after the first API response), and the
+    numbers are "last known" (they refresh whenever any claude session updates its status line)."""
+    path = LOOM_HOME / "usage.json"
+    try:
+        data = json.loads(path.read_text())
+        mtime: float | None = path.stat().st_mtime
+    except (OSError, ValueError):
+        return {"available": False}
+
+    rl = (data or {}).get("rate_limits") or {}
+
+    def window(name: str) -> dict | None:
+        w = rl.get(name) or {}
+        pct = w.get("used_percentage")
+        if pct is None:
+            return None
+        return {"used_percentage": pct, "resets_at": w.get("resets_at")}
+
+    model = data.get("model")
+    if isinstance(model, dict):
+        model = model.get("display_name") or model.get("id")
+
+    return {
+        "available": True,
+        "five_hour": window("five_hour"),
+        "seven_day": window("seven_day"),
+        "model": model,
+        "updated": mtime,
+    }
 
 
 # doctor shells out to `gh auth status` (up to a 10s network timeout) + `docker info` + several

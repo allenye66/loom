@@ -7,8 +7,8 @@ import { DevStackBar, OpenInIde } from '../chat/ChatSidebar';
 import { PrBadges } from '../components/PrBadges';
 import { ServiceLogsPanel, useLogsPanel } from '../components/ServiceLogsPanel';
 import { NotesPanel } from '../notes/NotesPanel';
-import { NotesButton } from '../notes/NotesButton';
 import { useNote } from '../notes/notesStore';
+import { UsageChip } from '../usage/UsageChip';
 import type { Task } from '../api';
 
 // Per-chat notes drawer open-state, remembered across chat switches / reloads (the whole
@@ -722,6 +722,7 @@ export function TerminalView({
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            <UsageChip />
             {resume && (
               <button
                 onClick={() => setNotesOpen((v) => !v)}
@@ -734,10 +735,6 @@ export function TerminalView({
                 notes
               </button>
             )}
-            <NotesButton
-              label="all notes"
-              className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 shrink-0 inline-flex items-center gap-1.5"
-            />
             <button
               onClick={() => setShowText((v) => !v)}
               title="view the conversation as selectable text — copy any part (the fullscreen TUI can't drag-select across scroll)"

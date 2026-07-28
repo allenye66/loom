@@ -168,6 +168,23 @@ export const useChats = (params: ChatQuery) =>
 export const useTrash = () =>
   useQuery({ queryKey: ['chats-trash'], queryFn: () => jget<{ trash: string[] }>('/chats-trash').then((d) => d.trash) });
 
+// --- Claude Code subscription usage (from the statusLine hook; see loom/server/api.py) -------
+export type UsageWindow = { used_percentage: number; resets_at?: number | null } | null;
+export type Usage = {
+  available: boolean;
+  five_hour?: UsageWindow;
+  seven_day?: UsageWindow;
+  model?: string | null;
+  updated?: number | null;
+};
+
+export const useUsage = () =>
+  useQuery({
+    queryKey: ['usage'],
+    queryFn: () => jget<Usage>('/usage'),
+    refetchInterval: 20000,
+  });
+
 type ChatPatch = Partial<Pick<Chat, 'starred' | 'archived' | 'hidden' | 'name' | 'tags' | 'description' | 'mode'>>;
 
 export function useChatActions() {
