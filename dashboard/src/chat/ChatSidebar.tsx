@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useOpenChat } from './openChat';
+import { NotesButton } from '../notes/NotesButton';
+import {
+  addCategory,
+  assignChat,
+  moveCategory,
+  removeCategory,
+  renameCategory,
+  useCategories,
+} from '../categories/categoriesStore';
 import { useChatActions, useDoctor, useRepos, useTasks, useTaskActions, type AgentId, type Chat, type Task } from '../api';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
@@ -23,6 +32,24 @@ const saveChatOrder = (ids: string[]) => {
     localStorage.setItem(CHAT_ORDER_KEY, JSON.stringify(ids));
   } catch {
     /* private mode / quota — order just won't persist */
+  }
+};
+// Which category groups are collapsed in the sidebar (localStorage). Keyed by category id, or
+// the literal 'uncat' for the Uncategorized bucket.
+const COLLAPSED_KEY = 'loom.sidebarCollapsedCats';
+const loadCollapsed = (): Set<string> => {
+  try {
+    const v = JSON.parse(localStorage.getItem(COLLAPSED_KEY) || '[]');
+    return new Set(Array.isArray(v) ? v : []);
+  } catch {
+    return new Set();
+  }
+};
+const saveCollapsed = (s: Set<string>) => {
+  try {
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...s]));
+  } catch {
+    /* private mode / quota */
   }
 };
 // Live branch-name sanitizer: keep only chars git allows in a ref (spaces/anything else → '-').
@@ -295,6 +322,49 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     saveChatOrder(cur);
   };
 
+  // --- categories ---------------------------------------------------------------------------
+  // Shared with the (now-removed) board; assignments are by chat id. Chats group under their
+  // category; drag a chat onto a group (or a row in it) to (re)file it. Only kicks in once at
+  // least one category exists — otherwise the sidebar stays a plain list.
+  const { categories, assign } = useCategories();
+  const validCatIds = new Set(categories.map((c) => c.id));
+  const catOf = (id: string): string | null => {
+    const a = assign[id];
+    return a && validCatIds.has(a) ? a : null;
+  };
+  const grouped = !q && categories.length > 0;
+  const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed);
+  const [dragOverGroup, setDragOverGroup] = useState<string | null>(null);
+  const [dragOverRow, setDragOverRow] = useState<string | null>(null); // row the drop would land just before
+  const [creatingCat, setCreatingCat] = useState(false);
+  const [catName, setCatName] = useState('');
+  const [renamingCat, setRenamingCat] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const toggleCollapse = (key: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      saveCollapsed(next);
+      return next;
+    });
+  const commitRename = () => {
+    if (renamingCat) renameCategory(renamingCat, renameDraft);
+    setRenamingCat(null);
+  };
+  const createCat = () => {
+    if (!catName.trim()) return;
+    addCategory(catName);
+    setCatName('');
+    setCreatingCat(false);
+  };
+  const assignTo = (catId: string | null) => {
+    if (dragId.current) assignChat(dragId.current, catId);
+    dragId.current = null;
+    setDragOverGroup(null);
+    setDragOverRow(null);
+  };
+
   const archiveToggle = (id: string) => patch.mutate({ id, patch: { archived: tab !== 'archived' } });
   // Fully delete an archived chat's worktree (git worktree + files). Warns first; the branch and
   // the chat transcript are kept. Also trims the worktree count, which keeps loom snappy.
@@ -340,18 +410,201 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     }
   };
 
-  return (
-    <div className="w-56 shrink-0 border-r border-edge bg-surface overflow-auto thin-scroll flex flex-col">
-      <div className="px-3 py-2.5 flex items-center justify-between">
-        <span className="text-[11px] mono text-muted uppercase tracking-wide">chats</span>
+  // One chat row. `catId` is the group it's rendered in (undefined in the ungrouped list):
+  // dropping another chat on it reorders AND files the dragged chat into this row's group.
+  const renderRow = (r: Row, catId?: string | null) => {
+    const t = termById.get(r.id); // live terminal activity (undefined = not running this loom session)
+    const working = t != null && t.idle_sec < WORKING_WITHIN_S; // recent output → agent is working
+    const needs = t != null && t.needs && !working && r.id !== activeSid; // hook flagged a wait, quiet, not the chat you're viewing
+    return (
+      <div
+        key={r.id}
+        draggable={!q}
+        onDragStart={(e) => {
+          dragId.current = r.id;
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', r.id); // Firefox needs data set to start a drag
+        }}
+        onDragOver={(e) => {
+          if (q) return;
+          e.preventDefault();
+          if (dragId.current && dragId.current !== r.id) setDragOverRow(r.id);
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          e.stopPropagation(); // don't also fire the group's drop
+          const from = dragId.current;
+          if (from && from !== r.id) {
+            reorder(from, r.id);
+            if (catId !== undefined) assignChat(from, catId); // inherit this row's group
+          }
+          dragId.current = null;
+          setDragOverGroup(null);
+          setDragOverRow(null);
+        }}
+        onDragEnd={() => {
+          dragId.current = null;
+          setDragOverGroup(null);
+          setDragOverRow(null);
+        }}
+        onClick={() =>
+          openChat({
+            resume: r.id,
+            cwd: r.cwd ?? undefined,
+            title: r.title,
+            mode: r.mode ?? undefined,
+            agent: r.agent ?? undefined,
+          })
+        }
+        className={`group relative w-full text-left px-3 py-2 flex items-center gap-2 border-l-2 ${
+          q ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+        } ${r.id === activeSid ? 'bg-surface-2 border-accent' : 'border-transparent hover:bg-surface-2/60'}`}
+      >
+        {/* Insertion indicator: the dragged chat lands just before this row. */}
+        {dragOverRow === r.id && (
+          <span className="pointer-events-none absolute inset-x-1 -top-px h-0.5 rounded-full bg-accent shadow-[0_0_4px_var(--color-accent)] z-10" />
+        )}
+        <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${working ? 'bg-accent animate-pulse' : needs ? 'bg-ok' : 'bg-muted/40'}`} />
+        <span className="text-xs text-ink truncate flex-1">{r.title}</span>
+        {r.agent && (
+          <span title={`${r.agent} session`} className="text-[9px] mono text-muted shrink-0 opacity-70">
+            {r.agent === 'grok' ? 'g' : 'c'}
+          </span>
+        )}
+        {working && <span title="agent is working (recent output)" className="text-[9px] mono text-accent shrink-0 animate-pulse">working</span>}
+        {needs && <span title="idle — agent may be waiting on you" className="text-[9px] mono text-ok shrink-0">needs you</span>}
+        {r.mode === 'terminal' && !working && !needs && <span title="terminal chat (real agent TUI)" className="text-[9px] mono text-accent shrink-0">❯</span>}
+        {/* Open this chat as a terminal (resumes the same transcript in the real claude TUI). */}
+        {r.mode !== 'terminal' && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              openChat({ resume: r.id, cwd: r.cwd ?? undefined, title: r.title, mode: 'terminal', agent: r.agent ?? undefined });
+            }}
+            title="open as a terminal (real claude TUI)"
+            className="opacity-0 group-hover:opacity-100 text-muted hover:text-accent shrink-0 text-[9px] mono leading-none"
+          >
+            term
+          </button>
+        )}
         <button
-          onClick={() => setCreating((v) => !v)}
-          title="new task + chat"
-          className="text-[11px] mono text-muted hover:text-accent leading-none"
+          onClick={(e) => { e.stopPropagation(); archiveToggle(r.id); }}
+          title={tab === 'archived' ? 'unarchive' : 'archive'}
+          className="opacity-0 group-hover:opacity-100 text-muted hover:text-ink shrink-0 text-xs leading-none"
         >
-          + new
+          {tab === 'archived' ? '↺' : '⊘'}
         </button>
+        {tab === 'archived' && (
+          <button
+            onClick={(e) => { e.stopPropagation(); deleteWorktree(r); }}
+            title="fully delete this worktree (removes the git worktree + files; branch & transcript kept)"
+            className="opacity-0 group-hover:opacity-100 text-muted hover:text-bad shrink-0 text-xs leading-none"
+          >
+            🗑
+          </button>
+        )}
       </div>
+    );
+  };
+
+  // A category section header: chevron + name (Uncategorized is fixed; custom categories can be
+  // renamed on click, reordered ▲▼, deleted ✕).
+  const renderGroupHeader = (
+    g: { id: string | null; key: string; name: string; count: number },
+    isColl: boolean,
+  ) => (
+    <div
+      onDragOver={() => setDragOverRow(null)}
+      className="group/gh px-2 py-1.5 flex items-center gap-1 bg-surface/95 sticky top-0 z-[1]"
+    >
+      <button onClick={() => toggleCollapse(g.key)} className="w-3 shrink-0 text-[9px] text-muted hover:text-ink leading-none">
+        {isColl ? '▸' : '▾'}
+      </button>
+      {renamingCat === g.id && g.id !== null ? (
+        <input
+          autoFocus
+          value={renameDraft}
+          onChange={(e) => setRenameDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitRename();
+            if (e.key === 'Escape') setRenamingCat(null);
+          }}
+          onBlur={commitRename}
+          className="flex-1 min-w-0 mono text-[10px] px-1 py-0.5 rounded bg-canvas border border-edge outline-none focus:border-accent"
+        />
+      ) : g.id === null ? (
+        <span className="flex-1 text-[10px] mono text-muted uppercase tracking-wide truncate">{g.name}</span>
+      ) : (
+        <button
+          onClick={() => { setRenamingCat(g.id); setRenameDraft(g.name); }}
+          title="rename category"
+          className="flex-1 text-left text-[10px] mono text-muted uppercase tracking-wide truncate hover:text-ink"
+        >
+          {g.name}
+        </button>
+      )}
+      <span className="text-[9px] mono text-muted shrink-0">{g.count}</span>
+      {g.id !== null && (
+        <>
+          <button onClick={() => moveCategory(g.id!, -1)} title="move up" className="opacity-0 group-hover/gh:opacity-100 text-[9px] text-muted hover:text-ink shrink-0 leading-none">▲</button>
+          <button onClick={() => moveCategory(g.id!, 1)} title="move down" className="opacity-0 group-hover/gh:opacity-100 text-[9px] text-muted hover:text-ink shrink-0 leading-none">▼</button>
+          <button
+            onClick={() => { if (confirm(`Delete category "${g.name}"?\n\nChats stay — they move back to Uncategorized.`)) removeCategory(g.id!); }}
+            title="delete category"
+            className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-bad shrink-0 leading-none"
+          >
+            ✕
+          </button>
+        </>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="w-56 shrink-0 border-r border-edge bg-surface flex flex-col h-full">
+      <div className="flex-1 overflow-auto thin-scroll flex flex-col min-h-0">
+      <div className="px-3 py-2.5 flex items-center justify-between gap-2">
+        <span className="text-[11px] mono text-muted uppercase tracking-wide">chats</span>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={() => setCreatingCat((v) => !v)}
+            title="new category"
+            className="text-[11px] mono text-muted hover:text-accent leading-none"
+          >
+            + cat
+          </button>
+          <button
+            onClick={() => setCreating((v) => !v)}
+            title="new task + chat"
+            className="text-[11px] mono text-muted hover:text-accent leading-none"
+          >
+            + new
+          </button>
+        </div>
+      </div>
+
+      {creatingCat && (
+        <div className="px-3 pb-2 flex gap-1">
+          <input
+            autoFocus
+            value={catName}
+            onChange={(e) => setCatName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') createCat();
+              if (e.key === 'Escape') setCreatingCat(false);
+            }}
+            placeholder="new category name…"
+            className="flex-1 min-w-0 mono text-[11px] px-2 py-1 rounded bg-surface border border-edge outline-none focus:border-accent"
+          />
+          <button
+            onClick={createCat}
+            disabled={!catName.trim()}
+            className="text-[11px] px-2 py-1 rounded bg-accent/15 text-accent border border-accent-dim disabled:opacity-40"
+          >
+            add
+          </button>
+        </div>
+      )}
 
       {creating && (
         <div className="px-3 pb-2 flex flex-col gap-1.5">
@@ -429,89 +682,56 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       {rows.length === 0 && (
         <div className="px-3 text-[11px] text-muted/70">{q ? `no matches for "${q}"` : `no ${tab} chats`}</div>
       )}
-      {orderedRows.map((r) => {
-        const t = termById.get(r.id); // live terminal activity (undefined = not running this loom session)
-        const working = t != null && t.idle_sec < WORKING_WITHIN_S; // recent output → claude is working
-        const needs = t != null && t.needs && !working && r.id !== activeSid; // claude's hook flagged a wait, it's quiet, and it's not the chat you're viewing
-        return (
-        <div
-          key={r.id}
-          draggable={!q}
-          onDragStart={(e) => {
-            dragId.current = r.id;
-            e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('text/plain', r.id); // Firefox needs data set to start a drag
-          }}
-          onDragOver={(e) => !q && e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            reorder(dragId.current, r.id);
-            dragId.current = null;
-          }}
-          onDragEnd={() => {
-            dragId.current = null;
-          }}
-          onClick={() =>
-            openChat({
-              resume: r.id,
-              cwd: r.cwd ?? undefined,
-              title: r.title,
-              mode: r.mode ?? undefined,
-              agent: r.agent ?? undefined,
-            })
-          }
-          className={`group w-full text-left px-3 py-2 flex items-center gap-2 border-l-2 ${
-            q ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
-          } ${r.id === activeSid ? 'bg-surface-2 border-accent' : 'border-transparent hover:bg-surface-2/60'}`}
-        >
-          <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${working ? 'bg-accent animate-pulse' : needs ? 'bg-ok' : 'bg-muted/40'}`} />
-          <span className="text-xs text-ink truncate flex-1">{r.title}</span>
-          {r.agent && (
-            <span title={`${r.agent} session`} className="text-[9px] mono text-muted shrink-0 opacity-70">
-              {r.agent === 'grok' ? 'g' : 'c'}
-            </span>
-          )}
-          {working && <span title="agent is working (recent output)" className="text-[9px] mono text-accent shrink-0 animate-pulse">working</span>}
-          {needs && <span title="idle — agent may be waiting on you" className="text-[9px] mono text-ok shrink-0">needs you</span>}
-          {r.mode === 'terminal' && !working && !needs && <span title="terminal chat (real agent TUI)" className="text-[9px] mono text-accent shrink-0">❯</span>}
-          {/* Open this chat as a terminal (resumes the same transcript in the real claude TUI). */}
-          {r.mode !== 'terminal' && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                openChat({
-                  resume: r.id,
-                  cwd: r.cwd ?? undefined,
-                  title: r.title,
-                  mode: 'terminal',
-                  agent: r.agent ?? undefined,
-                });
+
+      {/* Ungrouped list — no categories yet, or while searching. */}
+      {!grouped && orderedRows.map((r) => renderRow(r))}
+
+      {/* Grouped by category: Uncategorized first, then each category in order. Drop a chat on
+          a group (or a row within it) to file it there. */}
+      {grouped &&
+        [
+          { id: null as string | null, key: 'uncat', name: 'Uncategorized' },
+          ...categories.map((c) => ({ id: c.id as string | null, key: c.id, name: c.name })),
+        ].map((g) => {
+          const groupRows = orderedRows.filter((r) => catOf(r.id) === g.id);
+          if (g.id === null && groupRows.length === 0) return null; // hide an empty Uncategorized bucket
+          const isColl = collapsed.has(g.key);
+          return (
+            <div
+              key={g.key}
+              onDragOver={(e) => {
+                if (q) return;
+                e.preventDefault();
+                if (dragOverGroup !== g.key) setDragOverGroup(g.key);
               }}
-              title="open as a terminal (real claude TUI)"
-              className="opacity-0 group-hover:opacity-100 text-muted hover:text-accent shrink-0 text-[9px] mono leading-none"
+              onDragLeave={() => setDragOverGroup((v) => (v === g.key ? null : v))}
+              onDrop={(e) => {
+                e.preventDefault();
+                assignTo(g.id);
+              }}
+              className={dragOverGroup === g.key ? 'bg-accent/5' : ''}
             >
-              term
-            </button>
-          )}
-          <button
-            onClick={(e) => { e.stopPropagation(); archiveToggle(r.id); }}
-            title={tab === 'archived' ? 'unarchive' : 'archive'}
-            className="opacity-0 group-hover:opacity-100 text-muted hover:text-ink shrink-0 text-xs leading-none"
-          >
-            {tab === 'archived' ? '↺' : '⊘'}
-          </button>
-          {tab === 'archived' && (
-            <button
-              onClick={(e) => { e.stopPropagation(); deleteWorktree(r); }}
-              title="fully delete this worktree (removes the git worktree + files; branch & transcript kept)"
-              className="opacity-0 group-hover:opacity-100 text-muted hover:text-bad shrink-0 text-xs leading-none"
-            >
-              🗑
-            </button>
-          )}
-        </div>
-        );
-      })}
+              {renderGroupHeader({ ...g, count: groupRows.length }, isColl)}
+              {!isColl && groupRows.map((r) => renderRow(r, g.id))}
+              {!isColl && groupRows.length === 0 && (
+                <div
+                  onDragOver={() => setDragOverRow(null)}
+                  className="px-3 py-2 text-[10px] mono text-muted/40 select-none"
+                >
+                  drop chats here
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="border-t border-edge p-2 shrink-0">
+        <NotesButton
+          label="✎ all notes"
+          className="w-full text-[11px] mono px-2 py-1.5 rounded border border-edge text-muted hover:text-ink inline-flex items-center justify-center gap-1.5"
+        />
+      </div>
     </div>
   );
 }

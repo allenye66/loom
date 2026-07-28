@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import { useDoctor, useRepos, useTasks, useTaskActions, type Repo } from './api';
-import { TasksView } from './components/TasksView';
-import { ChatsView } from './components/ChatsView';
 import { ChatProvider } from './chat/ChatContext';
+import { useChatShell } from './chat/openChat';
+import { ChatSidebar } from './chat/ChatSidebar';
+import { TerminalView } from './term/TerminalView';
+import { NotesButton } from './notes/NotesButton';
 
 function Logo() {
   return (
@@ -165,54 +167,64 @@ function RepoPicker({ value, onChange }: { value: string; onChange: (v: string) 
   );
 }
 
-export default function App() {
+/** Content pane shown when no chat is open. loom is sidebar-first now, so this is just a
+ *  welcome + the global actions (repo add on first run, open-in-editor, notes, doctor) —
+ *  not a browsable page. */
+function EmptyState() {
   const { data: repos } = useRepos();
-  const [view, setView] = useState<'tasks' | 'chats'>('chats');
-  const [repoRoot, setRepoRoot] = useState('');
+  const noRepos = !repos || repos.length === 0;
+  return (
+    <div className="flex-1 min-w-0 flex flex-col items-center justify-center gap-6 p-10 text-center">
+      <Logo />
+      <div>
+        <div className="text-lg font-semibold tracking-tight">loom</div>
+        <div className="text-sm text-muted mt-1">
+          Pick a chat from the sidebar, or <span className="text-accent mono">+ new</span> to start one.
+        </div>
+      </div>
+      {noRepos && (
+        <div className="flex flex-col items-center gap-1.5">
+          <div className="text-xs text-muted">Add a repo (with a .loom.yaml) to get started:</div>
+          <RepoPicker value="" onChange={() => {}} />
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <OpenWorktree />
+        <NotesButton />
+        <DoctorBadge />
+      </div>
+    </div>
+  );
+}
 
-  const activeRoot = repoRoot || repos?.[0]?.root || '';
-  const activeName = repos?.find((r) => r.root === activeRoot)?.name;
+/** The whole app: an always-present chat sidebar next to the content pane (the live terminal
+ *  for the open chat, or the empty state). No separate home/main page. */
+function Shell() {
+  const { active, close } = useChatShell();
+  return (
+    <div className="flex h-screen min-h-0 bg-canvas">
+      <ChatSidebar activeSid={active?.resume} />
+      {active ? (
+        <TerminalView
+          // remount (fresh xterm + socket) when switching chats
+          key={active.resume ?? active.cwd ?? active.title}
+          resume={active.resume}
+          cwd={active.cwd}
+          title={active.title}
+          agent={active.agent}
+          onClose={close}
+        />
+      ) : (
+        <EmptyState />
+      )}
+    </div>
+  );
+}
 
+export default function App() {
   return (
     <ChatProvider>
-    <div className="min-h-full">
-      <header className="border-b border-edge bg-surface/70 backdrop-blur sticky top-0 z-10">
-        <div className="max-w-6xl mx-auto px-5 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <Logo />
-            <span className="text-lg font-semibold tracking-tight">loom</span>
-            <nav className="ml-3 flex gap-1">
-              {(['tasks', 'chats'] as const).map((v) => (
-                <button
-                  key={v}
-                  onClick={() => setView(v)}
-                  className={`text-sm px-2.5 py-1 rounded-md ${
-                    view === v ? 'bg-surface-2 text-ink' : 'text-muted hover:text-ink'
-                  }`}
-                >
-                  {v}
-                </button>
-              ))}
-            </nav>
-          </div>
-          <div className="flex items-center gap-3">
-            <OpenWorktree />
-            <DoctorBadge />
-          </div>
-        </div>
-      </header>
-
-      <main className="max-w-6xl mx-auto px-5 py-6">
-        <div className="mb-5">
-          <RepoPicker value={activeRoot} onChange={setRepoRoot} />
-        </div>
-        {view === 'tasks' ? (
-          <TasksView repoRoot={activeRoot} />
-        ) : (
-          <ChatsView repoRoot={activeRoot} repoName={activeName} />
-        )}
-      </main>
-    </div>
+      <Shell />
     </ChatProvider>
   );
 }

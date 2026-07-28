@@ -3,10 +3,24 @@ import { useQuery } from '@tanstack/react-query';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { ChatSidebar, DevStackBar, OpenInIde } from '../chat/ChatSidebar';
+import { DevStackBar, OpenInIde } from '../chat/ChatSidebar';
 import { PrBadges } from '../components/PrBadges';
 import { ServiceLogsPanel, useLogsPanel } from '../components/ServiceLogsPanel';
+import { NotesPanel } from '../notes/NotesPanel';
+import { NotesButton } from '../notes/NotesButton';
+import { useNote } from '../notes/notesStore';
 import type { Task } from '../api';
+
+// Per-chat notes drawer open-state, remembered across chat switches / reloads (the whole
+// terminal remounts per chat, so local state alone would reset it each time).
+const NOTES_OPEN_KEY = 'loom.notesPanelOpen';
+const loadNotesOpen = () => {
+  try {
+    return localStorage.getItem(NOTES_OPEN_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
 
 // Match the app palette (index.css @theme tokens) so the TUI feels native.
 const THEME = {
@@ -360,6 +374,20 @@ export function TerminalView({
   const [dragOver, setDragOver] = useState(false);
   const [showText, setShowText] = useState(false); // selectable transcript panel (copy workaround)
 
+  // Per-chat notes drawer (localStorage-backed via notesStore). `note` drives the header dot.
+  const [notesOpen, setNotesOpenState] = useState(loadNotesOpen);
+  const setNotesOpen = (v: boolean | ((p: boolean) => boolean)) =>
+    setNotesOpenState((prev) => {
+      const next = typeof v === 'function' ? (v as (p: boolean) => boolean)(prev) : v;
+      try {
+        localStorage.setItem(NOTES_OPEN_KEY, next ? '1' : '0');
+      } catch {
+        /* private mode — drawer state just won't persist */
+      }
+      return next;
+    });
+  const note = useNote(resume);
+
   useEffect(() => {
     const term = new Terminal({
       fontFamily: "ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace",
@@ -677,9 +705,7 @@ export function TerminalView({
   }, [resume, cwd, termEpoch, agent]);
 
   return (
-    <div className="fixed inset-0 z-50 bg-canvas/95 backdrop-blur flex">
-      <ChatSidebar activeSid={resume} />
-      <div className="flex-1 flex flex-col min-w-0 relative">
+    <div className="flex-1 flex flex-col min-w-0 relative bg-canvas h-full">
         <header className="border-b border-edge px-5 h-12 flex items-center justify-between shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
             <span className="text-[10.5px] mono px-2 py-0.5 rounded-full border border-accent-dim text-accent shrink-0">
@@ -696,6 +722,22 @@ export function TerminalView({
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            {resume && (
+              <button
+                onClick={() => setNotesOpen((v) => !v)}
+                title="notes for this chat (saved to this browser)"
+                className={`text-[11px] mono border rounded px-2 py-0.5 shrink-0 inline-flex items-center gap-1.5 ${
+                  notesOpen ? 'border-accent-dim text-accent bg-accent/10' : 'border-edge text-muted hover:text-ink'
+                }`}
+              >
+                <span className={`w-1.5 h-1.5 rounded-full ${note ? 'bg-accent' : 'bg-muted/40'}`} />
+                notes
+              </button>
+            )}
+            <NotesButton
+              label="all notes"
+              className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 shrink-0 inline-flex items-center gap-1.5"
+            />
             <button
               onClick={() => setShowText((v) => !v)}
               title="view the conversation as selectable text — copy any part (the fullscreen TUI can't drag-select across scroll)"
@@ -731,10 +773,19 @@ export function TerminalView({
           />
         )}
 
-        <div
-          ref={holderRef}
-          className={`flex-1 min-h-0 px-2 py-1.5 overflow-hidden ${dragOver ? 'ring-2 ring-inset ring-accent-dim' : ''}`}
-        />
+        <div className="flex-1 min-h-0 flex">
+          <div
+            ref={holderRef}
+            className={`flex-1 min-w-0 px-2 py-1.5 overflow-hidden ${dragOver ? 'ring-2 ring-inset ring-accent-dim' : ''}`}
+          />
+          {notesOpen && resume && (
+            <NotesPanel
+              chatId={resume}
+              meta={{ title: title ?? liveAgent ?? resume.slice(0, 8), cwd, agent: liveAgent ?? agent ?? undefined }}
+              onClose={() => setNotesOpen(false)}
+            />
+          )}
+        </div>
 
         {task && logsPanel.open && (
           <ServiceLogsPanel
@@ -746,7 +797,6 @@ export function TerminalView({
         )}
 
         {showText && resume && <CopyTextPanel chatId={resume} onClose={() => setShowText(false)} />}
-      </div>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { TerminalView } from '../term/TerminalView';
-import { ChatCtx, type ActiveChat } from './openChat';
+import { NotesModal } from '../notes/NotesModal';
+import { ChatCtx, ChatShellCtx, type ActiveChat } from './openChat';
 
 export { useOpenChat } from './openChat';
 export type { ActiveChat } from './openChat';
@@ -45,19 +45,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   return (
     <ChatCtx.Provider value={open}>
-      {children}
-      {active && (
-        // Terminal is the only surface now — every chat opens into the real agent TUI.
-        <TerminalView
-          // remount (fresh socket) when switching chats
-          key={active.resume ?? active.cwd ?? active.title}
-          resume={active.resume}
-          cwd={active.cwd}
-          title={active.title}
-          agent={active.agent}
-          onClose={close}
-        />
-      )}
+      <ChatShellCtx.Provider value={{ active, open, close }}>
+        {children}
+        {/* Global "all chat notes" modal — mounted here so it can reach useOpenChat and float
+            above the shell. Reads its own open-state; renders null when closed. */}
+        <NotesModal />
+      </ChatShellCtx.Provider>
     </ChatCtx.Provider>
   );
 }
