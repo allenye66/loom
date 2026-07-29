@@ -717,9 +717,6 @@ export function TerminalView({
                 {liveAgent}
               </span>
             )}
-            <span className="text-[10.5px] mono text-muted hidden sm:block shrink-0">
-              real {liveAgent ?? 'agent'} TUI · {backend === 'tmux' ? 'classic (tmux)' : backend === 'pty' ? 'smooth scroll (pty)' : '…'}
-            </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <UsageChip />
