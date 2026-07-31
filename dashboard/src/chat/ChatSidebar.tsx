@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useOpenChat } from './openChat';
+import { NotesButton } from '../notes/NotesButton';
 import {
   addCategory,
   assignChat,
@@ -723,6 +724,13 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
             </div>
           );
         })}
+      </div>
+
+      <div className="border-t border-edge p-2 shrink-0">
+        <NotesButton
+          label="✎ all notes"
+          className="w-full text-[11px] mono px-2 py-1.5 rounded border border-edge text-muted hover:text-ink inline-flex items-center justify-center gap-1.5"
+        />
       </div>
     </div>
   );
