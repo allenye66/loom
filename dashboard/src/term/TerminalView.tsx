@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -316,6 +316,158 @@ function CopyTextPanel({ chatId, onClose }: { chatId: string; onClose: () => voi
   );
 }
 
+// --- in-chat search: full-text over the reconstructed transcript (your messages, claude's
+//     replies, thinking, and tool calls/results). Reuses the same /api/chats/:id/transcript
+//     the copy panel loads (shared query cache). ---
+function itemContent(it: any): string {
+  const parts: string[] = [];
+  if (it.text) parts.push(it.text);
+  if (it.thinking) parts.push(it.thinking);
+  for (const t of it.tools ?? []) {
+    parts.push(toolLine(t));
+    if (t.result) parts.push(String(t.result));
+  }
+  return parts.join('\n');
+}
+
+/** A ±ctx-char window around the FIRST match of `q` in `content` (whitespace-collapsed, with
+ *  ellipses), plus how many times `q` occurs in the whole message. */
+function makeSnippet(content: string, q: string, ctx = 100): { text: string; count: number } | null {
+  const lower = content.toLowerCase();
+  const ql = q.toLowerCase();
+  const first = lower.indexOf(ql);
+  if (first === -1) return null;
+  let count = 0;
+  for (let p = first; p !== -1; p = lower.indexOf(ql, p + ql.length)) count++;
+  const start = Math.max(0, first - ctx);
+  const end = Math.min(content.length, first + q.length + ctx);
+  let text = content.slice(start, end).replace(/\s+/g, ' ').trim();
+  if (start > 0) text = '… ' + text;
+  if (end < content.length) text += ' …';
+  return { text, count };
+}
+
+/** Render `text` with every (case-insensitive) occurrence of `q` wrapped in a highlight. */
+function Highlighted({ text, q }: { text: string; q: string }) {
+  if (!q) return <>{text}</>;
+  const lower = text.toLowerCase();
+  const ql = q.toLowerCase();
+  const nodes: ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+  for (let idx = lower.indexOf(ql); idx !== -1; idx = lower.indexOf(ql, i)) {
+    if (idx > i) nodes.push(text.slice(i, idx));
+    nodes.push(
+      <mark key={key++} className="bg-warn/30 text-ink rounded-[2px]">
+        {text.slice(idx, idx + q.length)}
+      </mark>,
+    );
+    i = idx + q.length;
+  }
+  if (i < text.length) nodes.push(text.slice(i));
+  return <>{nodes}</>;
+}
+
+const ROLE = (kind: string): [string, string] =>
+  kind === 'user' ? ['you', 'text-accent'] : kind === 'error' ? ['error', 'text-bad'] : ['claude', 'text-muted'];
+
+/** Full-text search over a chat's transcript. Opens as an overlay (like the copy panel); each
+ *  result is a role-labelled snippet with the keyword highlighted. Read-only + selectable. */
+function SearchPanel({ chatId, onClose }: { chatId: string; onClose: () => void }) {
+  const { data: items, isLoading } = useQuery({
+    queryKey: ['transcript', chatId],
+    queryFn: () =>
+      fetch(`/api/chats/${chatId}/transcript`).then((r) => r.json()).then((d) => (d.items ?? []) as any[]),
+    refetchOnWindowFocus: false,
+  });
+  const [q, setQ] = useState('');
+  const query = q.trim();
+
+  // Precompute each message's searchable text (and a lowercased copy) once per transcript load,
+  // so per-keystroke filtering is just a substring test — stays instant on large transcripts.
+  const contents = useMemo(() => (items ?? []).map((it) => itemContent(it)), [items]);
+  const contentsLower = useMemo(() => contents.map((c) => c.toLowerCase()), [contents]);
+  const results = useMemo(() => {
+    const out: { it: any; snip: { text: string; count: number }; idx: number }[] = [];
+    if (!query || !items) return out;
+    const ql = query.toLowerCase();
+    for (let idx = 0; idx < items.length; idx++) {
+      if (contentsLower[idx].includes(ql)) {
+        const snip = makeSnippet(contents[idx], query);
+        if (snip) out.push({ it: items[idx], snip, idx });
+      }
+    }
+    return out;
+  }, [items, contents, contentsLower, query]);
+  const totalMatches = results.reduce((n, r) => n + r.snip.count, 0);
+
+  return (
+    <div className="absolute inset-0 z-10 bg-canvas flex flex-col">
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-edge bg-surface shrink-0">
+        <span className="text-[11px] mono text-accent shrink-0">🔍 search chat</span>
+        <input
+          autoFocus
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') onClose();
+          }}
+          placeholder="keywords…"
+          className="flex-1 mono text-sm px-2.5 py-1 rounded bg-canvas border border-edge outline-none focus:border-accent"
+        />
+        {isLoading && (
+          <span className="inline-flex items-center gap-1.5 text-[11px] mono text-muted shrink-0">
+            <span className="inline-block w-3 h-3 rounded-full border-2 border-edge border-t-accent animate-spin" />
+            loading…
+          </span>
+        )}
+        {!isLoading && query && (
+          <span className="text-[11px] mono text-muted shrink-0">
+            {results.length} msg · {totalMatches} match{totalMatches === 1 ? '' : 'es'}
+          </span>
+        )}
+        <button
+          onClick={onClose}
+          className="text-xs px-2.5 py-1.5 rounded border border-edge text-muted hover:text-ink shrink-0"
+        >
+          close
+        </button>
+      </div>
+      <div className="flex-1 overflow-auto thin-scroll px-5 py-3 text-[12.5px] leading-relaxed select-text">
+        {isLoading && (
+          <div className="flex items-center justify-center gap-2 text-muted mono text-xs py-10">
+            <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-edge border-t-accent animate-spin" />
+            loading transcript…
+          </div>
+        )}
+        {!isLoading && !query && (
+          <div className="text-muted mono text-xs">
+            Type keywords to search this chat{items && items.length ? ` (${items.length} messages)` : ''} — your
+            messages, claude's replies, thinking, and tool calls/results.
+          </div>
+        )}
+        {!isLoading && query && results.length === 0 && (
+          <div className="text-muted mono text-xs">no matches for “{query}”</div>
+        )}
+        {results.map((r) => {
+          const [label, color] = ROLE(r.it.kind);
+          return (
+            <div key={r.idx} className="py-2 border-b border-edge/40">
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`text-[10px] mono uppercase tracking-wide ${color}`}>{label}</span>
+                {r.snip.count > 1 && <span className="text-[10px] mono text-muted/60">{r.snip.count} matches</span>}
+              </div>
+              <div className="whitespace-pre-wrap break-words text-ink/90">
+                <Highlighted text={r.snip.text} q={query} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /**
  * Terminal mode: the *real* interactive agent TUI (claude or grok), bridged from a
  * server-side PTY to xterm.js. No reimplementation — every slash command / permission
@@ -373,6 +525,7 @@ export function TerminalView({
   // native terminal's image drop). xterm has no file-drop handling, so we do it on the wrapper.
   const [dragOver, setDragOver] = useState(false);
   const [showText, setShowText] = useState(false); // selectable transcript panel (copy workaround)
+  const [showSearch, setShowSearch] = useState(false); // full-text search over the transcript
 
   // Per-chat notes drawer (localStorage-backed via notesStore). `note` drives the header dot.
   const [notesOpen, setNotesOpenState] = useState(loadNotesOpen);
@@ -753,8 +906,25 @@ export function TerminalView({
                 notes
               </button>
             )}
+            {resume && (
+              <button
+                onClick={() => {
+                  setShowText(false);
+                  setShowSearch((v) => !v);
+                }}
+                title="search this chat's messages (full transcript: you, claude, thinking, tool calls & results)"
+                className={`text-[11px] mono border rounded px-2 py-0.5 shrink-0 ${
+                  showSearch ? 'border-accent-dim text-accent bg-accent/10' : 'border-edge text-muted hover:text-ink'
+                }`}
+              >
+                search
+              </button>
+            )}
             <button
-              onClick={() => setShowText((v) => !v)}
+              onClick={() => {
+                setShowSearch(false);
+                setShowText((v) => !v);
+              }}
               title="view the conversation as selectable text — copy any part (the fullscreen TUI can't drag-select across scroll)"
               className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 shrink-0"
             >
@@ -812,6 +982,7 @@ export function TerminalView({
         )}
 
         {showText && resume && <CopyTextPanel chatId={resume} onClose={() => setShowText(false)} />}
+        {showSearch && resume && <SearchPanel chatId={resume} onClose={() => setShowSearch(false)} />}
     </div>
   );
 }
