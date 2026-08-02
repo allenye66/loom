@@ -624,24 +624,42 @@ export function TerminalView({
     // Coalesce refits to the FINAL stable size. Dragging fires resize continuously; re-fitting per
     // tick (→ SIGWINCH → full re-render) tears the TUI. A single rAF still fires before the next
     // observer tick mid-drag (rAF → Style → Layout → ResizeObserver → Paint), so use TWO frames —
-    // that guarantees one fit at the settled dims.
+    // that guarantees one fit at the settled dims. On TOP of that, a trailing timeout re-fit handles
+    // one-shot window-manager snaps (Rectangle "left half", macOS tiling, etc.): those resize the
+    // window in a single jump, so the observer fires once and the rAF fit can run before the browser
+    // has settled the new box — leaving the terminal "stuck" at the old width with no follow-up event
+    // to correct it. The settle pass re-fits once the layout is stable.
     let fitRaf1 = 0;
     let fitRaf2 = 0;
-    const ro = new ResizeObserver(() => {
+    let fitSettle: number | undefined;
+    const doFit = () => {
+      try {
+        fit.fit();
+      } catch {
+        /* mid-teardown */
+      }
+      scheduleRepaint();
+    };
+    const scheduleFit = () => {
       cancelAnimationFrame(fitRaf1);
       cancelAnimationFrame(fitRaf2);
+      window.clearTimeout(fitSettle);
       fitRaf1 = requestAnimationFrame(() => {
-        fitRaf2 = requestAnimationFrame(() => {
-          try {
-            fit.fit();
-          } catch {
-            /* mid-teardown */
-          }
-          scheduleRepaint();
-        });
+        fitRaf2 = requestAnimationFrame(doFit);
       });
-    });
+      fitSettle = window.setTimeout(doFit, 220); // settle pass for instant window-manager resizes
+    };
+    const ro = new ResizeObserver(scheduleFit);
     if (holderRef.current) ro.observe(holderRef.current);
+    // A window-manager snap resizes the whole window at once; the window 'resize' event is the most
+    // reliable signal for it (an element ResizeObserver can miss/mis-time a one-shot change).
+    window.addEventListener('resize', scheduleFit);
+    // Re-fit when the tab becomes visible again — a resize while it was hidden (rAF paused/throttled)
+    // would otherwise leave the terminal at the wrong size until the next event.
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') scheduleFit();
+    };
+    document.addEventListener('visibilitychange', onVisible);
 
     // File drop → save server-side + type the path into claude (mirrors a native terminal's drag).
     // Works for ANY file claude can read from a path — images, PDFs, CSVs, etc. Native CAPTURE-phase
@@ -686,6 +704,9 @@ export function TerminalView({
       window.clearInterval(pingTimer);
       cancelAnimationFrame(fitRaf1);
       cancelAnimationFrame(fitRaf2);
+      window.clearTimeout(fitSettle);
+      window.removeEventListener('resize', scheduleFit);
+      document.removeEventListener('visibilitychange', onVisible);
       window.clearTimeout(repaintTimer);
       resetSnap();
       if (wheelAnim.rafId !== null) cancelAnimationFrame(wheelAnim.rafId);
