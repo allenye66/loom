@@ -54,7 +54,7 @@ log = logging.getLogger("loom.pty_server")
 ESCAPE = 0x1C          # ASCII File Separator (dtach convention)
 CMD_RESIZE = 0x01
 CMD_SNAPSHOT = 0x02
-REPLAY_BUFFER_SIZE = 1_048_576   # 1 MB ring ~= 10k lines, matches xterm scrollback
+REPLAY_BUFFER_SIZE = 8_388_608   # 8 MB ring ~= 80k lines (xterm scrollback caps the view at 50k)
 
 # --- snapshot settle ----------------------------------------------------------
 # SIGWINCH only signals the START of a resize; claude/Ink has no "redraw done"

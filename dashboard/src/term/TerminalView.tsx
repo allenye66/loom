@@ -546,7 +546,7 @@ export function TerminalView({
       fontFamily: "ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, monospace",
       fontSize: 13,
       cursorBlink: true,
-      scrollback: 12000,
+      scrollback: 50000,
       theme: THEME,
     });
     const fit = new FitAddon();
