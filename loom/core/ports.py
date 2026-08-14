@@ -13,7 +13,7 @@ import socket
 
 from loom.models import Ports
 
-PORT_RANGE = 90  # usable offsets: 1..90
+PORT_RANGE = 300  # usable offsets: 1..300 (backend 8001..8300 / frontend 3001..3300 — no overlap)
 
 
 def _hash_offset(slug: str) -> int:

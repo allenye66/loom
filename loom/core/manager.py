@@ -63,7 +63,7 @@ def create_task(
     wt_base = Path(cfg.worktree_base).expanduser() if cfg.worktree_base else (DEFAULT_WORKTREE_BASE / cfg.name)
     wt_path = str(wt_base / slug)
 
-    taken = {t.ports.offset for t in registry.list_tasks() if t.ports}
+    taken = _taken_offsets()
     alloc = ports_mod.allocate(slug, cfg.ports.get("backend", 8000), cfg.ports.get("frontend", 3000), taken)
 
     chat_id = str(uuid.uuid4())  # the task's one chat, created with this id on first open
@@ -83,6 +83,7 @@ def create_task(
         task.state, task.note = TaskState.ready, None
     except Exception as e:  # noqa: BLE001 — surface to the user via task.note
         task.state, task.note = TaskState.error, str(e)
+        task.ports = None  # a worktree that never came up must not keep holding a port offset
     return registry.upsert(task)
 
 
@@ -103,8 +104,17 @@ def task_for_chat(chat_id: str) -> Task | None:
     return task
 
 
+def _taken_offsets() -> set[int]:
+    """Port offsets currently in use — EXCLUDING error-state tasks. A task whose worktree failed to
+    create (or was removed out-of-band) keeps a Ports in the registry but has no live worktree/stack,
+    so counting its offset slowly starves the 1..PORT_RANGE pool. Error tasks get a fresh offset if
+    ever (re)started (see reallocate_ports / start_task), so dropping them here is safe — a dead
+    worktree's offset gets reused automatically."""
+    return {t.ports.offset for t in registry.list_tasks() if t.ports and t.state != TaskState.error}
+
+
 def release_ports(task_id: str) -> Task | None:
-    """Return a task's port offset to the pool (offsets are only 1..90). Called when a chat is
+    """Return a task's port offset to the pool (the pool is bounded — see ports.PORT_RANGE). Called when a chat is
     archived: an archived worktree's dev stack is already stopped, so it has no business holding
     an offset — otherwise dead tasks pile up and eventually starve `allocate()`. A fresh offset is
     handed out again on unarchive / next start (see `reallocate_ports`, `start_task`)."""
@@ -123,7 +133,7 @@ def reallocate_ports(cfg: RepoConfig, task_id: str) -> Task | None:
     task = registry.get_task(task_id)
     if not task or task.ports:
         return task
-    taken = {t.ports.offset for t in registry.list_tasks() if t.ports}
+    taken = _taken_offsets()
     task.ports = ports_mod.allocate(task.id, cfg.ports.get("backend", 8000), cfg.ports.get("frontend", 3000), taken)
     task.updated_at = registry.now_iso()
     return registry.upsert(task)
