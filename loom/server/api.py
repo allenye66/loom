@@ -167,7 +167,7 @@ class TaskIn(BaseModel):
     branch: str
     base_branch: str | None = None
     note: str | None = None
-    agent: Literal["claude", "grok"] | None = None  # CLI for this task's chat; locked at create
+    agent: Literal["claude", "grok", "codex"] | None = None  # CLI for this task's chat; locked at create
 
 
 @router.post("/tasks")
@@ -419,7 +419,7 @@ def _task_chat_id(task) -> str | None:
 def task_chat(task_id: str) -> dict:
     """This task's single chat id (1:1) + locked mode/agent — powers 'open' from a task card.
     `mode` is null until the user first picks chat vs terminal (then it's fixed).
-    `agent` is claude|grok (defaults claude for legacy chats)."""
+    `agent` is claude|grok|codex (defaults claude for legacy chats)."""
     cid = _task_chat_id(registry.get_task(task_id))
     ov = sessions.get_overlay(cid) if cid else {}
     return {
@@ -439,8 +439,8 @@ class ChatPatch(BaseModel):
     description: str | None = None
     pr: int | None = None
     mode: str | None = None  # "chat" (SDK UI) | "terminal" (xterm); fixed once chosen
-    # Which CLI powers the terminal: "claude" | "grok". Locked once set (create-time).
-    agent: Literal["claude", "grok"] | None = None
+    # Which CLI powers the terminal: "claude" | "grok" | "codex". Locked once set (create-time).
+    agent: Literal["claude", "grok", "codex"] | None = None
     # Which host runs the terminal: "pty" (smooth scroll, default) | "tmux" (classic).
     # Orthogonal to `mode` — only applies within terminal mode; switchable (see
     # /terminals/{chat_id}/backend).
@@ -530,7 +530,7 @@ def get_one_chat(sid: str) -> dict:
     """The chat's index entry + overlay (name/starred/archived), or null if it has no
     transcript yet. Powers the in-overlay rename/star/archive actions. `mode` is the
     locked surface (chat/terminal), surfaced top-level too so a ?chat= deep link can
-    restore the right one even before any transcript exists. `agent` is claude|grok."""
+    restore the right one even before any transcript exists. `agent` is claude|grok|codex."""
     ov = sessions.get_overlay(sid)
     mode = ov.get("mode")
     agent = agents.normalize_agent(ov.get("agent"))
@@ -743,8 +743,8 @@ async def term_ws(websocket: WebSocket) -> None:
     cols = max(int(start.get("cols") or 120), 20)
     rows = max(int(start.get("rows") or 32), 5)
     # Lock terminal mode; set agent only if not already locked (create-time wins).
-    # Prefer client → index-derived agent → claude default so external grok transcripts
-    # still open under grok when the overlay hasn't been written yet.
+    # Prefer client → index-derived agent → claude default so external grok/codex
+    # transcripts still open under their own CLI when the overlay hasn't been written yet.
     with contextlib.suppress(Exception):
         ov = sessions.get_overlay(chat_id)
         patch: dict = {"mode": "terminal"}

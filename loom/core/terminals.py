@@ -1,6 +1,6 @@
 """Server-side persistent *terminal* sessions — the real agent TUI in the browser.
 
-loom runs the **actual** interactive CLI (`claude` or `grok`) under a PTY and streams
+loom runs the **actual** interactive CLI (`claude`, `grok`, or `codex`) under a PTY and streams
 its raw bytes to xterm.js, so every slash command / permission prompt / feature works
 with zero reimplementation. This is the only chat surface loom exposes (see
 docs/ARCHITECTURE.md). Agent choice is per-chat (`agent` in the sessions overlay).
@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import functools
 import os
 import pty
 import re
@@ -95,9 +96,46 @@ def _agent_for(chat_id: str) -> agents.AgentId:
     return agents.normalize_agent(sessions_mod.get_overlay(chat_id).get("agent"))
 
 
+def _codex_claimed_ids() -> set[str]:
+    """Codex session ids already owned by some chat — its own id (an external codex
+    session surfaced under its native uuid) or an `agent_session_id` binding."""
+    claimed: set[str] = set()
+    for cid, ov in sessions_mod.overlay_all().items():
+        claimed.add(cid)
+        asid = ov.get("agent_session_id")
+        if asid:
+            claimed.add(str(asid))
+    return claimed
+
+
+def _codex_session_id(chat_id: str, cwd: str | None, *, fresh_after: float | None = None) -> str | None:
+    """Resolve (and persist) the native codex session id behind a loom chat.
+
+    Codex mints its own uuid at launch — loom can't pre-set it like claude/grok's
+    --session-id — so the id is bound after the fact: chat id itself (external codex
+    chat) → overlay binding → the notify-hook file (exact: carries thread-id) → a
+    rollout cwd-scan (heuristic; sound because worktree↔chat is 1:1). `fresh_after`
+    is passed by the post-launch watcher so a just-created chat only scans rollouts
+    being written now; the pre-launch recovery path (lost binding) passes None and
+    takes the worktree's newest. Blocking (file IO) — call off the event loop."""
+    if agents.find_codex_rollout(chat_id) is not None:
+        return chat_id  # the chat id IS the native uuid — no binding needed
+    asid = sessions_mod.get_overlay(chat_id).get("agent_session_id")
+    if asid:
+        return str(asid)
+    asid = agents.codex_notify_binding(chat_id)
+    if not asid and cwd:
+        asid = agents.discover_codex_session(cwd, _codex_claimed_ids(), after_ts=fresh_after)
+    if asid:
+        sessions_mod.set_overlay(chat_id, {"agent_session_id": asid})
+    return asid
+
+
 def _agent_argv(chat_id: str, cwd: str | None, *, fullscreen: bool) -> list[str]:
     """Build argv for the chat's locked agent (resume if transcript exists, else mint id)."""
-    return agents.build_argv(_agent_for(chat_id), chat_id, cwd, fullscreen=fullscreen)
+    agent = _agent_for(chat_id)
+    asid = _codex_session_id(chat_id, cwd) if agent == "codex" else None
+    return agents.build_argv(agent, chat_id, cwd, fullscreen=fullscreen, agent_session_id=asid)
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -125,6 +163,12 @@ class _SessionBase:
         self._line_buf: bytearray | None = bytearray()
         self._paste_depth = 0        # inside bracketed paste (ESC[200~ … ESC[201~)
         self._guard_carry = b""      # partial paste marker split across write() chunks
+        # "The user typed/submitted something" (set by _guard_input on real keystrokes —
+        # mouse reports and bare escape sequences don't count). Codex has no
+        # UserPromptSubmit-style hook to clear the needs-you marker, so loom clears it
+        # from the input stream instead (clear_needs_on_typing, set by open_terminal).
+        self._typed = False
+        self.clear_needs_on_typing = False
         self.subscribers: set = set()
         self.backlog = bytearray()
         self.outq: asyncio.Queue = asyncio.Queue()
@@ -242,6 +286,7 @@ class _SessionBase:
                 i += 1
                 continue
             if b in (0x0D, 0x0A):
+                self._typed = True
                 if self._paste_depth:  # literal newline inside a paste → composer newline
                     self._line_buf = bytearray()
                 elif self._line_buf is not None and bytes(self._line_buf).strip() in self._BLOCKED_SUBMITS:
@@ -263,6 +308,7 @@ class _SessionBase:
                 i += 1
                 continue
             if b in (0x7F, 0x08) and not self._paste_depth:  # backspace
+                self._typed = True
                 if self._line_buf:
                     del self._line_buf[-1:]
                 out.append(b)
@@ -275,6 +321,10 @@ class _SessionBase:
                 continue
             if self._line_buf is not None:
                 if b >= 0x20:  # printable ASCII + any UTF-8 continuation
+                    # Composer-trackable printable = real typing (escape-sequence bodies
+                    # never get here — the ESC branch nulls _line_buf first; Enter above
+                    # still marks typing while untracked, so a clear lands on submit).
+                    self._typed = True
                     self._line_buf.append(b)
                     if len(self._line_buf) > self._GUARD_LINE_CAP:
                         self._line_buf = None
@@ -289,6 +339,11 @@ class _SessionBase:
         if self._write_fd() is None or not data:
             return
         data = self._guard_input(data)
+        if self._typed:
+            self._typed = False
+            if self.clear_needs_on_typing:  # codex: no prompt-submit hook → clear on typing
+                with contextlib.suppress(OSError):
+                    _marker_path(self.chat_id).unlink(missing_ok=True)
         if not data:
             return
         self._wbuf += self._frame_input(data)
@@ -887,9 +942,39 @@ def terminal_backend(chat_id: str) -> str:
     return DEFAULT_BACKEND
 
 
+# Live post-launch codex binders (one per chat at most — see _codex_bind_watch).
+_codex_watchers: dict[str, asyncio.Task] = {}
+
+
+async def _codex_bind_watch(chat_id: str, cwd: str | None, launched_at: float) -> None:
+    """Bind a freshly-launched codex session's native id to its loom chat.
+
+    Codex picks its own session uuid, so after a fresh launch loom polls until the id
+    is discoverable — the notify-hook file (exact, ≈ end of first turn) or the rollout
+    cwd-scan (≈ first prompt) — then persists it as the overlay's `agent_session_id`
+    (done inside _codex_session_id). That's what lets the indexed transcript row merge
+    into this chat in the sidebar and makes resume reattach the same thread. Gives up
+    after 15 min or once the live session is gone (an untyped session may never write
+    a rollout — the next open just launches fresh again, nothing to resume)."""
+    loop = asyncio.get_running_loop()
+    deadline = time.monotonic() + 900.0
+    try:
+        while time.monotonic() < deadline:
+            resolve = functools.partial(_codex_session_id, chat_id, cwd, fresh_after=launched_at)
+            if await loop.run_in_executor(None, resolve):
+                return
+            ts = _registry.get(chat_id)
+            if ts is None or not ts.attached:
+                return  # session ended — stop polling
+            await asyncio.sleep(5.0)
+    finally:
+        _codex_watchers.pop(chat_id, None)
+
+
 async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: int = 32) -> _SessionBase:
     loop = asyncio.get_running_loop()
     backend = await loop.run_in_executor(None, terminal_backend, chat_id)
+    agent = await loop.run_in_executor(None, _agent_for, chat_id)
     ts = _registry.get(chat_id)
     if ts is not None and ts.backend != backend:
         # The persisted choice changed under a live session (e.g. switched from another
@@ -910,7 +995,12 @@ async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: in
             None, sessions_mod.set_overlay, chat_id,
             {"terminal_backend": backend, "opened_at": time.time()},
         )
+    ts.clear_needs_on_typing = agent == "codex"  # codex has no prompt-submit hook (see write())
     await ts.open()
+    if agent == "codex":
+        live = _codex_watchers.get(chat_id)
+        if live is None or live.done():
+            _codex_watchers[chat_id] = asyncio.create_task(_codex_bind_watch(chat_id, cwd, time.time()))
     return ts
 
 

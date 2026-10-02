@@ -31,8 +31,9 @@ def run_checks() -> list[dict]:
     bun = _has("bun")
     add("bun", bun, "" if bun else "optional — npm fallback works (npm i -g bun)")
     add("tmux", _has("tmux"), "optional — classic terminal host fallback (brew install tmux)")
-    add("claude CLI", _has("claude"), "needed for Claude sessions (one of claude/grok required)")
-    add("grok CLI", _has("grok"), "needed for Grok sessions (one of claude/grok required)")
+    add("claude CLI", _has("claude"), "needed for Claude sessions (one of claude/grok/codex required)")
+    add("grok CLI", _has("grok"), "needed for Grok sessions (one of claude/grok/codex required)")
+    add("codex CLI", _has("codex"), "needed for Codex sessions (one of claude/grok/codex required)")
     gh_ok = _gh_authed()
     add(
         "gh authed",
@@ -49,9 +50,9 @@ def run_checks() -> list[dict]:
 
 def all_ok(checks: list[dict]) -> bool:
     # Optional tools don't fail the gate — only loom's own prerequisites do.
-    # Claude and Grok are individually optional if the other is present.
-    optional = {"bun", "tmux", "gh authed", "docker running", "claude CLI", "grok CLI"}
+    # The agent CLIs are individually optional as long as at least one is present.
+    optional = {"bun", "tmux", "gh authed", "docker running", "claude CLI", "grok CLI", "codex CLI"}
     if not all(c["ok"] for c in checks if c["name"] not in optional):
         return False
-    has_agent = any(c["name"] in ("claude CLI", "grok CLI") and c["ok"] for c in checks)
+    has_agent = any(c["name"] in ("claude CLI", "grok CLI", "codex CLI") and c["ok"] for c in checks)
     return has_agent

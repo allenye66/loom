@@ -10,7 +10,7 @@ export type Ports = {
 export type ServiceProc = { name: string; pid?: number | null; port?: number | null; healthy: boolean; health_url?: string | null };
 export type Git = { branch?: string; dirty?: boolean; ahead?: number; behind?: number };
 export type TestRun = { running: boolean; exit_code: number | null; command?: string } | null;
-export type AgentId = 'claude' | 'grok';
+export type AgentId = 'claude' | 'grok' | 'codex';
 
 export type Task = {
   id: string;

@@ -49,11 +49,11 @@ export function TaskCard({ task }: { task: Task }) {
   // falling back to a new one if there isn't yet.
   const onOpen = async (mode: 'chat' | 'terminal') => {
     let resume: string | undefined;
-    let agent: 'claude' | 'grok' | undefined = task.chat_agent ?? undefined;
+    let agent: 'claude' | 'grok' | 'codex' | undefined = task.chat_agent ?? undefined;
     try {
       const d = await fetch(`/api/tasks/${task.id}/chat`).then((r) => r.json());
       resume = d.chat_id || undefined;
-      if (d.agent === 'claude' || d.agent === 'grok') agent = d.agent;
+      if (d.agent === 'claude' || d.agent === 'grok' || d.agent === 'codex') agent = d.agent;
     } catch { /* fall back to a new chat */ }
     if (resume) {
       try {

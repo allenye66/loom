@@ -141,6 +141,38 @@ terminal instead. Native `tmux attach` / `⧉ terminal` bypass loom and are out 
 (3) The indexer skips local-command noise when deriving first_prompt, so command-headed
 sessions can never render as junk chats again.
 
+## D17 — Codex support: bind the native session id post-launch, never pre-mint it (2026-10-02)
+Codex CLI (verified on 0.160.0) has no `--session-id`: it mints its own uuid at launch and
+only `codex resume <uuid>` reattaches it. So the claude/grok invariant "loom chat id == agent
+session id" can't hold. Rather than re-keying live chats (which would break the pty/tmux
+session keyed on chat id, WS attaches, and `?chat=` deep links mid-flight), the loom chat id
+stays authoritative and the native id is **bound** into the chat overlay as
+`agent_session_id`, discovered two ways (first one wins, claim-once):
+1. **notify hook** (exact): loom passes `-c notify=["~/.loom/codex-notify.sh"]`; codex invokes
+   it on agent-turn-complete / approval-requested / async-question with a JSON arg carrying
+   `thread-id`. The env-guarded script (`LOOM_CODEX_NOTIFY_FILE`) drops that JSON per chat;
+   it also touches `LOOM_NEEDS_MARK` — codex's analogue of claude's Stop/Notification hooks
+   for the sidebar "needs you" dot (cleared from the input stream on real typing, since codex
+   has no UserPromptSubmit equivalent).
+2. **rollout cwd-scan** (early/fallback): `~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid>.jsonl`
+   first line is `session_meta` with `cwd` — and worktree↔chat is strict 1:1, so the newest
+   unclaimed rollout in the chat's worktree is this chat's. A fresh launch's watcher
+   (`_codex_bind_watch`, 15 min) only scans rollouts written since open; the pre-launch
+   recovery path (lost binding) takes the worktree's newest.
+The indexer re-keys claimed codex rows to their loom chat id (and titles them from codex's
+own `session_index.jsonl` thread names); unclaimed rollouts surface under their native uuid,
+so externally-created codex sessions list/resume like claude ones. The binding doubles as an
+**adoption** mechanism: writing `agent` + `agent_session_id` into any task's chat overlay
+pulls a natively-started session into that task — the chat resolver treats the `task.chat_id`
+link as authoritative over transcript-cwd inference and homes the chat in the task's worktree
+(sidebar, terminal cwd, dev stack). First used 2026-10-02 to adopt two codex chats started in
+`~` into kalendir worktree tasks. Codex writes no rollout
+until the first prompt (verified) — same pending-row UX as claude. Zero-content rollouts that
+no loom chat opened are hidden as junk (codex writes env-wrapper records even for untyped
+sessions). Launch flags mirror the claude posture: `model_reasoning_effort="xhigh"` (≈
+`--effort max`), `--dangerously-bypass-approvals-and-sandbox` (≈ `bypassPermissions`, D-adj
+to taste: `-s workspace-write -a on-request`), `--search`, `--no-alt-screen` on the pty host.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

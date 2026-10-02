@@ -41,12 +41,13 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `core/process.py` | Process-group spawn (`start_new_session`), liveness, `kill_group`, port-scoped `kill_port`, `health_check`. |
 | `core/manager.py` | Task lifecycle: `create_task` (worktree+alloc+setup), `start_task`/`stop_task` (Phase-2 dev servers), `remove_task`, `refresh_status`. |
 | `core/tests.py` | Isolated test runs: `build_test_run` (render cmd/env from `.loom.yaml`), `serialize_lock` (file lock so concurrent runs don't clash on one shared test resource). |
-| `core/doctor.py` | Preflight checks (git/uv/node/claude; optional bun/tmux/gh/docker). |
+| `core/doctor.py` | Preflight checks (git/uv/node + agent CLIs claude/grok/codex, one required; optional bun/tmux/gh/docker). |
 | `core/repos.py` | `repos.json` registry of known repos (name→root). |
-| `core/sessions.py` | **Chat manager**: index `~/.claude/projects/**/*.jsonl` (mtime-cached), merge a local overlay, search, soft-trash, and `get_transcript()` (reconstruct a session into render items). |
+| `core/agents.py` | **Agent adapters** (claude \| grok \| codex): argv/env construction per CLI, transcript discovery, needs-you hooks. Codex extras: it mints its own session id (no `--session-id`), so loom binds the discovered native id into the overlay (`agent_session_id`) via the `notify` hook file / a rollout cwd-scan, and resumes with `codex resume <that id>`. |
+| `core/sessions.py` | **Chat manager**: index `~/.claude/projects/**/*.jsonl` + `~/.grok/sessions/**` + `~/.codex/sessions/**` rollouts (mtime-cached), merge a local overlay, search, soft-trash, and `get_transcript()` (reconstruct a session into render items; claude + codex formats). Codex rows claimed by an `agent_session_id` binding are re-keyed to their loom chat id. Chat→task resolution: the `task.chat_id` link wins (homes adopted chats in their task's worktree), then worktree/repo cwd-prefix inference. |
 | `core/runtime.py` | Per-worktree runtime context: if a session's cwd is inside a worktree, build its `LOOM_*` env (ports/log dir) + the `<loom-runtime>` system-prompt note. Project-agnostic. |
 | `core/claude_session.py` | Native launcher (`open_session`/`resume_session` via tmux/Terminal.app). Powers the `loom claude` CLI and the `⧉ terminal` (native attach) button. |
-| `core/terminals.py` | **The chat surface**: the *real* `claude` TUI in the browser, bridged to WebSocket subscribers as raw bytes (xterm.js renders them). Two hosts behind one interface: `PtyTerminalSession` (default, "smooth scroll" — a detached `pty_server` daemon, inline renderer, xterm owns scrollback) and `TmuxTerminalSession` ("classic" — fullscreen `claude` in `loomx-<chat_id>`). Both survive loom restarts + browser disconnects; per-chat choice in the overlay (`terminal_backend`), switchable via kill + `--resume`. Uses `core/runtime.py` for the worktree env + system-prompt note. |
+| `core/terminals.py` | **The chat surface**: the *real* agent TUI (claude/grok/codex via `core/agents.py`) in the browser, bridged to WebSocket subscribers as raw bytes (xterm.js renders them). Two hosts behind one interface: `PtyTerminalSession` (default, "smooth scroll" — a detached `pty_server` daemon, inline renderer, xterm owns scrollback) and `TmuxTerminalSession` ("classic" — fullscreen `claude` in `loomx-<chat_id>`). Both survive loom restarts + browser disconnects; per-chat choice in the overlay (`terminal_backend`), switchable via kill + `--resume`. Uses `core/runtime.py` for the worktree env + system-prompt note. |
 | `core/pty_server.py` | The pty backend's **persistence daemon**: runs one command under a PTY on an AF_UNIX socket, detached (`start_new_session`) so it outlives loom. Escape-protocol relay (`\x1c` framing: resize / snapshot / literal), 1 MB replay ring (alt-screen-filtered on replay), DA1/DA2 interception (answers device-attribute queries itself so xterm's auto-reply can't echo as garbage), and settle-aware snapshots (waits for the TUI to go quiescent before capturing). Stdlib-only; runnable standalone as `python -m loom.core.pty_server`. |
 
 ## Frontend code map (`dashboard/src/`)
@@ -84,14 +85,19 @@ to `~/.loom/trash/`. See `SESSIONS_DESIGN.md`.
 
 ### Terminal chat (`/api/ws/term` ↔ `core/terminals.py`)
 
-The in-browser chat is the **actual** interactive `claude` CLI, so every slash
-command / permission prompt / feature works with zero reimplementation. Each chat
-runs
+The in-browser chat is the **actual** interactive agent CLI (claude | grok | codex,
+locked per chat), so every slash command / permission prompt / feature works with
+zero reimplementation. A claude chat runs
 
 ```
 claude --effort max --permission-mode bypassPermissions --settings '{...theme,hooks[,tui]}'
        [--append-system-prompt <loom-runtime note>] (--resume|--session-id <chat_id>)
 ```
+
+(grok: `--effort max --permission-mode acceptEdits [--no-alt-screen --minimal]`;
+codex: `[resume <bound id>] -c model_reasoning_effort="xhigh"
+--dangerously-bypass-approvals-and-sandbox --search -c notify=[<needs-hook>]
+[--no-alt-screen]` — argv per agent built in `core/agents.py`)
 
 under one of two hosts (per-chat `terminal_backend` overlay field; default `pty`):
 
@@ -113,8 +119,12 @@ backend edit restarts it). Switching an existing chat = kill the host + relaunch
 transcript, so only the live process restarts. Chats that already had a live tmux
 session before the pty default keep tmux until switched (never two claudes on one
 session id). The chat's `cwd` and worktree ports/logs come from `core/runtime.py`;
-the chat id is the stable `~/.claude` session id, so terminal output and the indexed
-transcript are the same conversation.
+the chat id is the stable agent-native session id (`~/.claude` / `~/.grok`), so
+terminal output and the indexed transcript are the same conversation. Codex is the
+exception — it mints its own uuid at launch, so the loom chat id stays and the
+native id is **bound** into the overlay (`agent_session_id`) post-launch
+(`terminals._codex_bind_watch`: notify-hook file, else rollout cwd-scan; see D17);
+indexed codex rows claimed by a binding are re-keyed to the loom chat id.
 
 WS protocol (`/api/ws/term`):
 

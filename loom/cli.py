@@ -64,7 +64,7 @@ def new(
     branch: str,
     repo: str = typer.Option(".", "--repo", "-r", help="path to the target repo"),
     base: str | None = typer.Option(None, "--base", help="base branch (default from .loom.yaml)"),
-    agent: str = typer.Option("claude", "--agent", "-a", help="agent CLI for the task chat: claude | grok"),
+    agent: str = typer.Option("claude", "--agent", "-a", help="agent CLI for the task chat: claude | grok | codex"),
 ) -> None:
     """Create a worktree + isolated env for a branch."""
     cfg = load_repo_config(repo)

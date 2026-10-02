@@ -1,11 +1,15 @@
-"""Chat/session index over Claude + Grok transcripts + a local organization overlay.
+"""Chat/session index over Claude + Grok + Codex transcripts + a local organization overlay.
 
 Claude writes append-only transcripts to ~/.claude/projects/<slug>/<id>.jsonl with
 ai-title / last-prompt / gitBranch / pr-link records. Grok stores sessions under
-~/.grok/sessions/<encoded-cwd>/<id>/ (summary.json + updates.jsonl). loom READS
-those (never edits) to build a fast, cached index, and keeps its OWN overlay
-(~/.loom/chats.json) for user-controlled state: star / archive / hide / name /
-tags / description / agent.
+~/.grok/sessions/<encoded-cwd>/<id>/ (summary.json + updates.jsonl). Codex writes
+rollout jsonls under ~/.codex/sessions/YYYY/MM/DD/ (+ session_index.jsonl with
+auto thread names). loom READS those (never edits) to build a fast, cached index,
+and keeps its OWN overlay (~/.loom/chats.json) for user-controlled state: star /
+archive / hide / name / tags / description / agent — plus, for codex chats,
+`agent_session_id`: the native codex session uuid bound to this loom chat (codex
+mints its own id at launch, so it can't equal the loom chat id like claude/grok;
+indexed codex rows claimed by a binding are re-keyed to the loom chat id).
 
 Delete = soft-trash (overlay flag; transcripts stay for the native CLI).
 Search depth = metadata + prompts (title, branch, PR, tags, description, first/last
@@ -30,6 +34,8 @@ from loom.core.config import LOOM_HOME, ensure_dirs
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 GROK_SESSIONS = Path.home() / ".grok" / "sessions"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+CODEX_SESSION_INDEX = Path.home() / ".codex" / "session_index.jsonl"
 TRASH_DIR = LOOM_HOME / "trash"
 OVERLAY_PATH = LOOM_HOME / "chats.json"
 INDEX_CACHE = LOOM_HOME / "sessions_index.json"
@@ -317,11 +323,142 @@ def _parse_grok_session(sess_dir: Path, group_name: str) -> dict:
     }
 
 
+# Codex injects wrapper records as role=user that aren't something the user typed —
+# keep them out of first_prompt / previews / n_user (same job as _LOCAL_CMD_MARKERS
+# for claude's /clear plumbing).
+_CODEX_NOISE_PREFIXES = (
+    "<environment_context>",
+    "<user_instructions>",
+    "<turn_aborted>",
+    "<permissions",
+    "<app_context>",
+    "<system_status>",
+)
+
+
+def _is_codex_noise(text: str) -> bool:
+    return text.lstrip().startswith(_CODEX_NOISE_PREFIXES)
+
+
+def _codex_message_text(payload: dict) -> str | None:
+    """Joined text of a codex response_item message payload (input_text/output_text blocks)."""
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text") for b in content if isinstance(b, dict) and b.get("text")]
+        if parts:
+            return "\n".join(parts)
+    return None
+
+
+def _parse_codex_session(path: Path) -> dict:
+    """Index a codex rollout jsonl: session_meta (cwd/created) + real user/assistant turns."""
+    first_prompt = preview = cwd = created = None
+    n_user = n_assistant = 0
+    sid = path.stem[-36:]  # rollout-<launch ts>-<uuid>.jsonl
+    try:
+        with path.open("r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = rec.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                t = rec.get("type")
+                if t == "session_meta":
+                    sid = str(payload.get("id") or payload.get("session_id") or sid)
+                    cwd = payload.get("cwd") or cwd
+                    created = payload.get("timestamp") or created
+                elif t == "response_item" and payload.get("type") == "message":
+                    role = payload.get("role")
+                    if role == "user":
+                        text = _codex_message_text(payload)
+                        if text and not _is_codex_noise(text):
+                            n_user += 1
+                            if first_prompt is None:
+                                first_prompt = text[:240]
+                            preview = text[:240]
+                    elif role == "assistant":
+                        n_assistant += 1
+    except OSError:
+        pass
+    st = path.stat()
+    return {
+        "id": sid,
+        "agent": "codex",
+        "title": None,  # filled from session_index.jsonl thread names at read time
+        "preview": preview,
+        "first_prompt": first_prompt,
+        "branch": None,
+        "cwd": cwd,
+        "prs": [],
+        "pr_repo": None,
+        "created": created,
+        "last_active": st.st_mtime,
+        "size": st.st_size,
+        "n_user": n_user,
+        "n_assistant": n_assistant,
+    }
+
+
+# mtime/size-keyed cache of codex's session_index.jsonl ({id → thread_name}, last
+# write wins). Small file, read on every build_index — same pattern as overlay_all.
+_codex_names_cache: tuple[tuple[float, int], dict] | None = None
+
+
+def _codex_thread_names() -> dict:
+    global _codex_names_cache
+    try:
+        st = CODEX_SESSION_INDEX.stat()
+    except OSError:
+        return {}
+    key = (st.st_mtime, st.st_size)
+    if _codex_names_cache is not None and _codex_names_cache[0] == key:
+        return _codex_names_cache[1]
+    names: dict = {}
+    try:
+        with CODEX_SESSION_INDEX.open("r", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict) and rec.get("id") and rec.get("thread_name"):
+                    names[str(rec["id"])] = rec["thread_name"]
+    except OSError:
+        return {}
+    _codex_names_cache = (key, names)
+    return names
+
+
+def _codex_claims() -> dict:
+    """{native codex session uuid → loom chat id} from overlay `agent_session_id`
+    bindings (written by terminals.py post-launch — codex can't be handed a session
+    id at launch the way claude/grok can)."""
+    out: dict = {}
+    for cid, ov in overlay_all().items():
+        asid = ov.get("agent_session_id")
+        if asid and asid != cid:
+            out[str(asid)] = cid
+    return out
+
+
 def build_index(force: bool = False) -> list[dict]:
     """Re-parse only transcripts whose size/mtime changed; cache the rest.
 
-    Cache keys are `claude:<id>` / `grok:<id>` so the two stores never collide.
-    The public `id` field remains the raw session UUID.
+    Cache keys are `claude:<id>` / `grok:<id>` / `codex:<id>` so the stores never
+    collide. The public `id` field is the raw session UUID — except codex rows
+    claimed by a loom chat's `agent_session_id` binding, which are re-keyed to that
+    loom chat id so every consumer (overlay, tasks, deep links) sees one chat.
     """
     cache = _read_json(INDEX_CACHE, {})
     out: dict[str, dict] = {}
@@ -383,48 +520,89 @@ def build_index(force: bool = False) -> list[dict]:
                     lambda sess=sess, group=group: _parse_grok_session(sess, group.name),
                 )
 
+    if CODEX_SESSIONS.exists():
+        # YYYY/MM/DD day dirs of rollout-<ts>-<uuid>.jsonl files.
+        for f in CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            key = f"codex:{f.stem[-36:]}"
+            _put(key, st.st_size, st.st_mtime, lambda f=f: _parse_codex_session(f))
+
     # Only rewrite the cache when a transcript was added / removed / re-parsed. Under the
     # sidebar's polling this is usually a no-op, which avoids a concurrent-write storm.
     if changed or out.keys() != cache.keys():
         _write_json(INDEX_CACHE, out)
-    return list(out.values())
+
+    rows = list(out.values())
+    # Codex post-pass (on copies — never mutate cached rows): titles from codex's own
+    # thread names (generated server-side after the first turns, so they can't be baked
+    # into the parse-time cache), and claim re-keying (native uuid → loom chat id).
+    claims = _codex_claims()
+    names = _codex_thread_names()
+    if claims or names:
+        for i, r in enumerate(rows):
+            if r.get("agent") != "codex":
+                continue
+            new_id = claims.get(r["id"])
+            title = r.get("title") or names.get(r["id"])
+            if new_id or title != r.get("title"):
+                rows[i] = {**r, "id": new_id or r["id"], "title": title}
+    return rows
 
 
 # --- repo / task linkage ------------------------------------------------------
-def _repo_task_for_cwd(cwd: str | None) -> tuple[str | None, str | None]:
-    return _cwd_resolver()(cwd)
+def _repo_task_for_cwd(cwd: str | None, chat_id: str | None = None) -> tuple[str | None, str | None, str | None]:
+    return _cwd_resolver()(cwd, chat_id)
 
 
 def _cwd_resolver():
-    """Build a cwd → (repo, task_id) resolver ONCE. `list_chats` maps N chats through this;
-    doing the registry/repo lookup per chat (the old `_repo_task_for_cwd`) re-read the task
-    registry + repo list N times per request — the dominant cost of listing chats. Snapshot
-    both lists here, then resolve each chat against the in-memory snapshot."""
-    tasks = [(t.worktree_path.rstrip("/"), t.repo, t.id) for t in registry.list_tasks() if t.worktree_path]
+    """Build a (cwd, chat_id) → (repo, task_id, home_cwd) resolver ONCE. `list_chats` maps N
+    chats through this; doing the registry/repo lookup per chat (the old `_repo_task_for_cwd`)
+    re-read the task registry + repo list N times per request — the dominant cost of listing
+    chats. Snapshot both lists here, then resolve each chat against the in-memory snapshot.
+
+    Resolution order: the explicit task↔chat link (`task.chat_id` — authoritative, strict 1:1;
+    it's what makes an ADOPTED chat belong to its task even though the transcript recorded a
+    different cwd, e.g. a codex session started natively in ~ and bound to a task later) →
+    worktree-path prefix → repo-root prefix. `home_cwd` is non-None only for the link case:
+    the task's worktree is the chat's loom home, overriding the transcript cwd so the sidebar
+    filter and terminal-open land in the worktree."""
+    all_tasks = registry.list_tasks()
+    by_chat = {t.chat_id: (t.repo, t.id, t.worktree_path) for t in all_tasks if t.chat_id}
+    paths = [(t.worktree_path.rstrip("/"), t.repo, t.id) for t in all_tasks if t.worktree_path]
     roots = [(r["root"].rstrip("/"), r["name"]) for r in repos_mod.list_repos()]
 
-    def resolve(cwd: str | None) -> tuple[str | None, str | None]:
+    def resolve(cwd: str | None, chat_id: str | None = None) -> tuple[str | None, str | None, str | None]:
+        linked = by_chat.get(chat_id) if chat_id else None
+        if linked:
+            repo, tid, wt = linked
+            return repo, tid, wt
         if not cwd:
-            return None, None
-        for wp, repo, tid in tasks:
+            return None, None, None
+        for wp, repo, tid in paths:
             if cwd == wp or cwd.startswith(wp + "/"):
-                return repo, tid
+                return repo, tid, None
         for root, name in roots:
             if cwd == root or cwd.startswith(root + "/"):
-                return name, None
-        return None, None
+                return name, None, None
+        return None, None, None
 
     return resolve
 
 
 def _merge(s: dict, resolve=None) -> dict:
     ov = get_overlay(s["id"])
-    repo_name, task_id = (resolve or _repo_task_for_cwd)(s.get("cwd"))
+    repo_name, task_id, home_cwd = (resolve or _repo_task_for_cwd)(s.get("cwd"), s["id"])
     title = ov.get("name") or s.get("title") or (s.get("first_prompt") or "")[:64] or s["id"][:8]
-    # Overlay agent wins once locked; else the index source (claude/grok scan).
+    # Overlay agent wins once locked; else the index source (claude/grok/codex scan).
     agent = agents.normalize_agent(ov.get("agent") or s.get("agent"))
     return {
         **s,
+        # A task-linked chat's home is its worktree (overrides the transcript's recorded
+        # cwd for adopted chats — terminal opens + sidebar filtering use this).
+        "cwd": home_cwd or s.get("cwd"),
         "agent": agent,
         "repo": repo_name,
         "task": task_id,
@@ -439,6 +617,7 @@ def _merge(s: dict, resolve=None) -> dict:
         "hidden": ov.get("hidden", False),
         "deleted": ov.get("deleted", False),  # trashed = unlisted everywhere (transcript untouched)
         "mode": ov.get("mode"),  # "chat" | "terminal" | None (not yet chosen)
+        "opened": bool(ov.get("opened_at")),  # loom ever attached a terminal to this chat
     }
 
 
@@ -456,6 +635,12 @@ def _is_contentless_junk(r: dict) -> bool:
         return False
     if r.get("name") or r.get("title") or r.get("first_prompt") or r.get("preview") or r.get("n_assistant"):
         return False
+    # Codex writes a rollout (session_meta + env wrappers) even for a session nobody
+    # typed in, so a zero-content rollout that no loom chat opened/claimed is pure
+    # noise — unlike claude, where an untyped session writes no transcript at all.
+    # Loom's own just-opened codex chats survive via `opened` (overlay opened_at).
+    if r.get("agent") == "codex" and not r.get("opened"):
+        return True
     return (r.get("n_user") or 0) > 0
 
 
@@ -557,9 +742,15 @@ def get_transcript(sid: str) -> list[dict]:
 
     user(string) -> user message; assistant -> text + thinking + tool_use blocks;
     user(tool_result) -> attaches result to the matching tool by tool_use_id.
+
+    Claude's jsonl format is parsed inline below; codex rollouts go through
+    _codex_transcript (grok sessions aren't reconstructed yet → []).
     """
     path = _find_transcript(sid)
     if not path or not path.exists():
+        rollout = _codex_rollout_for_chat(sid)
+        if rollout is not None:
+            return _codex_transcript(rollout)
         return []
     items: list[dict] = []
     tool_index: dict = {}
@@ -640,6 +831,75 @@ def get_transcript(sid: str) -> list[dict]:
                             "thinking": "".join(thinks),
                             "tools": tools,
                         })
+    return items
+
+
+def _codex_rollout_for_chat(sid: str) -> Path | None:
+    """Rollout file for a chat id — via its overlay binding (loom-created codex chat)
+    or the id itself (an external codex session surfaced under its native uuid)."""
+    asid = get_overlay(sid).get("agent_session_id") or sid
+    return agents.find_codex_rollout(str(asid))
+
+
+def _codex_transcript(path: Path) -> list[dict]:
+    """Reconstruct a codex rollout as the same render-ready items claude's parse yields.
+
+    response_item messages → user/assistant items; reasoning summaries → thinking;
+    *_call / *_call_output pairs (matched on call_id) → tools with results attached.
+    """
+    items: list[dict] = []
+    tool_index: dict = {}
+    try:
+        f = path.open(errors="replace")
+    except OSError:
+        return []
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("type") != "response_item":
+                continue
+            p = rec.get("payload")
+            if not isinstance(p, dict):
+                continue
+            pt = p.get("type")
+            if pt == "message":
+                text = _codex_message_text(p) or ""
+                role = p.get("role")
+                if role == "user":
+                    if text.strip() and not _is_codex_noise(text):
+                        items.append({"kind": "user", "text": text})
+                elif role == "assistant" and text.strip():
+                    items.append({"kind": "assistant", "text": text, "thinking": "", "tools": []})
+            elif pt == "reasoning":
+                summary = p.get("summary")
+                think = ""
+                if isinstance(summary, list):
+                    think = "\n".join(
+                        b.get("text", "") for b in summary if isinstance(b, dict) and b.get("text")
+                    )
+                if think.strip():
+                    items.append({"kind": "assistant", "text": "", "thinking": think, "tools": []})
+            elif pt and pt.endswith("_call_output"):
+                tool = tool_index.get(p.get("call_id"))
+                if tool is not None:
+                    out = p.get("output")
+                    tool["result"] = out if isinstance(out, str) else ("" if out is None else str(out))
+            elif pt and (pt.endswith("_call") or pt == "local_shell_call"):
+                inp = p.get("input") or p.get("arguments")
+                if inp is None and isinstance(p.get("action"), dict):  # local_shell_call
+                    cmd = p["action"].get("command")
+                    inp = " ".join(map(str, cmd)) if isinstance(cmd, list) else cmd
+                name = p.get("name") or pt.removesuffix("_call")
+                tool = {"id": p.get("call_id") or p.get("id"), "name": name, "input": inp}
+                if tool["id"]:
+                    tool_index[tool["id"]] = tool
+                items.append({"kind": "assistant", "text": "", "thinking": "", "tools": [tool]})
     return items
 
 

@@ -6,7 +6,7 @@ export type ActiveChat = {
   resume?: string;
   title: string;
   mode?: 'chat' | 'terminal'; // vestigial — every chat now opens into the terminal surface
-  agent?: AgentId; // claude | grok — sticky once the session is created
+  agent?: AgentId; // claude | grok | codex — sticky once the session is created
 };
 
 export const ChatCtx = createContext<(c: ActiveChat) => void>(() => {});

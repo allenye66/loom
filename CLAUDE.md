@@ -10,13 +10,13 @@ Two halves:
 1. **Worktree tasks** — each task = a git worktree on its own branch, with
    deterministic ports + isolated test runs, so you can work/test several
    branches in parallel without checkout conflicts.
-2. **In-browser agent TUI client** — the **real** interactive `claude` or
-   `grok` CLI (chosen at task/session create, locked per chat), hosted
+2. **In-browser agent TUI client** — the **real** interactive `claude`, `grok`,
+   or `codex` CLI (chosen at task/session create, locked per chat), hosted
    server-side (default: a detached `pty_server` daemon, "smooth scroll";
    fallback: a **tmux** session, "classic") and bridged to xterm.js over a
    WebSocket (so every slash command / permission prompt / feature works with zero
-   reimplementation), plus a chat manager that indexes `~/.claude` and
-   `~/.grok/sessions` history. The goal is to **replace the agent terminal as a
+   reimplementation), plus a chat manager that indexes `~/.claude`,
+   `~/.grok/sessions`, and `~/.codex/sessions` history. The goal is to **replace the agent terminal as a
    UI** and let you run/▸switch between multiple chats.
 
 A personal tool, shared as-is. Repo: `github.com/allenye66/loom`.
@@ -45,7 +45,7 @@ A personal tool, shared as-is. Repo: `github.com/allenye66/loom`.
 - **Frontend** (`dashboard/`): React + Vite + Tailwind v4 (bun). TanStack Query
   for REST, a raw WebSocket for the live terminal.
 - **Live terminal** (`loom/core/terminals.py` ↔ `dashboard/src/term/`): each chat
-  is a real agent CLI (`claude` or `grok`, from overlay `agent` via
+  is a real agent CLI (`claude` | `grok` | `codex`, from overlay `agent` via
   `core/agents.py`) hosted by one of two backends so it survives browser
   disconnects *and* loom restarts — **pty** (default): a detached
   `loom/core/pty_server.py` daemon on `~/.loom/pty-sockets/`, inline renderer,
@@ -63,12 +63,18 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   **classic tmux** backend still needs `tmux`. Both scrub `CLAUDECODE`/`CLAUDE_CODE_*`
   from the child so the nested `claude` doesn't inherit auto-approve (see
   `docs/CLAUDE_AGENT_SDK_NOTES.md`).
-- Terminal sessions launch with `--effort max` (and agent-specific flags from
-  `core/agents.py`). Agent is chosen when creating a task (`agent: claude|grok`)
-  and stored sticky in the chat overlay — never switch mid-session.
+- Terminal sessions launch with max effort (and agent-specific flags from
+  `core/agents.py`). Agent is chosen when creating a task (`agent:
+  claude|grok|codex`) and stored sticky in the chat overlay — never switch
+  mid-session.
 - The chat manager treats agent transcripts as **read-only** truth
-  (`~/.claude/projects/**/*.jsonl` and `~/.grok/sessions/**`) and keeps user
-  state (star/archive/tags/name/agent) in `~/.loom/chats.json`.
+  (`~/.claude/projects/**/*.jsonl`, `~/.grok/sessions/**`,
+  `~/.codex/sessions/**`) and keeps user state (star/archive/tags/name/agent)
+  in `~/.loom/chats.json`.
+- **Codex has no `--session-id`** — it mints its own uuid, so the chat overlay
+  binds the discovered native id as `agent_session_id` post-launch (notify hook
+  → rollout cwd-scan) and resume goes through `codex resume <that id>`. See
+  `docs/DECISIONS.md` D17 before touching that flow.
 - Match the existing code style; keep Python imports at top of file.
 
 ## Docs

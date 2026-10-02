@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useDoctor, useTasks, useTaskActions, type AgentId } from '../api';
+import { AgentIcon } from './AgentIcon';
 import { useOpenChat } from '../chat/ChatContext';
 import { TaskCard } from './TaskCard';
 
@@ -17,13 +18,17 @@ export function TasksView({ repoRoot }: { repoRoot: string }) {
 
   const hasClaude = doctor?.some((c) => c.name === 'claude CLI' && c.ok) ?? true;
   const hasGrok = doctor?.some((c) => c.name === 'grok CLI' && c.ok) ?? false;
+  const hasCodex = doctor?.some((c) => c.name === 'codex CLI' && c.ok) ?? false;
 
   // Prefer an installed agent if the current pick isn't available (e.g. only grok installed).
   useEffect(() => {
     if (!doctor) return;
-    if (agent === 'claude' && !hasClaude && hasGrok) setAgent('grok');
-    if (agent === 'grok' && !hasGrok && hasClaude) setAgent('claude');
-  }, [doctor, hasClaude, hasGrok, agent]);
+    const avail: Record<AgentId, boolean> = { claude: hasClaude, grok: hasGrok, codex: hasCodex };
+    if (!avail[agent]) {
+      const fallback = (['claude', 'grok', 'codex'] as const).find((a) => avail[a]);
+      if (fallback) setAgent(fallback);
+    }
+  }, [doctor, hasClaude, hasGrok, hasCodex, agent]);
 
   // Create the worktree task, then drop straight into a fresh chat with the chosen agent.
   const submit = async () => {
@@ -70,6 +75,7 @@ export function TasksView({ repoRoot }: { repoRoot: string }) {
             {([
               { id: 'claude' as const, label: 'claude', ok: hasClaude },
               { id: 'grok' as const, label: 'grok', ok: hasGrok },
+              { id: 'codex' as const, label: 'codex', ok: hasCodex },
             ]).map((opt) => (
               <button
                 key={opt.id}
@@ -77,7 +83,7 @@ export function TasksView({ repoRoot }: { repoRoot: string }) {
                 disabled={!opt.ok}
                 title={opt.ok ? `use ${opt.label} for this session` : `${opt.label} CLI not found on PATH`}
                 onClick={() => setAgent(opt.id)}
-                className={`px-3 py-1 mono ${
+                className={`px-3 py-1 mono inline-flex items-center gap-1.5 ${
                   agent === opt.id
                     ? 'bg-accent/15 text-accent'
                     : opt.ok
@@ -85,12 +91,13 @@ export function TasksView({ repoRoot }: { repoRoot: string }) {
                       : 'bg-surface text-muted/40 cursor-not-allowed'
                 }`}
               >
+                <AgentIcon agent={opt.id} size={10} />
                 {opt.label}
               </button>
             ))}
           </div>
-          {!hasClaude && !hasGrok && (
-            <span className="text-bad mono">install claude or grok CLI</span>
+          {!hasClaude && !hasGrok && !hasCodex && (
+            <span className="text-bad mono">install claude, grok, or codex CLI</span>
           )}
         </div>
       </div>

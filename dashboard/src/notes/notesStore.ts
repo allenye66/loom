@@ -37,7 +37,7 @@ function load(): NotesMap {
           updated: typeof n.updated === 'number' ? n.updated : 0,
           title: typeof n.title === 'string' && n.title ? n.title : id.slice(0, 8),
           cwd: typeof n.cwd === 'string' ? n.cwd : undefined,
-          agent: n.agent === 'claude' || n.agent === 'grok' ? n.agent : undefined,
+          agent: n.agent === 'claude' || n.agent === 'grok' || n.agent === 'codex' ? n.agent : undefined,
         };
       }
     }

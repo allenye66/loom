@@ -11,6 +11,7 @@ import {
   useCategories,
 } from '../categories/categoriesStore';
 import { useChatActions, useDoctor, useRepos, useTasks, useTaskActions, type AgentId, type Chat, type Task } from '../api';
+import { AgentIcon } from '../components/AgentIcon';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
 // opening a chat triggers (otherwise clicking a chat would snap the tab back to 'active').
@@ -246,8 +247,11 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const repoRoot = repos?.[0]?.root || '';
   const hasClaude = doctor?.some((c) => c.name === 'claude CLI' && c.ok) ?? true;
   const hasGrok = doctor?.some((c) => c.name === 'grok CLI' && c.ok) ?? false;
+  const hasCodex = doctor?.some((c) => c.name === 'codex CLI' && c.ok) ?? false;
   // This sidebar shows *loom's* work — one chat per task worktree — so filter the chat
-  // index down to chats whose cwd is a current task worktree.
+  // index down to chats that belong to a task: the server-resolved task link (covers
+  // adopted chats, e.g. a codex session started outside loom and bound to a task) or a
+  // cwd inside a current worktree.
   const { data: tasks } = useTasks();
   const worktreeSet = new Set((tasks ?? []).map((t) => t.worktree_path));
 
@@ -270,7 +274,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     refetchInterval: 2000,
   });
   const termById = new Map((termData ?? []).map((t) => [t.chat_id, t]));
-  const taskChats = (chatList ?? []).filter((c) => c.cwd && worktreeSet.has(c.cwd));
+  const taskChats = (chatList ?? []).filter((c) => c.task != null || (c.cwd && worktreeSet.has(c.cwd)));
 
   type Row = {
     id: string;
@@ -467,8 +471,8 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${working ? 'bg-accent animate-pulse' : needs ? 'bg-ok' : 'bg-muted/40'}`} />
         <span className="text-xs text-ink truncate flex-1">{r.title}</span>
         {r.agent && (
-          <span title={`${r.agent} session`} className="text-[9px] mono text-muted shrink-0 opacity-70">
-            {r.agent === 'grok' ? 'g' : 'c'}
+          <span title={`${r.agent} session`} className="text-muted shrink-0 opacity-80 inline-flex items-center">
+            <AgentIcon agent={r.agent} />
           </span>
         )}
         {working && <span title="agent is working (recent output)" className="text-[9px] mono text-accent shrink-0 animate-pulse">working</span>}
@@ -633,6 +637,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
             {([
               { id: 'claude' as const, label: 'claude', ok: hasClaude },
               { id: 'grok' as const, label: 'grok', ok: hasGrok },
+              { id: 'codex' as const, label: 'codex', ok: hasCodex },
             ]).map((opt) => (
               <button
                 key={opt.id}
@@ -640,7 +645,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
                 disabled={!opt.ok}
                 title={opt.ok ? `use ${opt.label}` : `${opt.label} CLI not on PATH`}
                 onClick={() => setAgent(opt.id)}
-                className={`flex-1 px-1.5 py-0.5 ${
+                className={`flex-1 px-1.5 py-0.5 inline-flex items-center justify-center gap-1 ${
                   agent === opt.id
                     ? 'bg-accent/15 text-accent'
                     : opt.ok
@@ -648,6 +653,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
                       : 'bg-surface text-muted/40 cursor-not-allowed'
                 }`}
               >
+                <AgentIcon agent={opt.id} size={9} />
                 {opt.label}
               </button>
             ))}

@@ -123,10 +123,11 @@ function jumpNoteText(r: JumpResult): string | null {
   }
 }
 
-/** Dropdown to open a native Terminal for this worktree — either ATTACH to the live claude
+/** Dropdown to open a native Terminal for this worktree — either ATTACH to the live agent
  *  session (tmux backend only; tmux supports multiple clients) or open a PLAIN SHELL in the
- *  worktree (no claude). */
-function OpenTerminalMenu({ chatId, cwd, backend }: { chatId?: string; cwd?: string; backend: TermBackend | null }) {
+ *  worktree (no agent). */
+function OpenTerminalMenu({ chatId, cwd, backend, agent }: { chatId?: string; cwd?: string; backend: TermBackend | null; agent?: string | null }) {
+  const agentName = agent || 'claude';
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(false);
@@ -167,7 +168,7 @@ function OpenTerminalMenu({ chatId, cwd, backend }: { chatId?: string; cwd?: str
       <button
         onClick={() => setOpen((v) => !v)}
         disabled={busy}
-        title="open a native Terminal — the live claude session, or a plain shell in this worktree"
+        title={`open a native Terminal — the live ${agentName} session, or a plain shell in this worktree`}
         className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 disabled:opacity-50"
       >
         {busy ? 'opening…' : err ? 'failed' : '⧉ terminal ▾'}
@@ -176,7 +177,7 @@ function OpenTerminalMenu({ chatId, cwd, backend }: { chatId?: string; cwd?: str
         <div className="absolute right-0 top-full mt-1 z-20 w-56 rounded-md border border-edge bg-surface shadow-xl overflow-hidden">
           {backend === 'tmux' && (
             <button onClick={() => run('claude')} className="w-full text-left px-3 py-2 hover:bg-surface-2 flex flex-col gap-0.5">
-              <span className="text-[11px] mono text-ink">❯ attach claude</span>
+              <span className="text-[11px] mono text-ink">❯ attach {agentName}</span>
               <span className="text-[10px] text-muted">the live session — tmux attach, stays in sync</span>
             </button>
           )}
@@ -186,7 +187,7 @@ function OpenTerminalMenu({ chatId, cwd, backend }: { chatId?: string; cwd?: str
             className="w-full text-left px-3 py-2 hover:bg-surface-2 border-t border-edge first:border-t-0 flex flex-col gap-0.5 disabled:opacity-40"
           >
             <span className="text-[11px] mono text-ink">$ plain shell</span>
-            <span className="text-[10px] text-muted">no claude — a shell in this worktree</span>
+            <span className="text-[10px] text-muted">no {agentName} — a shell in this worktree</span>
           </button>
         </div>
       )}
@@ -498,14 +499,14 @@ export function TerminalView({
   resume?: string;
   cwd?: string;
   title?: string;
-  agent?: 'claude' | 'grok';
+  agent?: 'claude' | 'grok' | 'codex';
   onClose: () => void;
 }) {
   const holderRef = useRef<HTMLDivElement>(null);
   // Which host backs this session — reported by the server on WS open. Drives the header
   // label/menus; the live wheel/snapshot branching uses the effect-local mirror below.
   const [backend, setBackend] = useState<TermBackend | null>(null);
-  const [liveAgent, setLiveAgent] = useState<'claude' | 'grok' | null>(agent ?? null);
+  const [liveAgent, setLiveAgent] = useState<'claude' | 'grok' | 'codex' | null>(agent ?? null);
   // Bumped after a renderer switch → remounts the whole terminal (fresh xterm state — the
   // old host's alt-screen/scrollback state must not leak into the new one) + a fresh WS.
   const [termEpoch, setTermEpoch] = useState(0);
@@ -579,7 +580,7 @@ export function TerminalView({
     // Branches the wheel path: tmux owns the screen (forward SGR wheel events), pty gives
     // xterm its own scrollback (scroll locally). Default pty = the server's default.
     let liveBackend: TermBackend = 'pty';
-    let sessionAgent: 'claude' | 'grok' = agent === 'grok' ? 'grok' : 'claude';
+    let sessionAgent: 'claude' | 'grok' | 'codex' = agent === 'grok' || agent === 'codex' ? agent : 'claude';
     // Persistent streaming UTF-8 decoder. claude's TUI is mostly box-drawing/Unicode; a multibyte
     // char split across two WS frames would decode to U+FFFD if each frame were decoded on its own.
     // decode(…, {stream:true}) carries the partial bytes into the next frame; flushed on reconnect
@@ -630,7 +631,7 @@ export function TerminalView({
 
     // Jump between the messages you sent (⌘↑ older / ⌘↓ newer, or the header buttons). Reads
     // xterm's own scrollback, so it needs the pty host + claude's inline renderer; tmux (classic)
-    // has no local scrollback, and grok's rendering isn't recognized — keys pass through there.
+    // has no local scrollback, and grok/codex rendering isn't recognized — keys pass through there.
     const nav = createMessageNav(term, () => cancelWheelAnim(wheelAnim));
     const canJump = () => liveBackend === 'pty' && sessionAgent === 'claude';
     const jump = (dir: -1 | 1) => {
@@ -675,7 +676,7 @@ export function TerminalView({
             if (m.type === 'backend') {
               liveBackend = m.backend === 'tmux' ? 'tmux' : 'pty';
               setBackend(liveBackend);
-              if (m.agent === 'claude' || m.agent === 'grok') {
+              if (m.agent === 'claude' || m.agent === 'grok' || m.agent === 'codex') {
                 sessionAgent = m.agent;
                 setLiveAgent(m.agent);
               }
@@ -977,7 +978,7 @@ export function TerminalView({
                 notes
               </button>
             )}
-            {backend === 'pty' && liveAgent !== 'grok' && (
+            {backend === 'pty' && (liveAgent ?? 'claude') === 'claude' && (
               <div className="inline-flex shrink-0 rounded border border-edge text-[11px] mono overflow-hidden">
                 <button
                   onClick={() => jumpRef.current?.(-1)}
@@ -1021,7 +1022,7 @@ export function TerminalView({
               copy text
             </button>
             <RendererMenu chatId={resume} backend={backend} onSwitched={() => setTermEpoch((e) => e + 1)} />
-            <OpenTerminalMenu chatId={resume} cwd={cwd} backend={backend} />
+            <OpenTerminalMenu chatId={resume} cwd={cwd} backend={backend} agent={liveAgent} />
             <OpenInIde cwd={cwd} />
             <button
               onClick={onClose}
