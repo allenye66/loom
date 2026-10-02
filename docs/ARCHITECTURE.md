@@ -62,7 +62,9 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `components/ChatsView.tsx` | Chat manager UI: Active/Archived/Trash tabs, ★ starred, search, inline rename/tag, keyboard nav; `open` (→ terminal chat, resume). |
 | `chat/ChatContext.tsx` | `ChatProvider` + `useOpenChat()` — opens a full-screen `TerminalView` overlay; restores `?chat=<id>` on load. |
 | `chat/ChatSidebar.tsx` | The per-worktree chat rail (`ChatSidebar`) + the in-chat `DevStackBar` and `OpenInIde` button. Shared by the terminal overlay. |
-| `term/TerminalView.tsx` | The terminal overlay: xterm.js bound to `/api/ws/term`. Branches on the server-reported backend — pty: smooth wheel scroll over xterm's own scrollback, snap-to-bottom on input, `snapshot-start/end` bracketed repaints (reset + atomic rewrite); tmux: wheel→SGR forwarding + tmux redraws. Plus renderer switcher, image drop, selectable copy-text panel, `⧉ terminal` native attach (tmux only). |
+| `term/TerminalView.tsx` | The terminal overlay: xterm.js bound to `/api/ws/term`. Branches on the server-reported backend — pty: smooth wheel scroll over xterm's own scrollback, snap-to-bottom on real input only (xterm's `scrollOnUserInput` — not on focus reports), `snapshot-start/end` bracketed repaints (reset + atomic rewrite, requested only after a real resize); tmux: wheel→SGR forwarding + tmux redraws. Plus renderer switcher, image drop, selectable copy-text panel, `⧉ terminal` native attach (tmux only), `↑ my msg ↓` / ⌘↑⌘↓ message jumps. |
+| `term/messageNav.ts` | Jump between the prompts you sent (pty + claude only): finds claude's inline-rendered prompts in xterm's scrollback (`❯` in column 0 on a grey row; skips the input box and still-queued prompts), steps older/newer from the last jump or the current view, highlights the landing row. |
+| `term/readingPosition.ts` | Keeps a scrolled-up reader's place across a resize reflow or a snapshot rebuild (anchored on the text of the view's top logical lines; distance-from-bottom fallback), plus `scrollToLineExact` for xterm 6's post-reflow scroll lag. |
 
 ## Data flows
 

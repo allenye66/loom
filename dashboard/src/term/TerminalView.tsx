@@ -10,6 +10,8 @@ import { NotesPanel } from '../notes/NotesPanel';
 import { useNote } from '../notes/notesStore';
 import { UsageChip } from '../usage/UsageChip';
 import type { Task } from '../api';
+import { createMessageNav, type JumpResult } from './messageNav';
+import { captureReadingPosition, restoreReadingPosition } from './readingPosition';
 
 // Per-chat notes drawer open-state, remembered across chat switches / reloads (the whole
 // terminal remounts per chat, so local state alone would reset it each time).
@@ -98,19 +100,27 @@ function animateWheelScroll(
   state.rafId = requestAnimationFrame(step);
 }
 
-function snapTermToBottom(
-  term: { scrollToBottom?: () => void } | null | undefined,
-  wheelAnim: WheelAnimState | null,
-): void {
-  // Cancel any in-flight wheel animation FIRST, else its next frame yanks the
-  // viewport back up after we snap.
+function cancelWheelAnim(wheelAnim: WheelAnimState | null): void {
   if (wheelAnim && wheelAnim.rafId !== null) {
     cancelAnimationFrame(wheelAnim.rafId);
     wheelAnim.rafId = null;
     wheelAnim.targetDelta = 0;
     wheelAnim.scrolledSoFar = 0;
   }
-  if (term && typeof term.scrollToBottom === 'function') term.scrollToBottom();
+}
+
+/** The transient note shown after a message jump (null = say nothing). */
+function jumpNoteText(r: JumpResult): string | null {
+  switch (r.kind) {
+    case 'message':
+      return `your message ${r.index}/${r.total}`;
+    case 'oldest':
+      return 'no older messages in scrollback';
+    case 'none':
+      return 'none of your messages in scrollback yet';
+    case 'live':
+      return r.moved ? 'back to live output' : null;
+  }
 }
 
 /** Dropdown to open a native Terminal for this worktree — either ATTACH to the live claude
@@ -526,6 +536,11 @@ export function TerminalView({
   const [dragOver, setDragOver] = useState(false);
   const [showText, setShowText] = useState(false); // selectable transcript panel (copy workaround)
   const [showSearch, setShowSearch] = useState(false); // full-text search over the transcript
+  // Jump between the messages you sent (term/messageNav.ts). The effect owns the xterm instance,
+  // so it publishes the jump function here for the header buttons.
+  const jumpRef = useRef<((dir: -1 | 1) => void) | null>(null);
+  const [scrolledUp, setScrolledUp] = useState(false); // viewport above live output → ↓ is useful
+  const [jumpNote, setJumpNote] = useState<{ text: string; id: number } | null>(null);
 
   // Per-chat notes drawer (localStorage-backed via notesStore). `note` drives the header dot.
   const [notesOpen, setNotesOpenState] = useState(loadNotesOpen);
@@ -548,6 +563,7 @@ export function TerminalView({
       cursorBlink: true,
       scrollback: 50000,
       theme: THEME,
+      allowProposedApi: true, // registerDecoration — highlights the message a jump lands on
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -586,9 +602,12 @@ export function TerminalView({
     const sendResize = (cols: number, rows: number) => {
       if (cols < 20 || rows < 5) return;
       const k = `${cols}x${rows}`;
-      if (k === lastSentDims) return;
+      // Not attached yet (first fit, or mid-reconnect): the attach frame carries the size, and the
+      // server repaints a newcomer itself — a resize+repaint here would just double that snapshot.
+      if (k === lastSentDims || ws?.readyState !== WebSocket.OPEN) return;
       lastSentDims = k;
       send({ type: 'resize', cols, rows });
+      scheduleRepaint();
     };
 
     // Snapshot bracketing (pty backend): between snapshot-start and snapshot-end, buffer
@@ -608,6 +627,34 @@ export function TerminalView({
     };
 
     const wheelAnim: WheelAnimState = { rafId: null, targetDelta: 0, scrolledSoFar: 0, startTime: 0 };
+
+    // Jump between the messages you sent (⌘↑ older / ⌘↓ newer, or the header buttons). Reads
+    // xterm's own scrollback, so it needs the pty host + claude's inline renderer; tmux (classic)
+    // has no local scrollback, and grok's rendering isn't recognized — keys pass through there.
+    const nav = createMessageNav(term, () => cancelWheelAnim(wheelAnim));
+    const canJump = () => liveBackend === 'pty' && sessionAgent === 'claude';
+    const jump = (dir: -1 | 1) => {
+      if (!canJump()) return;
+      const text = jumpNoteText(nav.step(dir));
+      if (text) setJumpNote({ text, id: Date.now() });
+    };
+    jumpRef.current = (dir) => {
+      jump(dir);
+      term.focus(); // back to the terminal so ⌘↑/⌘↓ and typing keep working after a click
+    };
+    term.attachCustomKeyEventHandler((e) => {
+      const arrow = e.key === 'ArrowUp' || e.key === 'ArrowDown';
+      if (!arrow || e.altKey || !(e.metaKey || (e.ctrlKey && e.shiftKey)) || !canJump()) return true;
+      if (e.type === 'keydown') {
+        e.preventDefault();
+        jump(e.key === 'ArrowUp' ? -1 : 1);
+      }
+      return false; // never forward the chord to the agent
+    });
+    const onScroll = term.onScroll(() => {
+      const b = term.buffer.active;
+      setScrolledUp(b.viewportY < b.baseY);
+    });
 
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -657,8 +704,14 @@ export function TerminalView({
               // left by the previous host after a renderer switch. Decode with a FRESH
               // (non-streaming) decoder so partial-UTF-8 state can't leak between the
               // live stream and the snapshot; flush the shared decoder too.
+              // A reader scrolled up into history keeps their place instead of being dropped at
+              // live output by the reset (readingPosition.ts).
+              const reading = captureReadingPosition(term);
               term.reset();
-              term.write(new TextDecoder('utf-8').decode(combined));
+              nav.reset();
+              term.write(new TextDecoder('utf-8').decode(combined), () => {
+                if (reading) restoreReadingPosition(term, reading);
+              });
               dec.decode(new Uint8Array());
               resetSnap();
             } else if (m.type === 'pong') {
@@ -765,9 +818,13 @@ export function TerminalView({
     });
 
     const onData = term.onData((d) => {
-      // Any keystroke returns a scrolled-up user to live content (what a native terminal
-      // does). Only meaningful on pty, where xterm owns the scrollback position.
-      if (liveBackend === 'pty') snapTermToBottom(term, wheelAnim);
+      // A keystroke/paste returns a scrolled-up user to live content (what a native terminal does)
+      // — xterm does that itself (scrollOnUserInput), and ONLY for real user input. onData also
+      // carries terminal-generated reports, e.g. the focus-in `\x1b[I` claude enables (DECSET 1004)
+      // that fires on every return to the tab, so snapping here on any data threw a scrolled-up
+      // reader to the bottom. Just stop an in-flight wheel glide, else its next frame yanks the
+      // view back up after xterm's snap.
+      cancelWheelAnim(wheelAnim);
       // Debug aid for paste truncation: log large inputs (likely pastes) so it's easy to see
       // the full byte count actually leaving the browser. Filter the console by "loom-term".
       if (d.length > 64) console.debug(`[loom-term] input ${d.length} bytes:`, JSON.stringify(d.slice(0, 60)) + (d.length > 60 ? '…' : ''));
@@ -785,13 +842,24 @@ export function TerminalView({
     let fitRaf1 = 0;
     let fitRaf2 = 0;
     let fitSettle: number | undefined;
+    // fit() → onResize → sendResize, which schedules the repaint only if the dims really changed:
+    // for pty the repaint is a full-snapshot reset, far too heavy (and scroll-losing) to fire on a
+    // no-op refit like the one on every return to the tab. A real resize reflows the scrollback
+    // (claude's full-width prompt rows and rules re-wrap), shifting a scrolled-up view — re-anchor it.
+    // Next frame: xterm scrolls relative to its DOM scroll position, which only catches up with the
+    // resize in the refresh frame fit() just queued (ours runs after it).
     const doFit = () => {
+      const dims = `${term.cols}x${term.rows}`;
+      const reading = captureReadingPosition(term);
       try {
         fit.fit();
       } catch {
         /* mid-teardown */
       }
-      scheduleRepaint();
+      if (reading && `${term.cols}x${term.rows}` !== dims)
+        requestAnimationFrame(() => {
+          if (!disposed) restoreReadingPosition(term, reading);
+        });
     };
     const scheduleFit = () => {
       cancelAnimationFrame(fitRaf1);
@@ -869,6 +937,9 @@ export function TerminalView({
       ro.disconnect();
       onData.dispose();
       onResize.dispose();
+      onScroll.dispose();
+      nav.dispose();
+      jumpRef.current = null;
       try {
         ws?.close();
       } catch {
@@ -905,6 +976,25 @@ export function TerminalView({
                 <span className={`w-1.5 h-1.5 rounded-full ${note ? 'bg-accent' : 'bg-muted/40'}`} />
                 notes
               </button>
+            )}
+            {backend === 'pty' && liveAgent !== 'grok' && (
+              <div className="inline-flex shrink-0 rounded border border-edge text-[11px] mono overflow-hidden">
+                <button
+                  onClick={() => jumpRef.current?.(-1)}
+                  title="jump to your most recent message (⌘↑) — press again for older ones"
+                  className="px-2 py-0.5 text-muted hover:text-ink hover:bg-surface-2"
+                >
+                  ↑ my msg
+                </button>
+                <button
+                  onClick={() => jumpRef.current?.(1)}
+                  disabled={!scrolledUp}
+                  title="newer message, then back to live output (⌘↓)"
+                  className="px-1.5 py-0.5 border-l border-edge text-muted hover:text-ink hover:bg-surface-2 disabled:opacity-40 disabled:pointer-events-none"
+                >
+                  ↓
+                </button>
+              </div>
             )}
             {resume && (
               <button
@@ -959,10 +1049,21 @@ export function TerminalView({
         )}
 
         <div className="flex-1 min-h-0 flex">
-          <div
-            ref={holderRef}
-            className={`flex-1 min-w-0 px-2 py-1.5 overflow-hidden ${dragOver ? 'ring-2 ring-inset ring-accent-dim' : ''}`}
-          />
+          <div className="relative flex-1 min-w-0 flex">
+            <div
+              ref={holderRef}
+              className={`flex-1 min-w-0 px-2 py-1.5 overflow-hidden ${dragOver ? 'ring-2 ring-inset ring-accent-dim' : ''}`}
+            />
+            {jumpNote && (
+              <div
+                key={jumpNote.id}
+                onAnimationEnd={() => setJumpNote(null)}
+                className="loom-jump-note absolute top-2 right-5 pointer-events-none text-[11px] mono px-2 py-0.5 rounded border border-accent-dim bg-surface text-accent shadow-lg"
+              >
+                {jumpNote.text}
+              </div>
+            )}
+          </div>
           {notesOpen && resume && (
             <NotesPanel
               chatId={resume}
