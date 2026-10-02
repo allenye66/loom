@@ -356,6 +356,7 @@ def _parse_codex_session(path: Path) -> dict:
     """Index a codex rollout jsonl: session_meta (cwd/created) + real user/assistant turns."""
     first_prompt = preview = cwd = created = None
     n_user = n_assistant = 0
+    subagent = False
     sid = path.stem[-36:]  # rollout-<launch ts>-<uuid>.jsonl
     try:
         with path.open("r", errors="replace") as f:
@@ -375,6 +376,7 @@ def _parse_codex_session(path: Path) -> dict:
                     sid = str(payload.get("id") or payload.get("session_id") or sid)
                     cwd = payload.get("cwd") or cwd
                     created = payload.get("timestamp") or created
+                    subagent = subagent or agents.codex_is_subagent(payload)
                 elif t == "response_item" and payload.get("type") == "message":
                     role = payload.get("role")
                     if role == "user":
@@ -392,6 +394,9 @@ def _parse_codex_session(path: Path) -> dict:
     return {
         "id": sid,
         "agent": "codex",
+        # Multi-agent sub-agent thread — never a resumable/listable chat (list_chats
+        # drops these; codex itself refuses `resume` on them: "resume the parent first").
+        "subagent": subagent,
         "title": None,  # filled from session_index.jsonl thread names at read time
         "preview": preview,
         "first_prompt": first_prompt,
@@ -474,6 +479,8 @@ def build_index(force: bool = False) -> list[dict]:
             and abs(cached.get("last_active", 0) - st_mtime) < 0.001
             # Re-parse if a pre-agent cache entry lacks the agent tag.
             and cached.get("agent")
+            # One-time re-parse of codex rows cached before the subagent flag existed.
+            and (not key.startswith("codex:") or "subagent" in cached)
         )
         if unchanged:
             out[key] = cached
@@ -703,6 +710,9 @@ def list_chats(
     # Trashed chats are unlisted in every tab (the transcript itself is untouched — see
     # trash_chat; now that trashing no longer moves the file, the index still sees it).
     rows = [r for r in rows if not r["deleted"]]
+    # Codex multi-agent sub-agent threads live in the same rollout store but aren't
+    # chats — not resumable (codex: "resume the parent first") and pure sidebar noise.
+    rows = [r for r in rows if not r.get("subagent")]
     # Drop /clear-offspring & empty aborted sessions (bare-UUID, zero human content) — see
     # _is_contentless_junk. They'd otherwise clutter the list and invite a misclick that opens
     # an orphan session.

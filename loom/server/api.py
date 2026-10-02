@@ -408,6 +408,8 @@ def _task_chat_id(task) -> str | None:
         return task.chat_id
     best = None
     for s in sessions.build_index():
+        if s.get("subagent"):
+            continue  # codex sub-agent threads in the worktree aren't adoptable chats
         if s.get("cwd") == task.worktree_path and (best is None or (s.get("last_active") or 0) > best[1]):
             best = (s["id"], s.get("last_active") or 0)
     task.chat_id = best[0] if best else str(uuid.uuid4())

@@ -187,6 +187,17 @@ def codex_rollout_meta(path: Path) -> dict | None:
     return None
 
 
+def codex_is_subagent(meta: dict | None) -> bool:
+    """True for a multi-agent v2 SUB-AGENT thread's rollout. Codex gives each spawned
+    sub-agent its own rollout file in ~/.codex/sessions (session_meta carries
+    thread_source:"subagent" + parent_thread_id), but refuses to resume one directly
+    ("resume the parent first", code -32600) — so they must never be indexed as chats
+    or claimed by the bind scan."""
+    if not meta:
+        return False
+    return meta.get("thread_source") == "subagent" or bool(meta.get("parent_thread_id"))
+
+
 def _same_dir(a: str | None, b: str | None) -> bool:
     if not a or not b:
         return False
@@ -218,8 +229,8 @@ def discover_codex_session(cwd: str, claimed: set[str], after_ts: float | None =
             if best is not None and mtime <= best[0]:
                 continue
             meta = codex_rollout_meta(f)
-            if not meta:
-                continue
+            if not meta or codex_is_subagent(meta):
+                continue  # a sub-agent thread in this worktree is NOT this chat's session
             sid = str(meta.get("id") or meta.get("session_id") or "")
             if not sid or sid in claimed:
                 continue

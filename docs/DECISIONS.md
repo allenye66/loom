@@ -159,6 +159,13 @@ stays authoritative and the native id is **bound** into the chat overlay as
    unclaimed rollout in the chat's worktree is this chat's. A fresh launch's watcher
    (`_codex_bind_watch`, 15 min) only scans rollouts written since open; the pre-launch
    recovery path (lost binding) takes the worktree's newest.
+**Sub-agent rollouts are not chats**: codex multi-agent v2 gives every spawned sub-agent its
+own rollout file in the same store (session_meta: `thread_source:"subagent"` +
+`parent_thread_id`) — in the parent's cwd, i.e. the chat's worktree — and refuses to resume
+one directly ("resume the parent first", -32600). The indexer flags them (`subagent`),
+list_chats drops them, and the bind scan skips them (else a fresh chat's watcher could claim
+its own session's sub-agent thread). Found live 2026-10-02: a resumed worktree session
+spawned a review sub-agent whose rollout surfaced as a ghost bare-uuid chat.
 The indexer re-keys claimed codex rows to their loom chat id (and titles them from codex's
 own `session_index.jsonl` thread names); unclaimed rollouts surface under their native uuid,
 so externally-created codex sessions list/resume like claude ones. The binding doubles as an
