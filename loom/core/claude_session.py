@@ -46,7 +46,7 @@ def _claude() -> str:
 
 def open_session(worktree_path: str, prompt: str | None = None, prefer: str = "auto", effort: str = "max") -> str:
     """Start a fresh Claude session in a worktree, optionally seeding a /skill."""
-    inner = f"cd {shlex.quote(worktree_path)} && {shlex.quote(_claude())} --effort {shlex.quote(effort)}"
+    inner = f"cd {shlex.quote(worktree_path)} && {shlex.quote(_claude())} --debug --effort {shlex.quote(effort)}"
     if prompt:
         inner += f" {shlex.quote(prompt)}"
     return _launch(inner, label=Path(worktree_path).name, prefer=prefer)
@@ -58,7 +58,7 @@ def resume_session(cwd: str, session_id: str, fork: bool = False, prefer: str = 
     Always passes `--effort` so a terminal handoff keeps the same effort as the
     loom chat (a bare `claude --resume` would fall back to the CLI default).
     """
-    inner = f"cd {shlex.quote(cwd)} && {shlex.quote(_claude())} --effort {shlex.quote(effort)} --resume {shlex.quote(session_id)}"
+    inner = f"cd {shlex.quote(cwd)} && {shlex.quote(_claude())} --debug --effort {shlex.quote(effort)} --resume {shlex.quote(session_id)}"
     if fork:
         inner += " --fork-session"
     return _launch(inner, label=session_id, prefer=prefer)

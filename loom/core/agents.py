@@ -193,6 +193,9 @@ def build_argv(agent: AgentId, chat_id: str, cwd: str | None, *, fullscreen: boo
     argv = [
         binary("claude"),
         "--effort", "max",
+        # Debug log per session -> $CLAUDE_CODE_DEBUG_LOGS_DIR (~/net-monitor/logs/claude-debug/<id>.txt)
+        # so "API error (attempt N/M)" lines can be correlated with the net-monitor (2026-09-02).
+        "--debug",
         "--permission-mode", "bypassPermissions",
         "--settings", json.dumps(settings),
     ]
