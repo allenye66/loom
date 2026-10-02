@@ -89,7 +89,7 @@ command / permission prompt / feature works with zero reimplementation. Each cha
 runs
 
 ```
-claude --effort max --permission-mode acceptEdits --settings '{...theme,hooks[,tui]}'
+claude --effort max --permission-mode bypassPermissions --settings '{...theme,hooks[,tui]}'
        [--append-system-prompt <loom-runtime note>] (--resume|--session-id <chat_id>)
 ```
 

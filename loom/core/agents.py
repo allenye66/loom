@@ -193,7 +193,7 @@ def build_argv(agent: AgentId, chat_id: str, cwd: str | None, *, fullscreen: boo
     argv = [
         binary("claude"),
         "--effort", "max",
-        "--permission-mode", "acceptEdits",
+        "--permission-mode", "bypassPermissions",
         "--settings", json.dumps(settings),
     ]
     if note:
