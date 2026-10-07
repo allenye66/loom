@@ -34,7 +34,8 @@ const THEME = {
 };
 
 /** Which server-side host backs a terminal session. `pty` = the smooth-scroll daemon
- *  (xterm owns scrollback); `tmux` = the classic fullscreen mode. */
+ *  (xterm owns scrollback; the only host loom starts); `tmux` = a still-live legacy classic
+ *  fullscreen session. */
 type TermBackend = 'pty' | 'tmux';
 
 // Smooth wheel scroll over xterm's OWN scrollback (pty mode: xterm owns the
@@ -123,38 +124,21 @@ function jumpNoteText(r: JumpResult): string | null {
   }
 }
 
-/** Dropdown to open a native Terminal for this worktree — either ATTACH to the live agent
- *  session (tmux backend only; tmux supports multiple clients) or open a PLAIN SHELL in the
- *  worktree (no agent). */
-function OpenTerminalMenu({ chatId, cwd, backend, agent }: { chatId?: string; cwd?: string; backend: TermBackend | null; agent?: string | null }) {
-  const agentName = agent || 'claude';
-  const [open, setOpen] = useState(false);
+/** Opens a plain native shell (Terminal.app) in this worktree — no agent. */
+function OpenShellButton({ cwd }: { cwd?: string }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [open]);
-  if (!chatId) return null;
+  if (!cwd) return null;
 
-  const run = async (which: 'claude' | 'shell') => {
-    setOpen(false);
+  const run = async () => {
     setBusy(true);
     setErr(false);
     try {
-      const r =
-        which === 'claude'
-          ? await fetch(`/api/terminals/${chatId}/open-native`, { method: 'POST' })
-          : await fetch('/api/shell', {
-              method: 'POST',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ cwd }),
-            });
+      const r = await fetch('/api/shell', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cwd }),
+      });
       setErr(!r.ok);
     } catch {
       setErr(true);
@@ -164,117 +148,14 @@ function OpenTerminalMenu({ chatId, cwd, backend, agent }: { chatId?: string; cw
   };
 
   return (
-    <div ref={ref} className="relative shrink-0">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        disabled={busy}
-        title={`open a native Terminal — the live ${agentName} session, or a plain shell in this worktree`}
-        className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 disabled:opacity-50"
-      >
-        {busy ? 'opening…' : err ? 'failed' : '⧉ terminal ▾'}
-      </button>
-      {open && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-56 rounded-md border border-edge bg-surface shadow-xl overflow-hidden">
-          {backend === 'tmux' && (
-            <button onClick={() => run('claude')} className="w-full text-left px-3 py-2 hover:bg-surface-2 flex flex-col gap-0.5">
-              <span className="text-[11px] mono text-ink">❯ attach {agentName}</span>
-              <span className="text-[10px] text-muted">the live session — tmux attach, stays in sync</span>
-            </button>
-          )}
-          <button
-            onClick={() => run('shell')}
-            disabled={!cwd}
-            className="w-full text-left px-3 py-2 hover:bg-surface-2 border-t border-edge first:border-t-0 flex flex-col gap-0.5 disabled:opacity-40"
-          >
-            <span className="text-[11px] mono text-ink">$ plain shell</span>
-            <span className="text-[10px] text-muted">no {agentName} — a shell in this worktree</span>
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Renderer picker: smooth-scroll (pty, default) vs classic (tmux). Switching an existing
- *  session is a quick restart that keeps the conversation (kill host + `claude --resume`),
- *  not a live flip — so we confirm, POST the switch, then remount the terminal (fresh xterm
- *  + WS; the server relaunches claude under the new host). */
-function RendererMenu({
-  chatId,
-  backend,
-  onSwitched,
-}: {
-  chatId?: string;
-  backend: TermBackend | null;
-  onSwitched: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [open]);
-  if (!chatId || !backend) return null;
-
-  const pick = async (target: TermBackend) => {
-    setOpen(false);
-    if (target === backend || busy) return;
-    if (
-      !window.confirm(
-        'Switch the renderer? This restarts claude for this session — your conversation is kept ' +
-          '(it relaunches with --resume). Best done while claude is idle.',
-      )
-    )
-      return;
-    setBusy(true);
-    setErr(false);
-    try {
-      const r = await fetch(`/api/terminals/${chatId}/backend`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ target }),
-      });
-      if (r.ok) onSwitched();
-      else setErr(true);
-    } catch {
-      setErr(true);
-    }
-    setBusy(false);
-    setTimeout(() => setErr(false), 2500);
-  };
-
-  return (
-    <div ref={ref} className="relative shrink-0">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        disabled={busy}
-        title="how this session renders — switching restarts claude (conversation kept)"
-        className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 disabled:opacity-50"
-      >
-        {busy ? 'switching…' : err ? 'failed' : `renderer: ${backend === 'pty' ? 'smooth' : 'classic'} ▾`}
-      </button>
-      {open && (
-        <div className="absolute right-0 top-full mt-1 z-20 w-64 rounded-md border border-edge bg-surface shadow-xl overflow-hidden">
-          <button onClick={() => pick('pty')} className="w-full text-left px-3 py-2 hover:bg-surface-2 flex flex-col gap-0.5">
-            <span className="text-[11px] mono text-ink">smooth-scroll (pty) {backend === 'pty' ? '·  current' : ''}</span>
-            <span className="text-[10px] text-muted">native scroll, drag-select/copy — like claude in a normal terminal</span>
-          </button>
-          <button
-            onClick={() => pick('tmux')}
-            className="w-full text-left px-3 py-2 hover:bg-surface-2 border-t border-edge flex flex-col gap-0.5"
-          >
-            <span className="text-[11px] mono text-ink">classic (tmux) {backend === 'tmux' ? '·  current' : ''}</span>
-            <span className="text-[10px] text-muted">legacy fullscreen mode — fallback; supports native tmux attach</span>
-          </button>
-        </div>
-      )}
-    </div>
+    <button
+      onClick={run}
+      disabled={busy}
+      title="open a plain shell in this worktree (native Terminal)"
+      className="text-[11px] mono text-muted hover:text-ink border border-edge rounded px-2 py-0.5 shrink-0 disabled:opacity-50"
+    >
+      {busy ? 'opening…' : err ? 'failed' : '⧉ terminal'}
+    </button>
   );
 }
 
@@ -482,12 +363,12 @@ function SearchPanel({ chatId, onClose }: { chatId: string; onClose: () => void 
 /**
  * Terminal mode: the *real* interactive agent TUI (claude or grok), bridged from a
  * server-side PTY to xterm.js. No reimplementation — every slash command / permission
- * prompt is the CLI's own. Two hosts (see loom/core/terminals.py): `pty` (default) = a
- * detached daemon, inline renderer, xterm owns scrollback → native smooth scroll +
- * select/copy; `tmux` (classic) = fullscreen-pinned, scroll forwarded as SGR wheel events.
- * Both outlive this tab and loom restarts, so a dropped socket just reconnects to the
- * running session. Wraps the conversation pane in loom's shell (the `ChatSidebar` +
- * dev-stack bar).
+ * prompt is the CLI's own. Host (see loom/core/terminals.py): `pty` = a detached daemon,
+ * inline renderer, xterm owns scrollback → native smooth scroll + select/copy. A legacy
+ * `tmux` (classic) session that is still alive keeps its fullscreen-pinned host, with scroll
+ * forwarded as SGR wheel events. Both outlive this tab and loom restarts, so a dropped
+ * socket just reconnects to the running session. Wraps the conversation pane in loom's
+ * shell (the `ChatSidebar` + dev-stack bar).
  */
 export function TerminalView({
   resume,
@@ -503,13 +384,11 @@ export function TerminalView({
   onClose: () => void;
 }) {
   const holderRef = useRef<HTMLDivElement>(null);
-  // Which host backs this session — reported by the server on WS open. Drives the header
-  // label/menus; the live wheel/snapshot branching uses the effect-local mirror below.
+  // Which host backs this session — reported by the server on WS open (always pty, except a
+  // still-live legacy tmux session). Gates the header's message-jump controls; the live
+  // wheel/snapshot branching uses the effect-local mirror below.
   const [backend, setBackend] = useState<TermBackend | null>(null);
   const [liveAgent, setLiveAgent] = useState<'claude' | 'grok' | 'codex' | null>(agent ?? null);
-  // Bumped after a renderer switch → remounts the whole terminal (fresh xterm state — the
-  // old host's alt-screen/scrollback state must not leak into the new one) + a fresh WS.
-  const [termEpoch, setTermEpoch] = useState(0);
 
   // Dev-stack parity: map this worktree (cwd) to its loom task for the FE/BE + start/stop strip.
   const { data: tasks } = useQuery({
@@ -702,7 +581,7 @@ export function TerminalView({
               // Reset first: the snapshot is the FULL authoritative state (for inline
               // content it includes the scrollback history), so it must replace the
               // buffer, not append — and a reset also clears any stale alt-screen mode
-              // left by the previous host after a renderer switch. Decode with a FRESH
+              // left by a previous host. Decode with a FRESH
               // (non-streaming) decoder so partial-UTF-8 state can't leak between the
               // live stream and the snapshot; flush the shared decoder too.
               // A reader scrolled up into history keeps their place instead of being dropped at
@@ -948,7 +827,7 @@ export function TerminalView({
       }
       term.dispose();
     };
-  }, [resume, cwd, termEpoch, agent]);
+  }, [resume, cwd, agent]);
 
   return (
     <div className="flex-1 flex flex-col min-w-0 relative bg-canvas h-full">
@@ -1021,8 +900,7 @@ export function TerminalView({
             >
               copy text
             </button>
-            <RendererMenu chatId={resume} backend={backend} onSwitched={() => setTermEpoch((e) => e + 1)} />
-            <OpenTerminalMenu chatId={resume} cwd={cwd} backend={backend} agent={liveAgent} />
+            <OpenShellButton cwd={cwd} />
             <OpenInIde cwd={cwd} />
             <button
               onClick={onClose}

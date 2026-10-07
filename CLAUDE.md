@@ -12,9 +12,8 @@ Two halves:
    branches in parallel without checkout conflicts.
 2. **In-browser agent TUI client** — the **real** interactive `claude`, `grok`,
    or `codex` CLI (chosen at task/session create, locked per chat), hosted
-   server-side (default: a detached `pty_server` daemon, "smooth scroll";
-   fallback: a **tmux** session, "classic") and bridged to xterm.js over a
-   WebSocket (so every slash command / permission prompt / feature works with zero
+   server-side (a detached `pty_server` daemon, "smooth scroll") and bridged to
+   xterm.js over a WebSocket (so every slash command / permission prompt / feature works with zero
    reimplementation), plus a chat manager that indexes `~/.claude`,
    `~/.grok/sessions`, and `~/.codex/sessions` history. The goal is to **replace the agent terminal as a
    UI** and let you run/▸switch between multiple chats.
@@ -46,21 +45,21 @@ A personal tool, shared as-is. Repo: `github.com/allenye66/loom`.
   for REST, a raw WebSocket for the live terminal.
 - **Live terminal** (`loom/core/terminals.py` ↔ `dashboard/src/term/`): each chat
   is a real agent CLI (`claude` | `grok` | `codex`, from overlay `agent` via
-  `core/agents.py`) hosted by one of two backends so it survives browser
-  disconnects *and* loom restarts — **pty** (default): a detached
-  `loom/core/pty_server.py` daemon on `~/.loom/pty-sockets/`, inline renderer,
-  xterm owns scrollback (smooth scroll/select); **tmux** (fallback): fullscreen
-  agent in `loomx-<chat_id>`. `/api/ws/term` attaches as a subscriber, fanning raw
-  bytes to xterm.js; per-chat choice in the overlay (`terminal_backend`), switchable
-  (kill + `--resume`). Per-worktree ports/logs are injected via `core/runtime.py`.
+  `core/agents.py`) hosted so it survives browser disconnects *and* loom restarts —
+  **pty**: a detached `loom/core/pty_server.py` daemon on `~/.loom/pty-sockets/`,
+  inline renderer, xterm owns scrollback (smooth scroll/select). It's the only host
+  loom starts; the legacy **tmux** host (fullscreen agent in `loomx-<chat_id>`) is
+  used only for a classic session that is still alive, until it exits.
+  `/api/ws/term` attaches as a subscriber, fanning raw bytes to xterm.js.
+  Per-worktree ports/logs are injected via `core/runtime.py`.
 
 Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 
 ## Key conventions / gotchas (don't relearn these the hard way)
 
-- **Terminal sessions have two hosts** — the default **pty** backend needs no tmux
-  (a detached `pty_server` daemon keeps `claude` alive across loom restarts); the
-  **classic tmux** backend still needs `tmux`. Both scrub `CLAUDECODE`/`CLAUDE_CODE_*`
+- **Terminal sessions run on the pty host** — it needs no tmux (a detached
+  `pty_server` daemon keeps `claude` alive across loom restarts); the legacy **classic
+  tmux** host only drives a still-live old session. Both scrub `CLAUDECODE`/`CLAUDE_CODE_*`
   from the child so the nested `claude` doesn't inherit auto-approve (see
   `docs/CLAUDE_AGENT_SDK_NOTES.md`).
 - Terminal sessions launch with max effort (and agent-specific flags from
@@ -85,12 +84,20 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 - `docs/SESSIONS_DESIGN.md` — chat manager / session indexing design.
 - `README.md` — install + quickstart.
 
-## Roadmap (current focus)
+## Status
 
-**Done:** the in-browser terminal — the real `claude` TUI over tmux (`terminals.py`),
-surviving browser disconnects + loom restarts; a **sidebar** of per-worktree chats with
-click-to-switch + `?chat=<id>` deep links; per-worktree dev-stack start/stop from the
-task card.
+**Working today:**
+- **Worktree tasks** — worktree + deterministic ports + isolated test runs per branch
+  (from the CLI, or `+ new` in the sidebar).
+- **In-browser terminal** — the real `claude` / `grok` / `codex` TUI on the pty host,
+  surviving browser disconnects + loom restarts; `?chat=<id>` deep links.
+- **Sidebar-first shell** — the chat rail *is* the app (no separate Tasks/Chats pages):
+  loom's task chats with active/archived tabs, search, drag-to-reorder, collapsible
+  categories, per-chat needs-you / working status, and notes.
+- **In-chat tools** — dev-stack start/stop + FE/BE/test logs, transcript search,
+  copy-text panel, ⌘↑/⌘↓ message jumps, image drop, PR badges, Claude usage chip,
+  `⧉ terminal` (plain shell in the worktree), open-in-editor.
 
-**Next:** richer per-worktree status surfacing in the sidebar. See
+**Open cleanup:** delete the legacy tmux host once no classic sessions remain, and the
+unmounted `TasksView` / `TaskCard` / `ChatsView` components. See
 `docs/ARCHITECTURE.md` § Roadmap.

@@ -5,21 +5,18 @@ its raw bytes to xterm.js, so every slash command / permission prompt / feature 
 with zero reimplementation. This is the only chat surface loom exposes (see
 docs/ARCHITECTURE.md). Agent choice is per-chat (`agent` in the sessions overlay).
 
-Two interchangeable hosts keep the agent alive across browser disconnects *and* loom
-restarts (there's no hot-reload — every backend edit restarts the server; a bare PTY
-would die with it):
+A detached host keeps the agent alive across browser disconnects *and* loom restarts
+(there's no hot-reload — every backend edit restarts the server; a bare PTY would die
+with it):
 
-- **pty** (default — "smooth scroll"): agent under a detached `loom.core.pty_server`
-  daemon on a Unix socket, using the *inline* renderer. No alternate screen, so xterm.js
-  owns a real scrollback — native wheel scroll, drag-select/copy, and none of the
-  three-emulator (Ink↔tmux↔xterm) width desync that garbled the tmux mode.
-- **tmux** ("classic"): the original fullscreen-pinned mode — agent inside a tmux
-  session (`loomx-<chat_id>`), loom attached via one PTY. Kept as a per-session fallback
-  during the pty migration; also what a native `tmux attach` shares.
-
-The per-chat host choice is persisted in the sessions overlay (`terminal_backend`) and is
-switchable via `switch_backend()` — a kill + `--resume` relaunch (the transcript is the
-durable state), so the conversation survives the hop.
+- **pty** ("smooth scroll") — the only host loom starts: agent under a detached
+  `loom.core.pty_server` daemon on a Unix socket, using the *inline* renderer. No
+  alternate screen, so xterm.js owns a real scrollback — native wheel scroll,
+  drag-select/copy, and none of the three-emulator (Ink↔tmux↔xterm) width desync that
+  garbled the tmux mode.
+- **tmux** ("classic", legacy): the original fullscreen-pinned mode — agent inside a tmux
+  session (`loomx-<chat_id>`), loom attached via one PTY. loom no longer starts these; it
+  only keeps driving one that is still alive (see `terminal_backend()`), until it exits.
 """
 
 from __future__ import annotations
@@ -64,7 +61,6 @@ _SOCK_DIR = LOOM_HOME / "pty-sockets"   # one AF_UNIX socket per pty-backed sess
 # `claude` doesn't inherit auto-approve (see CLAUDE.md). Auth/API-key vars are untouched.
 _SCRUB = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")
 
-BACKENDS = ("pty", "tmux")
 DEFAULT_BACKEND = "pty"
 
 
@@ -928,13 +924,11 @@ def active_sessions() -> list[_SessionBase]:
 
 
 def terminal_backend(chat_id: str) -> str:
-    """Effective host for a chat: the persisted per-chat choice, else tmux when a live
-    pre-backend-era tmux session already holds this chat (spawning a pty daemon too would
-    run TWO claudes on one session id), else the pty default. Blocking (subprocess) —
-    call via run_in_executor on the loop."""
-    pref = sessions_mod.get_overlay(chat_id).get("terminal_backend")
-    if pref in BACKENDS:
-        return pref
+    """Host for a chat: always pty, except when a live legacy tmux session already holds
+    this chat — spawning a pty daemon too would run TWO claudes on one session id, so loom
+    keeps driving that one until it exits. Any `terminal_backend` still persisted in the
+    overlay (from the old renderer picker) is ignored. Blocking (subprocess) — call via
+    run_in_executor on the loop."""
     tm = _tmux()
     if tm and subprocess.run([tm, "has-session", "-t", session_name(chat_id)],
                              capture_output=True).returncode == 0:
@@ -977,8 +971,8 @@ async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: in
     agent = await loop.run_in_executor(None, _agent_for, chat_id)
     ts = _registry.get(chat_id)
     if ts is not None and ts.backend != backend:
-        # The persisted choice changed under a live session (e.g. switched from another
-        # tab) — retire the old host before opening the new one.
+        # The host changed under a registered session (a legacy tmux session exited, so this
+        # chat now gets pty) — retire the old host before opening the new one.
         await ts.close()
         ts = None
     if ts is None:
@@ -986,14 +980,12 @@ async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: in
         ts = cls(chat_id, cwd)
         ts.cols, ts.rows = cols or 120, rows or 32
         _registry[chat_id] = ts
-        # Persist the effective choice so this session keeps its host even if the default changes
-        # later, plus `opened_at` — a wall-clock stamp marking "loom actually attached a terminal
-        # to this chat" (distinct from mode:terminal, which create_task also sets). It's what lets
+        # Stamp `opened_at` — a wall-clock mark that "loom actually attached a terminal to this
+        # chat" (distinct from mode:terminal, which create_task also sets). It's what lets
         # list_chats keep a just-opened, not-yet-typed chat in the sidebar before claude writes any
         # transcript (see _pending_chat_rows).
         await loop.run_in_executor(
-            None, sessions_mod.set_overlay, chat_id,
-            {"terminal_backend": backend, "opened_at": time.time()},
+            None, sessions_mod.set_overlay, chat_id, {"opened_at": time.time()},
         )
     ts.clear_needs_on_typing = agent == "codex"  # codex has no prompt-submit hook (see write())
     await ts.open()
@@ -1002,27 +994,3 @@ async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: in
         if live is None or live.done():
             _codex_watchers[chat_id] = asyncio.create_task(_codex_bind_watch(chat_id, cwd, time.time()))
     return ts
-
-
-async def switch_backend(chat_id: str, target: str) -> None:
-    """Move a chat to the other terminal host: kill the live host (tmux session or pty
-    daemon), persist the choice. NOT a live flip — the next open_terminal relaunches
-    claude under the new host with `--resume <chat_id>`, so the conversation (the on-disk
-    transcript) carries over; only the live process restarts. Any in-flight turn is
-    interrupted, so the UI should offer this while the session is idle."""
-    if target not in BACKENDS:
-        raise ValueError(f"unknown terminal backend {target!r} (expected one of {BACKENDS})")
-    ts = _registry.pop(chat_id, None)
-    if ts is not None:
-        await ts.close()
-
-    def _kill_other_hosts() -> None:
-        # Sweep BOTH hosts (idempotent no-ops when absent) — covers a host left over from
-        # a previous loom run that this process never attached.
-        kill_session(_socket_path(chat_id))
-        tm = _tmux()
-        if tm:
-            subprocess.run([tm, "kill-session", "-t", session_name(chat_id)], capture_output=True)
-        sessions_mod.set_overlay(chat_id, {"terminal_backend": target})
-
-    await asyncio.get_running_loop().run_in_executor(None, _kill_other_hosts)

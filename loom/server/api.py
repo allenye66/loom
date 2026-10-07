@@ -443,10 +443,6 @@ class ChatPatch(BaseModel):
     mode: str | None = None  # "chat" (SDK UI) | "terminal" (xterm); fixed once chosen
     # Which CLI powers the terminal: "claude" | "grok" | "codex". Locked once set (create-time).
     agent: Literal["claude", "grok", "codex"] | None = None
-    # Which host runs the terminal: "pty" (smooth scroll, default) | "tmux" (classic).
-    # Orthogonal to `mode` — only applies within terminal mode; switchable (see
-    # /terminals/{chat_id}/backend).
-    terminal_backend: Literal["pty", "tmux"] | None = None
 
 
 @router.get("/chats")
@@ -660,38 +656,6 @@ def list_terminals() -> dict:
     return {"terminals": terminals.list_active()}
 
 
-@router.post("/terminals/{chat_id}/open-native")
-def open_native_terminal(chat_id: str) -> dict:
-    """Open the SAME live tmux session in a native Terminal.app (`tmux attach`). The
-    in-browser xterm and the real terminal then share one live session — terminal mode's
-    counterpart to chat mode's `claude --resume` handoff (here no handoff is needed; tmux
-    supports multiple clients on one session). tmux-backend sessions only (a pty daemon
-    has no attachable multiplexer; the UI hides this action there)."""
-    session = terminals.session_name(chat_id)
-    if subprocess.run(["tmux", "has-session", "-t", session], capture_output=True).returncode != 0:
-        raise HTTPException(
-            404,
-            "no live tmux session for this chat — open the terminal first (and note the "
-            "smooth-scroll/pty renderer can't be attached natively; switch it to classic/tmux)",
-        )
-    opened = claude_session._launch(f"tmux attach -t {shlex.quote(session)}", label=chat_id, prefer="terminal")
-    return {"opened": opened}
-
-
-class BackendIn(BaseModel):
-    target: Literal["pty", "tmux"]
-
-
-@router.post("/terminals/{chat_id}/backend")
-async def switch_terminal_backend(chat_id: str, body: BackendIn) -> dict:
-    """Switch this chat's terminal host (pty ⇄ tmux). Kill + resume, not a live flip:
-    stops the current host, persists the choice; the client then reconnects its WS and
-    open_terminal relaunches claude under the new host with `--resume` (conversation
-    kept — only the live process restarts). Best done while the session is idle."""
-    await terminals.switch_backend(chat_id, body.target)
-    return {"backend": body.target}
-
-
 class UploadIn(BaseModel):
     data: str  # base64-encoded file bytes
     name: str | None = None
@@ -724,7 +688,7 @@ async def terminal_upload(chat_id: str, body: UploadIn) -> dict:
 
 @router.websocket("/ws/term")
 async def term_ws(websocket: WebSocket) -> None:
-    """Terminal mode: bridge a tmux-hosted `claude` PTY to xterm.js as raw bytes.
+    """Terminal mode: bridge a hosted agent PTY (the pty daemon) to xterm.js as raw bytes.
 
     Browser → server: JSON `{type:"input"|"resize"|"ping", ...}`.
     Server → browser: binary frames = terminal output; JSON frames = control (exit/pong).

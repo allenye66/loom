@@ -21,7 +21,7 @@ layer; loom owns the *runnable-stack-per-worktree* layer that nothing else does.
 ## Install
 
 ```bash
-# prerequisites: git, uv (pip install uv), node — plus tmux for the in-browser terminal chat
+# prerequisites: git, uv (pip install uv), node
 uv tool install --from . loom     # or: uv sync && uv run loom ...
 loom doctor                       # preflight check
 ```
@@ -57,8 +57,8 @@ loom rm my-feature
 
 ```
 loom/
-  cli.py            # Typer CLI (doctor/serve/new/ls/test/start/stop/claude/rm)
-  server/           # FastAPI: /api/* + serves the built dashboard
+  cli.py            # Typer CLI (doctor/serve/repo-add/new/ls/test/start/stop/claude/rm)
+  server/           # FastAPI: /api/* + /api/ws/term + serves the built dashboard
   core/
     registry.py     # atomic JSON task registry + state machine
     ports.py        # hash-offset, collision-checked per-worktree port allocation
@@ -66,13 +66,19 @@ loom/
     process.py      # process-group spawn / health / port-scoped teardown
     manager.py      # task lifecycle (create/start/stop/remove)
     tests.py        # isolated test runs
+    monitor.py      # dev-stack supervisor + reaper
+    sessions.py     # chat index (~/.claude, ~/.grok, ~/.codex) + local overlay
+    agents.py       # claude / grok / codex launch adapters
+    terminals.py    # the in-browser agent terminal (pty host)
+    pty_server.py   # detached PTY daemon that outlives loom restarts
     doctor.py       # preflight checks
-dashboard/          # React + Vite + Tailwind (bun)
+dashboard/          # React + Vite + Tailwind (bun): chat sidebar + live terminal
 projects/           # reference .loom.yaml configs
 ```
 
 ## Status
 
-Phase 1 (worktrees + sessions + isolated tests) — in progress. Phase 2 adds
-per-worktree running servers + live preview to the dashboard. See the design doc
-and `docs/ARCHITECTURE.md`.
+Working: worktree tasks with isolated ports + test runs; per-worktree dev stacks
+(start/stop from each chat, kept up while the chat is open); and the in-browser agent
+terminal (claude / grok / codex) with the chat sidebar. Not built: a live preview of a
+worktree's app inside the dashboard. See `docs/ARCHITECTURE.md` § Roadmap.

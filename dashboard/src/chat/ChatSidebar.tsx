@@ -222,7 +222,7 @@ export function DevStackBar({
 
 /** Sidebar of loom's work — one chat per task worktree (list / search / star / archive /
  *  reorder / create / open-as-terminal). This is loom's own rail, NOT your whole ~/.claude
- *  history (that's the Chats page). Every chat opens into the terminal surface. */
+ *  history (no page lists that anymore). Every chat opens into the terminal surface. */
 export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const openChat = useOpenChat();
   const { patch } = useChatActions();
@@ -511,8 +511,8 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     );
   };
 
-  // A category section header: chevron + name (Uncategorized is fixed; custom categories can be
-  // renamed on click, reordered ▲▼, deleted ✕).
+  // A category section header: click anywhere on chevron/name/count to collapse or expand
+  // (Uncategorized is fixed; custom categories can be renamed ✎, reordered ▲▼, deleted ✕).
   const renderGroupHeader = (
     g: { id: string | null; key: string; name: string; count: number },
     isColl: boolean,
@@ -521,9 +521,6 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       onDragOver={() => setDragOverRow(null)}
       className="group/gh px-2 py-1.5 flex items-center gap-1 bg-surface/95 sticky top-0 z-[1]"
     >
-      <button onClick={() => toggleCollapse(g.key)} className="w-3 shrink-0 text-[9px] text-muted hover:text-ink leading-none">
-        {isColl ? '▸' : '▾'}
-      </button>
       {renamingCat === g.id && g.id !== null ? (
         <input
           autoFocus
@@ -536,20 +533,27 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           onBlur={commitRename}
           className="flex-1 min-w-0 mono text-[10px] px-1 py-0.5 rounded bg-canvas border border-edge outline-none focus:border-accent"
         />
-      ) : g.id === null ? (
-        <span className="flex-1 text-[10px] mono text-muted uppercase tracking-wide truncate">{g.name}</span>
       ) : (
         <button
-          onClick={() => { setRenamingCat(g.id); setRenameDraft(g.name); }}
-          title="rename category"
-          className="flex-1 text-left text-[10px] mono text-muted uppercase tracking-wide truncate hover:text-ink"
+          onClick={() => toggleCollapse(g.key)}
+          aria-expanded={!isColl}
+          title={isColl ? 'expand' : 'collapse'}
+          className="flex-1 min-w-0 flex items-center gap-1.5 text-left text-muted hover:text-ink"
         >
-          {g.name}
+          <span className="w-3 shrink-0 text-[11px] leading-none">{isColl ? '▸' : '▾'}</span>
+          <span className="flex-1 min-w-0 text-[10px] mono uppercase tracking-wide truncate">{g.name}</span>
+          <span className="text-[9px] mono shrink-0">{g.count}</span>
         </button>
       )}
-      <span className="text-[9px] mono text-muted shrink-0">{g.count}</span>
       {g.id !== null && (
         <>
+          <button
+            onClick={() => { setRenamingCat(g.id); setRenameDraft(g.name); }}
+            title="rename category"
+            className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-ink shrink-0 leading-none"
+          >
+            ✎
+          </button>
           <button onClick={() => moveCategory(g.id!, -1)} title="move up" className="opacity-0 group-hover/gh:opacity-100 text-[9px] text-muted hover:text-ink shrink-0 leading-none">▲</button>
           <button onClick={() => moveCategory(g.id!, 1)} title="move down" className="opacity-0 group-hover/gh:opacity-100 text-[9px] text-muted hover:text-ink shrink-0 leading-none">▼</button>
           <button
