@@ -35,7 +35,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `cli.py` | Typer CLI: `doctor, serve, repo-add, new, ls, rm, test, start, stop, claude`. `serve` runs uvicorn. |
 | `server/app.py` | `create_app()`: FastAPI, permissive CORS (localhost tool), mounts the router under `/api`, serves `dashboard/dist` at `/`. |
 | `server/api.py` | All REST endpoints + the `/api/ws/term` WebSocket route. |
-| `core/config.py` | `~/.loom` paths, `LOOM_API_PORT` (8787), and the per-repo **`.loom.yaml`** loader (`RepoConfig`). |
+| `core/config.py` | `~/.loom` paths, `LOOM_API_PORT` (8787), and the per-repo **`.loom.yaml`** loader (`RepoConfig`). The file is optional: without one a repo is a plain project (no services/setup/ports) and `base_branch` defaults to git's default branch (`default_branch`: origin/HEAD, else local `main`/`master`, else the checked-out branch). |
 | `core/registry.py` | Atomic JSON task registry (tempfile + `os.replace`). |
 | `core/ports.py` | Deterministic `hash(branch)`→offset port allocation, collision-checked. |
 | `core/worktree.py` | `git worktree` add/remove/status; `slugify`. |
@@ -43,7 +43,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `core/manager.py` | Task lifecycle: `create_task` (worktree+alloc+setup), `start_task`/`stop_task` (Phase-2 dev servers), `remove_task`, `refresh_status`. |
 | `core/tests.py` | Isolated test runs: `build_test_run` (render cmd/env from `.loom.yaml`), `serialize_lock` (file lock so concurrent runs don't clash on one shared test resource). |
 | `core/doctor.py` | Preflight checks (git/uv/node + agent CLIs claude/grok/codex, one required; optional bun/tmux/gh/docker). |
-| `core/repos.py` | `repos.json` registry of known repos (name→root). |
+| `core/repos.py` | **Projects**: the `repos.json` registry (name→root). `register` takes any git repo (stored at its top level) and refuses a second repo with an existing name. |
 | `core/agents.py` | **Agent adapters** (claude \| grok \| codex): argv/env construction per CLI, transcript discovery, needs-you hooks. Codex extras: it mints its own session id (no `--session-id`), so loom binds the discovered native id into the overlay (`agent_session_id`) via the `notify` hook file / a rollout cwd-scan, and resumes with `codex resume <that id>`. |
 | `core/sessions.py` | **Chat manager**: index `~/.claude/projects/**/*.jsonl` + `~/.grok/sessions/**` + `~/.codex/sessions/**` rollouts (mtime-cached), merge a local overlay, search, soft-trash, and `get_transcript()` (reconstruct a session into render items; claude + codex formats). Codex rows claimed by an `agent_session_id` binding are re-keyed to their loom chat id. Chat→task resolution: the `task.chat_id` link wins (homes adopted chats in their task's worktree), then worktree/repo cwd-prefix inference. |
 | `core/runtime.py` | Per-worktree runtime context: if a session's cwd is inside a worktree, build its `LOOM_*` env (ports/log dir) + the `<loom-runtime>` system-prompt note. Project-agnostic. |
@@ -63,8 +63,8 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `App.tsx` | The whole app: the always-present `ChatSidebar` beside the content pane — the open chat's `TerminalView`, or an empty state (first-run repo add, open-branch-in-editor, notes, doctor badge). No separate home/Tasks/Chats pages. Wrapped in `ChatProvider`. |
 | `api.ts` | REST types + TanStack Query hooks (`useTasks`, `useRepos`, `useDoctor`, `useChats`, `useTrash`, `useUsage`, `useTaskActions`, `useChatActions`). |
 | `chat/ChatContext.tsx` · `chat/openChat.ts` | `ChatProvider`: the active chat (`open`/`close`), `?chat=<id>` sync (restored on load via `GET /api/chats/{id}`), and the global `NotesModal`. `openChat.ts` holds the contexts + `useOpenChat` / `useChatShell`. |
-| `chat/ChatSidebar.tsx` | The chat rail: loom's task chats (task link or a task-worktree cwd — not your whole history), active/archived tabs, search, drag-to-reorder, categories (click a header to collapse; ✎ rename, ▲▼ reorder, ✕ delete; drag a chat onto a group to file it), per-row needs-you / working status (`GET /api/terminals`), archive, `+ new` task + chat. Also exports the in-chat `DevStackBar` (dev-stack start/stop) and `OpenInIde`. |
-| `categories/categoriesStore.ts` | Sidebar categories + chat→category assignments in localStorage (`loom.chatCategories`); collapsed groups in `loom.sidebarCollapsedCats`. |
+| `chat/ChatSidebar.tsx` | The chat rail, scoped to one **project**: the header's `ProjectMenu` switches projects (each with its chat count; remembered in localStorage `loom.activeProject`; opening a chat from another project switches to it) and adds any git repo. Lists that project's task chats (task link or a task-worktree cwd — not your whole history), active/archived tabs, search, drag-to-reorder, categories (click a header to collapse; ✎ rename, ▲▼ reorder, ✕ delete; drag a chat onto a group to file it), per-row needs-you / working status (`GET /api/terminals`), archive, `+ new` task + chat. Also exports the in-chat `DevStackBar` (dev-stack start/stop) and `OpenInIde`. |
+| `categories/categoriesStore.ts` | Sidebar categories + chat→category assignments in localStorage (`loom.chatCategories`); each category belongs to one project (`repo`; pre-project ones are filed under the project most of their chats are in). Collapsed groups in `loom.sidebarCollapsedCats`. |
 | `notes/*` | Per-chat notes in localStorage (`notesStore`): `NotesPanel` (drawer beside the terminal), `NotesModal` (all notes; reopen a chat from one), `NotesButton`. |
 | `term/TerminalView.tsx` | The terminal pane (beside the sidebar): xterm.js bound to `/api/ws/term`. Branches on the server-reported backend — pty: smooth wheel scroll over xterm's own scrollback, snap-to-bottom on real input only (xterm's `scrollOnUserInput` — not on focus reports), `snapshot-start/end` bracketed repaints (reset + atomic rewrite, requested only after a real resize); tmux: wheel→SGR forwarding + tmux redraws. Plus image drop, transcript search, selectable copy-text panel, notes drawer, PR badges, usage chip, `⧉ terminal` (opens a plain shell in the worktree), open-in-editor, `↑ my msg ↓` / ⌘↑⌘↓ message jumps; hosts the chat's `DevStackBar` + `ServiceLogsPanel`. |
 | `term/messageNav.ts` | Jump between the prompts you sent (pty + claude only): finds claude's inline-rendered prompts in xterm's scrollback (`❯` in column 0 on a grey row; skips the input box and still-queued prompts), steps older/newer from the last jump or the current view, highlights the landing row. |
@@ -184,6 +184,8 @@ default — see `DECISIONS.md`).
 ✅ **In-browser terminal** — the real claude/grok/codex TUI (`terminals.py`) on the pty
 host (`pty_server.py` daemon, inline renderer: native xterm scrollback/select/copy),
 surviving browser disconnects + loom restarts, with `?chat=<id>` deep links.
+✅ **Projects** — the sidebar shows one registered repo at a time (header switcher); add any
+git repo from the dashboard or `loom repo-add` — a `.loom.yaml` is optional.
 ✅ **Sidebar-first shell** — the chat rail is the app: tabs, search, reorder,
 collapsible categories, notes; dev-stack start/stop + logs live in each chat's
 `DevStackBar` (supervised by `monitor.py`).

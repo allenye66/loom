@@ -5,12 +5,23 @@ import { NotesButton } from '../notes/NotesButton';
 import {
   addCategory,
   assignChat,
+  claimUnscopedCategories,
   moveCategory,
   removeCategory,
   renameCategory,
   useCategories,
 } from '../categories/categoriesStore';
-import { useChatActions, useDoctor, useRepos, useTasks, useTaskActions, type AgentId, type Chat, type Task } from '../api';
+import {
+  useChatActions,
+  useDoctor,
+  useRepos,
+  useTasks,
+  useTaskActions,
+  type AgentId,
+  type Chat,
+  type Repo,
+  type Task,
+} from '../api';
 import { AgentIcon } from '../components/AgentIcon';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
@@ -51,6 +62,22 @@ const saveCollapsed = (s: Set<string>) => {
     localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...s]));
   } catch {
     /* private mode / quota */
+  }
+};
+// The project (registered repo) the sidebar shows — remembered across reloads (localStorage).
+const PROJECT_KEY = 'loom.activeProject';
+const loadProject = (): string | null => {
+  try {
+    return localStorage.getItem(PROJECT_KEY);
+  } catch {
+    return null;
+  }
+};
+const saveProject = (name: string) => {
+  try {
+    localStorage.setItem(PROJECT_KEY, name);
+  } catch {
+    /* private mode / quota — the choice just won't persist */
   }
 };
 // Live branch-name sanitizer: keep only chars git allows in a ref (spaces/anything else → '-').
@@ -220,6 +247,122 @@ export function DevStackBar({
   );
 }
 
+/** Sidebar header: the project (registered repo) whose chats are listed, a switcher between
+ *  projects with each one's chat count, and "add project" — any git repo path; a .loom.yaml
+ *  is optional. */
+function ProjectMenu({
+  repos,
+  active,
+  counts,
+  onPick,
+}: {
+  repos: Repo[];
+  active?: Repo;
+  counts: Map<string, number>;
+  onPick: (name: string) => void;
+}) {
+  const { addRepo } = useTaskActions();
+  const [open, setOpen] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [path, setPath] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const close = () => {
+    setOpen(false);
+    setAdding(false);
+    setPath('');
+    setErr(null);
+  };
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) close();
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+
+  const add = async () => {
+    const p = path.trim();
+    if (!p) return;
+    setErr(null);
+    try {
+      const repo = await addRepo.mutateAsync(p);
+      onPick(repo.name);
+      close();
+    } catch (e: any) {
+      setErr(e?.message ?? String(e));
+    }
+  };
+
+  return (
+    <div ref={ref} className="relative min-w-0">
+      <button
+        onClick={() => (open ? close() : setOpen(true))}
+        title={active ? `${active.root} — switch project` : 'add a project'}
+        className="max-w-full flex items-center gap-1 text-[11px] mono text-muted hover:text-ink uppercase tracking-wide"
+      >
+        <span className="truncate">{active?.name ?? 'no project'}</span>
+        <span className="text-[9px] shrink-0">▾</span>
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full mt-1 z-30 w-48 rounded-md border border-edge bg-surface shadow-xl overflow-hidden">
+          {repos.map((r) => (
+            <button
+              key={r.name}
+              onClick={() => {
+                onPick(r.name);
+                close();
+              }}
+              className="w-full text-left px-3 py-2 hover:bg-surface-2 border-b border-edge flex flex-col gap-0.5"
+            >
+              <span className="text-[11px] mono text-ink flex items-center gap-1.5">
+                <span className="truncate">{r.name}</span>
+                {r.name === active?.name && <span className="text-accent shrink-0">✓</span>}
+                <span className="ml-auto text-[10px] text-muted shrink-0">{counts.get(r.name) ?? 0}</span>
+              </span>
+              <span className="text-[10px] text-muted truncate">{r.root}</span>
+            </button>
+          ))}
+          {adding ? (
+            <div className="p-2 flex flex-col gap-1.5">
+              <div className="flex gap-1">
+                <input
+                  autoFocus
+                  value={path}
+                  onChange={(e) => setPath(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') add();
+                    if (e.key === 'Escape') close();
+                  }}
+                  placeholder="/path/to/repo"
+                  className="flex-1 min-w-0 mono text-[11px] px-2 py-1 rounded bg-canvas border border-edge outline-none focus:border-accent"
+                />
+                <button
+                  onClick={add}
+                  disabled={!path.trim() || addRepo.isPending}
+                  className="text-[11px] px-2 py-1 rounded bg-accent/15 text-accent border border-accent-dim disabled:opacity-40"
+                >
+                  {addRepo.isPending ? '…' : 'add'}
+                </button>
+              </div>
+              {err && <div className="text-[10px] text-bad break-words">{err}</div>}
+              <div className="text-[10px] text-muted">any git repo — a .loom.yaml is optional</div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setAdding(true)}
+              className="w-full text-left px-3 py-2 text-[11px] mono text-muted hover:text-accent hover:bg-surface-2"
+            >
+              + add project…
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Sidebar of loom's work — one chat per task worktree (list / search / star / archive /
  *  reorder / create / open-as-terminal). This is loom's own rail, NOT your whole ~/.claude
  *  history (no page lists that anymore). Every chat opens into the terminal surface. */
@@ -244,7 +387,15 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const [creating, setCreating] = useState(false);
   const [branch, setBranch] = useState('');
   const [agent, setAgent] = useState<AgentId>('claude');
-  const repoRoot = repos?.[0]?.root || '';
+  // Which project the sidebar shows: the remembered one while it's still registered, else the
+  // first. Its chats are the only ones listed, and `+ new` creates the task in it.
+  const [projectName, setProjectName] = useState<string | null>(loadProject);
+  const project = repos?.find((r) => r.name === projectName) ?? repos?.[0];
+  const pickProject = (name: string) => {
+    saveProject(name);
+    setProjectName(name);
+  };
+  const repoRoot = project?.root || '';
   const hasClaude = doctor?.some((c) => c.name === 'claude CLI' && c.ok) ?? true;
   const hasGrok = doctor?.some((c) => c.name === 'grok CLI' && c.ok) ?? false;
   const hasCodex = doctor?.some((c) => c.name === 'codex CLI' && c.ok) ?? false;
@@ -274,7 +425,23 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     refetchInterval: 2000,
   });
   const termById = new Map((termData ?? []).map((t) => [t.chat_id, t]));
-  const taskChats = (chatList ?? []).filter((c) => c.task != null || (c.cwd && worktreeSet.has(c.cwd)));
+  const allTaskChats = (chatList ?? []).filter((c) => c.task != null || (c.cwd && worktreeSet.has(c.cwd)));
+  const countByRepo = new Map<string, number>();
+  for (const c of allTaskChats) if (c.repo) countByRepo.set(c.repo, (countByRepo.get(c.repo) ?? 0) + 1);
+  // Only the active project's chats (each row carries its repo, resolved server-side).
+  const taskChats = project ? allTaskChats.filter((c) => c.repo === project.name) : allTaskChats;
+
+  // Opening a chat that lives in another project (a ?chat= deep link, a note) switches the
+  // sidebar to that project so the open chat is listed. Once per opened chat, so switching
+  // projects by hand afterwards sticks.
+  const syncedSid = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!activeSid || syncedSid.current === activeSid || !chatList) return;
+    const repo = chatList.find((c) => c.id === activeSid)?.repo;
+    if (!repo) return; // not in this list (yet) — retry when it refreshes
+    syncedSid.current = activeSid;
+    if (repo !== project?.name && repos?.some((r) => r.name === repo)) pickProject(repo);
+  }, [activeSid, chatList, project?.name, repos]);
 
   type Row = {
     id: string;
@@ -330,7 +497,22 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   // Shared with the (now-removed) board; assignments are by chat id. Chats group under their
   // category; drag a chat onto a group (or a row in it) to (re)file it. Only kicks in once at
   // least one category exists — otherwise the sidebar stays a plain list.
-  const { categories, assign } = useCategories();
+  const { categories: allCategories, assign } = useCategories();
+  // Each project has its own categories. Ones made before projects existed have none yet:
+  // file each under the project most of its chats are in (else the first project).
+  const categories = project ? allCategories.filter((c) => !c.repo || c.repo === project.name) : allCategories;
+  useEffect(() => {
+    if (!repos?.length || !chatList) return;
+    const repoOf = new Map(chatList.map((c) => [c.id, c.repo]));
+    claimUnscopedCategories((chatIds) => {
+      const n = new Map<string, number>();
+      for (const id of chatIds) {
+        const r = repoOf.get(id);
+        if (r) n.set(r, (n.get(r) ?? 0) + 1);
+      }
+      return [...n].sort((a, b) => b[1] - a[1])[0]?.[0] ?? repos[0].name;
+    });
+  }, [repos, chatList]);
   const validCatIds = new Set(categories.map((c) => c.id));
   const catOf = (id: string): string | null => {
     const a = assign[id];
@@ -358,7 +540,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   };
   const createCat = () => {
     if (!catName.trim()) return;
-    addCategory(catName);
+    addCategory(catName, project?.name);
     setCatName('');
     setCreatingCat(false);
   };
@@ -572,7 +754,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     <div className="w-56 shrink-0 border-r border-edge bg-surface flex flex-col h-full">
       <div className="flex-1 overflow-auto thin-scroll flex flex-col min-h-0">
       <div className="px-3 py-2.5 flex items-center justify-between gap-2">
-        <span className="text-[11px] mono text-muted uppercase tracking-wide">chats</span>
+        <ProjectMenu repos={repos ?? []} active={project} counts={countByRepo} onPick={pickProject} />
         <div className="flex items-center gap-2 shrink-0">
           <button
             onClick={() => setCreatingCat((v) => !v)}
@@ -625,7 +807,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
                 if (e.key === 'Enter') createTask();
                 if (e.key === 'Escape') setCreating(false);
               }}
-              placeholder={repoRoot ? 'new branch name…' : 'add a repo first'}
+              placeholder={repoRoot ? `new branch in ${project?.name}…` : 'add a project first'}
               disabled={!repoRoot}
               className="flex-1 min-w-0 mono text-[11px] px-2 py-1 rounded bg-surface border border-edge outline-none focus:border-accent"
             />

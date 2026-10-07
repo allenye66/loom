@@ -2,11 +2,15 @@
 
 A target repo describes its services/tests in a `.loom.yaml` committed at its
 root, so config travels with the code and loom itself stays project-agnostic.
+The file is optional: a repo without one is a plain project (no services/setup)
+on git's default branch.
 """
 
 from __future__ import annotations
 
+import functools
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -66,14 +70,33 @@ class RepoConfig(BaseModel):
     editor: str = "cursor --new-window {worktree}"
 
 
+@functools.lru_cache(maxsize=64)
+def default_branch(repo_root: str) -> str:
+    """git's default branch for a repo: what origin/HEAD points at, else a local `main` or
+    `master`, else whatever is checked out, else "main"."""
+
+    def git(*args: str) -> str | None:
+        r = subprocess.run(["git", "-C", repo_root, *args], capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+    origin_head = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if origin_head:
+        return origin_head.removeprefix("origin/")
+    for name in ("main", "master"):
+        if git("rev-parse", "--verify", "--quiet", f"refs/heads/{name}"):
+            return name
+    return git("symbolic-ref", "--quiet", "--short", "HEAD") or "main"
+
+
 def load_repo_config(repo_root: str | Path) -> RepoConfig:
+    """The repo's `.loom.yaml`, with `root` / `name` / `base_branch` defaulted from the repo
+    itself. A repo without the file gets an all-defaults config (no services, setup or
+    ports), so any git repo can be added as a project without writing one first."""
     repo_root = Path(repo_root).expanduser().resolve()
     cfg_path = repo_root / ".loom.yaml"
-    if not cfg_path.exists():
-        raise FileNotFoundError(
-            f"No .loom.yaml at {repo_root}. Copy one from loom/projects/ or run `loom init-repo`."
-        )
-    data: dict[str, Any] = yaml.safe_load(cfg_path.read_text()) or {}
+    data: dict[str, Any] = (yaml.safe_load(cfg_path.read_text()) or {}) if cfg_path.exists() else {}
     data.setdefault("root", str(repo_root))
     data.setdefault("name", repo_root.name)
+    if "base_branch" not in data:
+        data["base_branch"] = default_branch(str(repo_root))
     return RepoConfig(**data)

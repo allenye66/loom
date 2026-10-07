@@ -91,6 +91,9 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   (from the CLI, or `+ new` in the sidebar).
 - **In-browser terminal** — the real `claude` / `grok` / `codex` TUI on the pty host,
   surviving browser disconnects + loom restarts; `?chat=<id>` deep links.
+- **Projects** — the sidebar shows one registered repo at a time; switch or add one from
+  its header (any git repo — a `.loom.yaml` is optional; without one: no dev services, base
+  branch = git's default). Categories are per project.
 - **Sidebar-first shell** — the chat rail *is* the app (no separate Tasks/Chats pages):
   loom's task chats with active/archived tabs, search, drag-to-reorder, collapsible
   categories, per-chat needs-you / working status, and notes.

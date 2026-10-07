@@ -52,7 +52,7 @@ def serve(
 
 @app.command("repo-add")
 def repo_add(root: str) -> None:
-    """Register a repo (must contain a .loom.yaml)."""
+    """Register a repo as a project (any git repo; a .loom.yaml is optional)."""
     from loom.core import repos
 
     info = repos.register(root)
@@ -63,7 +63,7 @@ def repo_add(root: str) -> None:
 def new(
     branch: str,
     repo: str = typer.Option(".", "--repo", "-r", help="path to the target repo"),
-    base: str | None = typer.Option(None, "--base", help="base branch (default from .loom.yaml)"),
+    base: str | None = typer.Option(None, "--base", help="base branch (default: .loom.yaml, else git's default branch)"),
     agent: str = typer.Option("claude", "--agent", "-a", help="agent CLI for the task chat: claude | grok | codex"),
 ) -> None:
     """Create a worktree + isolated env for a branch."""

@@ -29,9 +29,10 @@ loom doctor                       # preflight check
 ## Quickstart
 
 ```bash
-# 1. add a .loom.yaml to your repo (see projects/example.loom.yaml — a Flask + JS app)
-cp projects/example.loom.yaml /path/to/your-repo/.loom.yaml   # then edit it for your stack
-loom repo-add /path/to/your-repo
+# 1. register your repo — any git repo works. Optionally add a .loom.yaml first to give
+#    loom its dev services / tests (see projects/example.loom.yaml — a Flask + JS app)
+cp projects/example.loom.yaml /path/to/your-repo/.loom.yaml   # optional, then edit it
+loom repo-add /path/to/your-repo                               # or "+ add project…" in the dashboard
 
 # 2. launch the dashboard
 loom serve                        # opens http://127.0.0.1:8787

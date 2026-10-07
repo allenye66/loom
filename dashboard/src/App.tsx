@@ -138,7 +138,7 @@ function RepoPicker({ value, onChange }: { value: string; onChange: (v: string) 
         <input
           value={path}
           onChange={(e) => setPath(e.target.value)}
-          placeholder="/path/to/repo (with .loom.yaml)"
+          placeholder="/path/to/repo"
           className="mono text-sm px-3 py-2 rounded-md bg-surface border border-edge outline-none focus:border-accent w-72"
         />
         <button
@@ -183,7 +183,7 @@ function EmptyState() {
       </div>
       {noRepos && (
         <div className="flex flex-col items-center gap-1.5">
-          <div className="text-xs text-muted">Add a repo (with a .loom.yaml) to get started:</div>
+          <div className="text-xs text-muted">Add a project (any git repo) to get started:</div>
           <RepoPicker value="" onChange={() => {}} />
         </div>
       )}

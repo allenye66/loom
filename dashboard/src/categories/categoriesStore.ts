@@ -1,13 +1,15 @@
 /**
  * User-defined chat categories + which category each chat sits in, persisted to this
- * browser's localStorage. Drives the "board" layout on the Chats page (create categories,
- * drag chats between them). Same tiny-external-store shape as notesStore: a module-level
- * value replaced on each change, exposed via a `useSyncExternalStore` hook, synced across
- * tabs through the `storage` event.
+ * browser's localStorage. Drives the sidebar's category groups. Each category belongs to one
+ * project (`repo`), so every project has its own set. Same tiny-external-store shape as
+ * notesStore: a module-level value replaced on each change, exposed via a
+ * `useSyncExternalStore` hook, synced across tabs through the `storage` event.
  */
 import { useSyncExternalStore } from 'react';
 
-export type Category = { id: string; name: string };
+// `repo` = the project (registered repo name) the category belongs to. Categories made before
+// projects existed have none until the sidebar files them (claimUnscopedCategories).
+export type Category = { id: string; name: string; repo?: string };
 type State = {
   categories: Category[]; // display order
   assign: Record<string, string>; // chatId -> categoryId
@@ -21,7 +23,7 @@ function load(): State {
     const categories = Array.isArray(raw?.categories)
       ? raw.categories
           .filter((c: any) => c && typeof c.id === 'string' && typeof c.name === 'string')
-          .map((c: any) => ({ id: c.id, name: c.name }))
+          .map((c: any) => ({ id: c.id, name: c.name, ...(typeof c.repo === 'string' ? { repo: c.repo } : {}) }))
       : [];
     const assign =
       raw?.assign && typeof raw.assign === 'object'
@@ -69,11 +71,11 @@ function newId(): string {
   return `cat_${Date.now().toString(36)}_${rnd}`;
 }
 
-export function addCategory(name: string): string {
+export function addCategory(name: string, repo?: string): string {
   const n = name.trim();
   if (!n) return '';
   const id = newId();
-  state = { ...state, categories: [...state.categories, { id, name: n }] };
+  state = { ...state, categories: [...state.categories, { id, name: n, ...(repo ? { repo } : {}) }] };
   persist();
   emit();
   return id;
@@ -106,15 +108,30 @@ export function assignChat(chatId: string, categoryId: string | null) {
   emit();
 }
 
-/** Nudge a category one slot left (-1) or right (+1) in the display order. */
+/** Nudge a category one slot up (-1) or down (+1) among its own project's categories. */
 export function moveCategory(id: string, dir: -1 | 1) {
   const idx = state.categories.findIndex((c) => c.id === id);
   if (idx < 0) return;
-  const j = idx + dir;
+  const repo = state.categories[idx].repo;
+  let j = idx + dir;
+  while (j >= 0 && j < state.categories.length && state.categories[j].repo !== repo) j += dir;
   if (j < 0 || j >= state.categories.length) return;
   const categories = [...state.categories];
   [categories[idx], categories[j]] = [categories[j], categories[idx]];
   state = { ...state, categories };
+  persist();
+  emit();
+}
+
+/** File every category that has no project yet under `pick(its chat ids)`. A no-op once all
+ *  are filed, so it's cheap to call on every chat-list refresh. */
+export function claimUnscopedCategories(pick: (chatIds: string[]) => string) {
+  if (!state.categories.some((c) => !c.repo)) return;
+  const chatsIn = (catId: string) => Object.keys(state.assign).filter((k) => state.assign[k] === catId);
+  state = {
+    ...state,
+    categories: state.categories.map((c) => (c.repo ? c : { ...c, repo: pick(chatsIn(c.id)) })),
+  };
   persist();
   emit();
 }
