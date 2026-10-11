@@ -1,4 +1,9 @@
-# loom
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/loom-lockup.svg">
+    <img src="assets/loom-lockup-light.svg" alt="loom" height="56">
+  </picture>
+</h1>
 
 **Parallel git-worktree dev orchestrator for Claude Code.** Run many PRs/tasks at
 once — each on its own worktree/branch, each independently testable — so a skill

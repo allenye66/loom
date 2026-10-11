@@ -5,12 +5,22 @@ import { useChatShell } from './chat/openChat';
 import { ChatSidebar } from './chat/ChatSidebar';
 import { TerminalView } from './term/TerminalView';
 
-function Logo() {
+/** The loom mark: one thread weaving over and under three warp dots (parallel tasks).
+ *  Same geometry as assets/loom-mark.svg. */
+function Logo({ width = 72 }: { width?: number }) {
   return (
-    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden>
-      <g stroke="var(--color-accent)" strokeWidth="1.6" strokeLinecap="round">
-        <path d="M3 6h16M3 11h16M3 16h16" opacity="0.35" />
-        <path d="M6 3v16M11 3v16M16 3v16" />
+    <svg width={width} height={(width * 28.5) / 71.5} viewBox="-3.75 17.75 71.5 28.5" fill="none" aria-hidden>
+      <path
+        d="M0.5 32L1.48 28.95A10 10 0 0 1 20.52 28.95L22.48 35.05A10 10 0 0 0 41.52 35.05L43.48 28.95A10 10 0 0 1 62.52 28.95L63.5 32"
+        stroke="var(--color-accent)"
+        strokeWidth="6.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <g fill="var(--color-ink)">
+        <circle cx="11" cy="32" r="5" />
+        <circle cx="32" cy="32" r="5" />
+        <circle cx="53" cy="32" r="5" />
       </g>
     </svg>
   );
