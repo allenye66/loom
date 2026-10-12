@@ -20,7 +20,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from loom import __version__
-from loom.core import agents, claude_session, doctor, github, manager, monitor, perf, registry, repos, sessions, terminals
+from loom.core import agents, briefs, claude_session, doctor, github, manager, monitor, perf, registry, repos, sessions, terminals
 from loom.core.config import LOGS_DIR, LOOM_HOME, load_repo_config
 from loom.core.tests import build_test_run, serialize_lock
 
@@ -553,6 +553,22 @@ def chat_prs(sid: str) -> dict:
         seen.add(str(n))
         out.append(github.pr_status(repo, n))
     return {"branch": chat.get("branch"), "prs": out}
+
+
+@router.get("/chats/{sid}/brief")
+def chat_brief(sid: str, auto: bool = False) -> dict:
+    """The chat's status brief (cached; see core/briefs.py). `auto` = the status panel is
+    open: regenerate in the background when one is due, so only watched chats spend tokens."""
+    if auto:
+        briefs.refresh(sid)
+    return briefs.get(sid)
+
+
+@router.post("/chats/{sid}/brief")
+def refresh_chat_brief(sid: str) -> dict:
+    """Regenerate the brief now (the panel's ↻)."""
+    briefs.refresh(sid, force=True)
+    return briefs.get(sid)
 
 
 class OpenIdeIn(BaseModel):

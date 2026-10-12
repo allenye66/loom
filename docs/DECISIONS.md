@@ -180,6 +180,30 @@ sessions). Launch flags mirror the claude posture: `model_reasoning_effort="xhig
 `--effort max`), `--dangerously-bypass-approvals-and-sandbox` (≈ `bypassPermissions`, D-adj
 to taste: `-s workspace-write -a on-request`), `--search`, `--no-alt-screen` on the pty host.
 
+## D18 — Status briefs: loom summarizes the transcript; the agent doesn't self-report (2026-10-11)
+Problem: you give a worktree agent freedom, it runs for hours, and you lose the high-level
+picture. Per-tool-call "now" lines don't help at hour three. Asking the agent to keep a
+progress file was rejected: it costs tool calls, and it goes stale exactly when the agent is
+deep in a long run. Instead loom reads the transcript (already the source of truth, D16) and
+has **Haiku** write a brief: goal as it stands now, status, working vs idle time, phase
+timeline, decisions attributed you/agent, unasked work, needs-you.
+- **Input matters more than the model.** Prototype on real sessions found each of these made
+  the brief wrong until fixed: mid-turn messages are `queued_command` attachments (not user
+  records); AskUserQuestion answers are tool_results; `isMeta` records are harness noise
+  (except cross-session handoffs); idle time must be **computed** from timestamps (a 2h48m
+  outage after an API error was described as "testing" until gap markers were injected).
+  Tool outputs are dropped, so the prompt forbids numbers not in the text.
+- **Transport:** headless `claude -p --model haiku` on the user's own login (no API key;
+  counts toward plan usage) with `--no-session-persistence` (no transcript for the chat index
+  to adopt), `--setting-sources ""`, `--tools ""`, `--json-schema` for a structured brief.
+- **Cost:** measured 1.5¢ list price for a 9 h session (~65k tokens in, ~25 s); 0.6¢ for 70
+  min. One-shot over the whole compressed timeline (capped ~180k chars: tool lines dropped
+  oldest-first) — no incremental folding, so no error accumulation.
+- **Refresh only while watched:** the panel's polls pass `auto`; the server regenerates when
+  the transcript grew and the turn ended (needs-you marker newer than the brief) or 10 min
+  passed. Closed panels read the cache only.
+Claude transcripts only for now; codex/grok need their own timeline builders.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

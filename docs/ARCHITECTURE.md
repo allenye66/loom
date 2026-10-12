@@ -52,6 +52,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `core/pty_server.py` | The pty backend's **persistence daemon**: runs one command under a PTY on an AF_UNIX socket, detached (`start_new_session`) so it outlives loom. Escape-protocol relay (`\x1c` framing: resize / snapshot / literal), 1 MB replay ring (alt-screen-filtered on replay), DA1/DA2 interception (answers device-attribute queries itself so xterm's auto-reply can't echo as garbage), and settle-aware snapshots (waits for the TUI to go quiescent before capturing). Stdlib-only; runnable standalone as `python -m loom.core.pty_server`. |
 | `core/monitor.py` | Dev-stack **supervisor + reaper** (background loop): keeps an open chat's task services up (restarts any that probe down, unless explicitly stopped) and reaps stacks whose chat is done. |
 | `core/logs.py` | Per-task service/test logs under `~/.loom/logs/`: end-of-file tail + byte-offset incremental follow (never loads whole files). |
+| `core/briefs.py` | **Status briefs**: compress a Claude transcript into a timeline (your messages incl. mid-turn `queued_command`s and question answers, agent prose, one line per tool call, computed idle gaps; tool outputs dropped), then one headless `claude -p --model haiku --no-session-persistence --json-schema` call → `~/.loom/briefs/<chat>.json` (brief + running cost). Refreshes only while the panel is open: on turn end (needs-you marker) or after 10 min of new work; ↻ forces. See D18. |
 | `core/github.py` | PR state via the `gh` CLI with a short TTL cache (`GET /api/chats/{id}/prs`); never raises (`unknown` when gh is missing/unauthed). |
 | `core/perf.py` | Opt-in (`LOOM_PERF=1`) perf tracing to `~/.loom/perf.log`: slow requests + event-loop lag, for root-causing terminal lag. |
 
@@ -61,12 +62,13 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 |---|---|
 | `main.tsx` | Entry: React root + the TanStack Query client (5 s default poll; the terminal has its own WS). |
 | `App.tsx` | The whole app: the always-present `ChatSidebar` beside the content pane — the open chat's `TerminalView`, or an empty state (first-run repo add, open-branch-in-editor, notes, doctor badge). No separate home/Tasks/Chats pages. Wrapped in `ChatProvider`. |
-| `api.ts` | REST types + TanStack Query hooks (`useTasks`, `useRepos`, `useDoctor`, `useChats`, `useTrash`, `useUsage`, `useTaskActions`, `useChatActions`). |
+| `api.ts` | REST types + TanStack Query hooks (`useTasks`, `useRepos`, `useDoctor`, `useChats`, `useTrash`, `useUsage`, `useBrief`, `useTaskActions`, `useChatActions`). |
 | `chat/ChatContext.tsx` · `chat/openChat.ts` | `ChatProvider`: the active chat (`open`/`close`), `?chat=<id>` sync (restored on load via `GET /api/chats/{id}`), and the global `NotesModal`. `openChat.ts` holds the contexts + `useOpenChat` / `useChatShell`. |
 | `chat/ChatSidebar.tsx` | The chat rail, scoped to one **project**: the header's `ProjectMenu` switches projects (each with its chat count; remembered in localStorage `loom.activeProject`; opening a chat from another project switches to it) and adds any git repo. Lists that project's task chats (task link or a task-worktree cwd — not your whole history), active/archived tabs, search, drag-to-reorder, categories (click a header to collapse; ✎ rename, ▲▼ reorder, ✕ delete; drag a chat onto a group to file it), per-row needs-you / working status (`GET /api/terminals`), archive, `+ new` task + chat. Also exports the in-chat `DevStackBar` (dev-stack start/stop) and `OpenInIde`. |
 | `categories/categoriesStore.ts` | Sidebar categories + chat→category assignments in localStorage (`loom.chatCategories`); each category belongs to one project (`repo`; pre-project ones are filed under the project most of their chats are in). Collapsed groups in `loom.sidebarCollapsedCats`. |
+| `status/StatusPanel.tsx` | The chat's status brief drawer (`GET/POST /api/chats/{id}/brief`): status pill, goal, working vs idle time, phase timeline, decisions tagged you/agent, unasked work, needs-you; cost footer. Docked above the notes drawer in the same right-hand column. |
 | `notes/*` | Per-chat notes in localStorage (`notesStore`): `NotesPanel` (drawer beside the terminal), `NotesModal` (all notes; reopen a chat from one), `NotesButton`. |
-| `term/TerminalView.tsx` | The terminal pane (beside the sidebar): xterm.js bound to `/api/ws/term`. Branches on the server-reported backend — pty: smooth wheel scroll over xterm's own scrollback, snap-to-bottom on real input only (xterm's `scrollOnUserInput` — not on focus reports), `snapshot-start/end` bracketed repaints (reset + atomic rewrite, requested only after a real resize); tmux: wheel→SGR forwarding + tmux redraws. Plus image drop, transcript search, selectable copy-text panel, notes drawer, PR badges, usage chip, `⧉ terminal` (opens a plain shell in the worktree), open-in-editor, `↑ my msg ↓` / ⌘↑⌘↓ message jumps; hosts the chat's `DevStackBar` + `ServiceLogsPanel`. |
+| `term/TerminalView.tsx` | The terminal pane (beside the sidebar): xterm.js bound to `/api/ws/term`. Branches on the server-reported backend — pty: smooth wheel scroll over xterm's own scrollback, snap-to-bottom on real input only (xterm's `scrollOnUserInput` — not on focus reports), `snapshot-start/end` bracketed repaints (reset + atomic rewrite, requested only after a real resize); tmux: wheel→SGR forwarding + tmux redraws. Plus image drop, transcript search, selectable copy-text panel, status + notes drawers (one right-hand column), PR badges, usage chip, `⧉ terminal` (opens a plain shell in the worktree), open-in-editor, `↑ my msg ↓` / ⌘↑⌘↓ message jumps; hosts the chat's `DevStackBar` + `ServiceLogsPanel`. |
 | `term/messageNav.ts` | Jump between the prompts you sent (pty + claude only): finds claude's inline-rendered prompts in xterm's scrollback (`❯` in column 0 on a grey row; skips the input box and still-queued prompts), steps older/newer from the last jump or the current view, highlights the landing row. |
 | `term/readingPosition.ts` | Keeps a scrolled-up reader's place across a resize reflow or a snapshot rebuild (anchored on the text of the view's top logical lines; distance-from-bottom fallback), plus `scrollToLineExact` for xterm 6's post-reflow scroll lag. |
 | `components/ServiceLogsPanel.tsx` | Live FE/BE/test log drawer in the terminal chat (SSE follow, filter, resize, clear). |
@@ -161,6 +163,7 @@ GET  /api/tasks/{id}/logs?kind=  (efficient tail: backend|frontend|test|…)
 GET  /api/tasks/{id}/logs/kinds · /logs/since · SSE /logs/stream ;  DELETE /logs?kind=
 GET  /api/chats ;  GET/PATCH/DELETE /api/chats/{id} ;  POST /api/chats/{id}/restore
 GET  /api/chats-trash ;  POST /api/chats/reindex ;  GET /api/chats/{id}/{transcript,prs}
+GET  /api/chats/{id}/brief[?auto=1] ;  POST /api/chats/{id}/brief   (status brief; auto = regenerate if due)
 POST /api/ide ;  POST /api/shell ;  GET /api/terminals ;  POST /api/terminals/{chat_id}/upload
 WS   /api/ws/term      (terminal mode — raw PTY bytes; core/terminals.py)
 ```
@@ -168,7 +171,7 @@ WS   /api/ws/term      (terminal mode — raw PTY bytes; core/terminals.py)
 ## State files (`~/.loom/`, gitignored)
 `registry.json` (tasks) · `chats.json` (chat overlay) ·
 `sessions_index.json` (index cache) · `repos.json` · `usage.json` (statusLine usage) ·
-`needs/` (needs-you markers) · `trash/` (legacy: transcripts the old hard delete moved) ·
+`needs/` (needs-you markers) · `briefs/` (status briefs + cost) · `trash/` (legacy: transcripts the old hard delete moved) ·
 `logs/` (`<task>-<service>.log`, `<task>-test.log`, `loomx-<chat>-pty.log`) ·
 `worktrees/` (default base) · `pty-sockets/` (pty daemon sockets + PID sidecars).
 

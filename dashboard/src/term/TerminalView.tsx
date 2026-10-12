@@ -8,21 +8,34 @@ import { PrBadges } from '../components/PrBadges';
 import { ServiceLogsPanel, useLogsPanel } from '../components/ServiceLogsPanel';
 import { NotesPanel } from '../notes/NotesPanel';
 import { useNote } from '../notes/notesStore';
+import { STATUS_TONE, StatusPanel } from '../status/StatusPanel';
 import { UsageChip } from '../usage/UsageChip';
-import type { Task } from '../api';
+import { useBrief, type Task } from '../api';
 import { createMessageNav, type JumpResult } from './messageNav';
 import { captureReadingPosition, restoreReadingPosition } from './readingPosition';
 
-// Per-chat notes drawer open-state, remembered across chat switches / reloads (the whole
-// terminal remounts per chat, so local state alone would reset it each time).
-const NOTES_OPEN_KEY = 'loom.notesPanelOpen';
-const loadNotesOpen = () => {
-  try {
-    return localStorage.getItem(NOTES_OPEN_KEY) === '1';
-  } catch {
-    return false;
-  }
-};
+// Drawer open-states (notes, status), remembered across chat switches / reloads (the whole
+// terminal remounts per chat, so local state alone would reset them each time).
+function usePersistedFlag(key: string) {
+  const [on, setOn] = useState(() => {
+    try {
+      return localStorage.getItem(key) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const set = (v: boolean | ((p: boolean) => boolean)) =>
+    setOn((prev) => {
+      const next = typeof v === 'function' ? v(prev) : v;
+      try {
+        localStorage.setItem(key, next ? '1' : '0');
+      } catch {
+        /* private mode — drawer state just won't persist */
+      }
+      return next;
+    });
+  return [on, set] as const;
+}
 
 // Match the app palette (index.css @theme tokens) so the TUI feels native.
 const THEME = {
@@ -423,18 +436,13 @@ export function TerminalView({
   const [jumpNote, setJumpNote] = useState<{ text: string; id: number } | null>(null);
 
   // Per-chat notes drawer (localStorage-backed via notesStore). `note` drives the header dot.
-  const [notesOpen, setNotesOpenState] = useState(loadNotesOpen);
-  const setNotesOpen = (v: boolean | ((p: boolean) => boolean)) =>
-    setNotesOpenState((prev) => {
-      const next = typeof v === 'function' ? (v as (p: boolean) => boolean)(prev) : v;
-      try {
-        localStorage.setItem(NOTES_OPEN_KEY, next ? '1' : '0');
-      } catch {
-        /* private mode — drawer state just won't persist */
-      }
-      return next;
-    });
+  const [notesOpen, setNotesOpen] = usePersistedFlag('loom.notesPanelOpen');
   const note = useNote(resume);
+  // Status brief drawer, docked above notes. Open → the server keeps the brief fresh (turn end /
+  // 10 min of new work); closed → the header dot just reads the cached brief.
+  const [statusOpen, setStatusOpen] = usePersistedFlag('loom.statusPanelOpen');
+  const { data: brief } = useBrief(resume, statusOpen);
+  const briefTone = brief?.brief ? STATUS_TONE[brief.brief.status]?.dot : undefined;
 
   useEffect(() => {
     const term = new Terminal({
@@ -847,6 +855,26 @@ export function TerminalView({
             <UsageChip />
             {resume && (
               <button
+                onClick={() => setStatusOpen((v) => !v)}
+                title={
+                  brief?.brief
+                    ? `status: ${brief.brief.status} — ${brief.brief.reason}`
+                    : 'status brief: what this agent is doing, written by Haiku from the transcript'
+                }
+                className={`text-[11px] mono border rounded px-2 py-0.5 shrink-0 inline-flex items-center gap-1.5 ${
+                  statusOpen ? 'border-accent-dim text-accent bg-accent/10' : 'border-edge text-muted hover:text-ink'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    brief?.running ? 'bg-accent animate-pulse' : (briefTone ?? 'bg-muted/40')
+                  }`}
+                />
+                status
+              </button>
+            )}
+            {resume && (
+              <button
                 onClick={() => setNotesOpen((v) => !v)}
                 title="notes for this chat (saved to this browser)"
                 className={`text-[11px] mono border rounded px-2 py-0.5 shrink-0 inline-flex items-center gap-1.5 ${
@@ -943,12 +971,25 @@ export function TerminalView({
               </div>
             )}
           </div>
-          {notesOpen && resume && (
-            <NotesPanel
-              chatId={resume}
-              meta={{ title: title ?? liveAgent ?? resume.slice(0, 8), cwd, agent: liveAgent ?? agent ?? undefined }}
-              onClose={() => setNotesOpen(false)}
-            />
+          {resume && (statusOpen || notesOpen) && (
+            <div className={`${statusOpen ? 'w-96' : 'w-80'} shrink-0 border-l border-edge flex flex-col min-h-0`}>
+              {statusOpen && (
+                <StatusPanel
+                  chatId={resume}
+                  state={brief}
+                  onClose={() => setStatusOpen(false)}
+                  className={notesOpen ? 'flex-[3]' : 'flex-1'}
+                />
+              )}
+              {notesOpen && (
+                <NotesPanel
+                  chatId={resume}
+                  meta={{ title: title ?? liveAgent ?? resume.slice(0, 8), cwd, agent: liveAgent ?? agent ?? undefined }}
+                  onClose={() => setNotesOpen(false)}
+                  className={statusOpen ? 'flex-[2] border-t border-edge' : 'flex-1'}
+                />
+              )}
+            </div>
           )}
         </div>
 

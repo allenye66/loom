@@ -11,17 +11,20 @@ function rel(ms: number): string {
   return `saved ${new Date(ms).toLocaleDateString()}`;
 }
 
-/** Collapsible per-chat notes drawer, docked to the right of the terminal. Free text,
- *  auto-saved to localStorage on every keystroke (see notesStore). Seeded once from the
- *  stored note — the parent keys the whole terminal by chat, so this remounts per chat. */
+/** Collapsible per-chat notes drawer, docked to the right of the terminal (below the status
+ *  panel when both are open — the parent owns the column). Free text, auto-saved to
+ *  localStorage on every keystroke (see notesStore). Seeded once from the stored note — the
+ *  parent keys the whole terminal by chat, so this remounts per chat. */
 export function NotesPanel({
   chatId,
   meta,
   onClose,
+  className = '',
 }: {
   chatId: string;
   meta: NoteMeta;
   onClose: () => void;
+  className?: string;
 }) {
   const note = useNote(chatId);
   const [text, setText] = useState(note?.text ?? '');
@@ -35,7 +38,7 @@ export function NotesPanel({
   };
 
   return (
-    <div className="w-80 shrink-0 border-l border-edge bg-surface flex flex-col min-h-0">
+    <div className={`min-h-0 bg-surface flex flex-col ${className}`}>
       <div className="px-3 py-2 flex items-center gap-2 border-b border-edge shrink-0">
         <span className="text-[11px] mono text-accent shrink-0">✎ notes</span>
         <span className="text-[10px] mono text-muted truncate flex-1">
