@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime
@@ -145,9 +146,106 @@ def _pr_from_record(rec: dict):
     return None
 
 
+# --- created-PR evidence --------------------------------------------------------
+# Which PRs did this chat itself CREATE (vs. merely mention)? The transcript can't say on its
+# own — Claude's `pr-link` holds one "current PR" (a script that opens two PRs records one), and
+# a pasted old link looks like any other URL. So each parser collects two facts and
+# github.created_prs() decides: (1) PR URLs seen on the AGENT's side only (tool output, task
+# notifications, pr-link — never what the user typed), with first-sighting time; (2) the time
+# windows the chat's tool calls were running. A PR counts as created here iff GitHub's createdAt
+# falls inside one of those windows. See docs/DECISIONS.md D19.
+_PR_URL_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)")
+_NOTIF_TOOL_ID_RE = re.compile(r"<tool-use-id>([\w-]+)</tool-use-id>")
+_WINDOW_GAP = 240  # = 2 × github._SLACK
+
+
+class _PrEvidence:
+    def __init__(self) -> None:
+        self.starts: dict[str, float] = {}  # tool call id → start epoch
+        self.ends: dict[str, float] = {}    # tool call id → latest end epoch (bg tasks: notification)
+        self.seen: dict[str, list] = {}     # "owner/repo#n" → [first sighting epoch, source]
+
+    def start(self, tid, ts: float | None) -> None:
+        if tid and ts and tid not in self.starts:
+            self.starts[tid] = ts
+
+    def end(self, tid, ts: float | None) -> None:
+        if tid and ts:
+            self.ends[tid] = max(ts, self.ends.get(tid, 0.0))
+
+    def sight(self, repo: str, number, ts: float | None, src: str) -> None:
+        key = f"{repo}#{int(number)}"
+        cur = self.seen.get(key)
+        if cur is None or (ts and ts < (cur[0] or ts)):
+            self.seen[key] = [ts, src]
+
+    def sight_text(self, text: str, ts: float | None, src: str = "tool") -> None:
+        for repo, num in _PR_URL_RE.findall(text):
+            self.sight(repo, num, ts, src)
+
+    def claude_record(self, rec: dict, line: str) -> None:
+        """Feed one claude jsonl record (main transcript or a subagent's)."""
+        ts = _parse_iso_ts(rec.get("timestamp"))
+        if "<task-notification>" in line:
+            # A background Bash/agent finished: its window runs until now, and its summary is
+            # agent-side output.
+            for tid in _NOTIF_TOOL_ID_RE.findall(line):
+                self.end(tid, ts)
+            self.sight_text(line, ts)
+        t = rec.get("type")
+        if t not in ("user", "assistant"):
+            return
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            return
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use":
+                self.start(b.get("id"), ts)
+            elif b.get("type") == "tool_result":
+                self.end(b.get("tool_use_id"), ts)
+                if "/pull/" in line:
+                    self.sight_text(json.dumps(b.get("content")), ts)
+
+    def dump(self) -> dict:
+        # Windows only matter when a PR was sighted; they're whole seconds, and spans closer
+        # than _WINDOW_GAP are merged (lossless: created_prs pads each side by that much anyway).
+        # Keeps the index cache — re-read on every sidebar poll — small.
+        if not self.seen:
+            return {"pr_seen": {}, "tool_windows": []}
+        spans = sorted((int(s), int(max(s, self.ends.get(tid, s))) + 1) for tid, s in self.starts.items())
+        merged: list[list[int]] = []
+        for s, e in spans:
+            if merged and s <= merged[-1][1] + _WINDOW_GAP:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        return {"pr_seen": self.seen, "tool_windows": merged}
+
+
+def _claude_subagent_evidence(path: Path, ev: _PrEvidence) -> None:
+    """Subagents (Task/Agent tool) write their own jsonls under <id>/subagents/ — a PR a
+    subagent opens is the chat's PR too."""
+    for sub in (path.parent / path.stem / "subagents").glob("*.jsonl"):
+        try:
+            with sub.open("r", errors="replace") as f:
+                for line in f:
+                    if "tool_use" not in line and "tool_result" not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ev.claude_record(rec, line)
+        except OSError:
+            continue
+
+
 def _parse_transcript(path: Path) -> dict:
     title = preview = first_prompt = branch = cwd = created = pr_repo = None
     prs: set = set()
+    ev = _PrEvidence()
     n_user = n_assistant = 0
     try:
         with path.open("r", errors="replace") as f:
@@ -160,6 +258,8 @@ def _parse_transcript(path: Path) -> dict:
                 except json.JSONDecodeError:
                     continue
                 t = rec.get("type")
+                if t == "queue-operation" and "<task-notification>" in line:
+                    ev.claude_record(rec, line)
                 if t == "ai-title":
                     title = rec.get("aiTitle") or title
                 elif t == "last-prompt":
@@ -170,7 +270,10 @@ def _parse_transcript(path: Path) -> dict:
                         prs.add(pr)
                     if rec.get("prRepository"):
                         pr_repo = rec["prRepository"]
+                    if pr and rec.get("prRepository") and str(pr).isdigit():
+                        ev.sight(rec["prRepository"], pr, _parse_iso_ts(rec.get("timestamp")), "pr-link")
                 elif t in ("user", "assistant"):
+                    ev.claude_record(rec, line)
                     if t == "user":
                         n_user += 1
                         if first_prompt is None:
@@ -187,8 +290,10 @@ def _parse_transcript(path: Path) -> dict:
                         created = rec["timestamp"]
     except OSError:
         pass
+    _claude_subagent_evidence(path, ev)
     st = path.stat()
     return {
+        **ev.dump(),
         "id": path.stem,
         "agent": "claude",
         "title": title,
@@ -315,6 +420,9 @@ def _parse_grok_session(sess_dir: Path, group_name: str) -> dict:
         "cwd": cwd,
         "prs": [],
         "pr_repo": None,
+        # No created-PR evidence yet: grok's chat_history has carried no tool output to learn from.
+        "pr_seen": {},
+        "tool_windows": [],
         "created": created,
         "last_active": last_active,
         "size": size,
@@ -357,6 +465,7 @@ def _parse_codex_session(path: Path) -> dict:
     first_prompt = preview = cwd = created = None
     n_user = n_assistant = 0
     subagent = False
+    ev = _PrEvidence()
     sid = path.stem[-36:]  # rollout-<launch ts>-<uuid>.jsonl
     try:
         with path.open("r", errors="replace") as f:
@@ -377,6 +486,14 @@ def _parse_codex_session(path: Path) -> dict:
                     cwd = payload.get("cwd") or cwd
                     created = payload.get("timestamp") or created
                     subagent = subagent or agents.codex_is_subagent(payload)
+                elif t == "response_item" and payload.get("call_id"):
+                    ts = _parse_iso_ts(rec.get("timestamp"))
+                    if str(payload.get("type", "")).endswith("_output"):
+                        ev.end(payload["call_id"], ts)
+                        if "/pull/" in line:
+                            ev.sight_text(json.dumps(payload.get("output")), ts)
+                    else:  # function_call / custom_tool_call / local_shell_call
+                        ev.start(payload["call_id"], ts)
                 elif t == "response_item" and payload.get("type") == "message":
                     role = payload.get("role")
                     if role == "user":
@@ -392,6 +509,7 @@ def _parse_codex_session(path: Path) -> dict:
         pass
     st = path.stat()
     return {
+        **ev.dump(),
         "id": sid,
         "agent": "codex",
         # Multi-agent sub-agent thread — never a resumable/listable chat (list_chats
@@ -481,6 +599,8 @@ def build_index(force: bool = False) -> list[dict]:
             and cached.get("agent")
             # One-time re-parse of codex rows cached before the subagent flag existed.
             and (not key.startswith("codex:") or "subagent" in cached)
+            # ...and of rows cached before created-PR evidence was collected.
+            and "pr_seen" in cached
         )
         if unchanged:
             out[key] = cached
@@ -606,7 +726,9 @@ def _merge(s: dict, resolve=None) -> dict:
     # Overlay agent wins once locked; else the index source (claude/grok/codex scan).
     agent = agents.normalize_agent(ov.get("agent") or s.get("agent"))
     return {
-        **s,
+        # Created-PR evidence is only for /chats/{sid}/prs (raw get_chat row) — keep it out of
+        # list payloads.
+        **{k: v for k, v in s.items() if k not in ("pr_seen", "tool_windows")},
         # A task-linked chat's home is its worktree (overrides the transcript's recorded
         # cwd for adopted chats — terminal opens + sidebar filtering use this).
         "cwd": home_cwd or s.get("cwd"),

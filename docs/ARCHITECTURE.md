@@ -53,7 +53,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `core/monitor.py` | Dev-stack **supervisor + reaper** (background loop): keeps an open chat's task services up (restarts any that probe down, unless explicitly stopped) and reaps stacks whose chat is done. |
 | `core/logs.py` | Per-task service/test logs under `~/.loom/logs/`: end-of-file tail + byte-offset incremental follow (never loads whole files). |
 | `core/briefs.py` | **Status briefs**: compress a Claude transcript into a timeline (your messages incl. mid-turn `queued_command`s and question answers, agent prose, one line per tool call, computed idle gaps; tool outputs dropped), then one headless `claude -p --model haiku --no-session-persistence --json-schema` call → `~/.loom/briefs/<chat>.json` (brief + running cost). Refreshes only while the panel is open: on turn end (needs-you marker) or after 10 min of new work; ↻ forces. See D18. |
-| `core/github.py` | PR state via the `gh` CLI with a short TTL cache (`GET /api/chats/{id}/prs`); never raises (`unknown` when gh is missing/unauthed). |
+| `core/github.py` | PR state via the `gh` CLI with a short TTL cache (`GET /api/chats/{id}/prs`); never raises (`unknown` when gh is missing/unauthed). `created_prs` decides which PRs a chat created (transcript sightings × tool windows × GitHub `createdAt`, D19). |
 | `core/perf.py` | Opt-in (`LOOM_PERF=1`) perf tracing to `~/.loom/perf.log`: slow requests + event-loop lag, for root-causing terminal lag. |
 
 ## Frontend code map (`dashboard/src/`)
@@ -72,7 +72,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `term/messageNav.ts` | Jump between the prompts you sent (pty + claude only): finds claude's inline-rendered prompts in xterm's scrollback (`❯` in column 0 on a grey row; skips the input box and still-queued prompts), steps older/newer from the last jump or the current view, highlights the landing row. |
 | `term/readingPosition.ts` | Keeps a scrolled-up reader's place across a resize reflow or a snapshot rebuild (anchored on the text of the view's top logical lines; distance-from-bottom fallback), plus `scrollToLineExact` for xterm 6's post-reflow scroll lag. |
 | `components/ServiceLogsPanel.tsx` | Live FE/BE/test log drawer in the terminal chat (SSE follow, filter, resize, clear). |
-| `components/PrBadges.tsx` · `components/AgentIcon.tsx` | PR state badges (`GET /api/chats/{id}/prs`) · claude/grok/codex icons. |
+| `components/PrBadges.tsx` · `components/AgentIcon.tsx` | PR state badges (`GET /api/chats/{id}/prs`; `+ pr` pins, × hides via POST/DELETE) · claude/grok/codex icons. |
 | `usage/UsageChip.tsx` | Claude subscription usage (5 h / 7 d) in the chat header, from `GET /api/usage`. |
 | `components/TasksView.tsx` · `TaskCard.tsx` · `ChatsView.tsx` | **Not mounted** — the old Tasks/Chats pages from before the sidebar-first shell; nothing imports them (`TaskCard` only via `TasksView`). |
 
@@ -170,7 +170,7 @@ WS   /api/ws/term      (terminal mode — raw PTY bytes; core/terminals.py)
 
 ## State files (`~/.loom/`, gitignored)
 `registry.json` (tasks) · `chats.json` (chat overlay) ·
-`sessions_index.json` (index cache) · `repos.json` · `usage.json` (statusLine usage) ·
+`sessions_index.json` (index cache) · `pr_created.json` (PR createdAt cache, D19) · `repos.json` · `usage.json` (statusLine usage) ·
 `needs/` (needs-you markers) · `briefs/` (status briefs + cost) · `trash/` (legacy: transcripts the old hard delete moved) ·
 `logs/` (`<task>-<service>.log`, `<task>-test.log`, `loomx-<chat>-pty.log`) ·
 `worktrees/` (default base) · `pty-sockets/` (pty daemon sockets + PID sidecars).

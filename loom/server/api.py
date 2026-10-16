@@ -6,6 +6,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -538,21 +539,85 @@ def get_one_chat(sid: str) -> dict:
     return {"chat": chat, "mode": mode, "agent": agent}
 
 
+def _chat_default_repo(chat: dict) -> str | None:
+    """The "owner/repo" a bare PR number in this chat refers to."""
+    if chat.get("pr_repo"):
+        return chat["pr_repo"]
+    for key in chat.get("pr_seen") or {}:
+        return key.rpartition("#")[0]
+    return github.repo_for_dir(chat.get("cwd"))
+
+
+def _pinned_keys(ov: dict, chat: dict) -> list[str]:
+    keys = list(ov.get("prs_pinned") or [])
+    if ov.get("pr"):  # legacy single manual PR (bare number)
+        repo = _chat_default_repo(chat)
+        if repo:
+            keys.append(f"{repo}#{int(ov['pr'])}")
+    return keys
+
+
 @router.get("/chats/{sid}/prs")
 def chat_prs(sid: str) -> dict:
-    """The chat's branch + its PRs enriched with live GitHub status (via `gh`, cached)."""
+    """The chat's branch + its PRs enriched with live GitHub status (via `gh`, cached).
+
+    PRs = the ones this chat CREATED (github.created_prs over the transcript evidence; a
+    pasted/looked-up old PR never qualifies) + any the user pinned, minus any they removed.
+    `source` on each is "created" | "pinned"."""
     chat = sessions.get_chat(sid) or {}
-    repo = chat.get("pr_repo")
-    nums: list = list(chat.get("prs") or [])
-    if chat.get("pr_manual") and chat["pr_manual"] not in nums:
-        nums.append(chat["pr_manual"])
-    out, seen = [], set()
-    for n in nums:
-        if str(n) in seen:
+    ov = sessions.get_overlay(sid)
+    hidden = set(ov.get("prs_hidden") or [])
+    keys = [(k, "created") for k in github.created_prs(chat.get("pr_seen") or {}, chat.get("tool_windows") or [])]
+    keys += [(k, "pinned") for k in _pinned_keys(ov, chat)]
+    out, done = [], set()
+    for key, source in keys:
+        if key in done or key in hidden:
             continue
-        seen.add(str(n))
-        out.append(github.pr_status(repo, n))
+        done.add(key)
+        repo, _, n = key.rpartition("#")
+        out.append({**github.pr_status(repo, int(n)), "source": source})
     return {"branch": chat.get("branch"), "prs": out}
+
+
+class PrRefIn(BaseModel):
+    ref: str  # a PR URL, "#123", or "123" (→ the chat's repo)
+
+
+@router.post("/chats/{sid}/prs")
+def pin_chat_pr(sid: str, body: PrRefIn) -> dict:
+    """Pin a PR to the chat (for one it didn't create, e.g. picked up from elsewhere)."""
+    ref = body.ref.strip()
+    m = re.search(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)", ref)
+    if m:
+        key = f"{m.group(1)}#{int(m.group(2))}"
+    elif re.fullmatch(r"#?\d+", ref):
+        repo = _chat_default_repo(sessions.get_chat(sid) or {})
+        if not repo:
+            raise HTTPException(400, "can't tell which repo — paste the full PR URL")
+        key = f"{repo}#{int(ref.lstrip('#'))}"
+    else:
+        raise HTTPException(400, "expected a PR URL or number")
+    ov = sessions.get_overlay(sid)
+    pinned = [k for k in ov.get("prs_pinned") or [] if k != key] + [key]
+    hidden = [k for k in ov.get("prs_hidden") or [] if k != key]
+    sessions.set_overlay(sid, {"prs_pinned": pinned, "prs_hidden": hidden})
+    return {"key": key}
+
+
+@router.delete("/chats/{sid}/prs")
+def remove_chat_pr(sid: str, repo: str, number: int) -> dict:
+    """Remove a PR chip: unpin it, and hide it if the chat would otherwise detect it."""
+    key = f"{repo}#{number}"
+    ov = sessions.get_overlay(sid)
+    patch: dict = {
+        "prs_pinned": [k for k in ov.get("prs_pinned") or [] if k != key],
+        "prs_hidden": sorted(set(ov.get("prs_hidden") or []) | {key}),
+    }
+    chat = sessions.get_chat(sid) or {}
+    if ov.get("pr") and _pinned_keys({"pr": ov["pr"]}, chat) == [key]:
+        patch["pr"] = None
+    sessions.set_overlay(sid, patch)
+    return {"ok": True}
 
 
 @router.get("/chats/{sid}/brief")

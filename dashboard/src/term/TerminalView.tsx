@@ -940,7 +940,8 @@ export function TerminalView({
           </div>
         </header>
 
-        {chatMeta && (chatMeta.branch || (chatMeta.prs?.length ?? 0) > 0) && (
+        {chatMeta && (
+
           <div className="border-b border-edge bg-surface-2/30 px-5 py-1.5 flex flex-wrap items-center gap-2 text-[11px] mono shrink-0">
             {chatMeta.branch && <span className="px-2 py-0.5 rounded border border-edge text-muted">⎇ {chatMeta.branch}</span>}
             <PrBadges sid={resume} prs={chatMeta.prs ?? []} repo={chatMeta.pr_repo} />

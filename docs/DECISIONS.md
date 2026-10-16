@@ -204,6 +204,22 @@ timeline, decisions attributed you/agent, unasked work, needs-you.
   passed. Closed panels read the cache only.
 Claude transcripts only for now; codex/grok need their own timeline builders.
 
+## D19 — A chat's PRs are the ones it created, proven by GitHub's createdAt (2026-10-16)
+Claude's `pr-link` records were the only PR source, and they're a "current PR" pointer, not
+a ledger: one script that opened #2006 and #2007 got a pr-link for #2006 only. Scanning the
+transcript for any PR URL would fix that but also register every old link the user pastes or
+the agent looks up. The rule instead: **a PR belongs to a chat iff its URL appeared on the
+agent's side (tool output, task notification, subagent transcript, pr-link — never user text)
+AND GitHub's `createdAt` falls inside a window when one of the chat's tool calls was running**
+(±2 min). Background calls stay open until their `<task-notification>` (it names the
+tool-use-id). The parsers store sightings + merged windows in the index (`pr_seen`,
+`tool_windows`; windows kept only when something was sighted); `github.created_prs` checks
+them with one cached GraphQL call per repo (`~/.loom/pr_created.json` — createdAt is
+immutable). Over all local chats: 565 sightings → 448 PRs. The 21 pr-link PRs this drops were
+all created before the chat or by someone else while it was idle (a chat that picked up an
+existing PR). For those, `+ pr` pins one (`prs_pinned`), and × hides a wrong one (`prs_hidden`).
+Offline (gh can't answer), pr-link PRs are still trusted. Grok: no tool output seen yet to parse.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

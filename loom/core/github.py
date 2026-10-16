@@ -9,9 +9,14 @@ Never raises: returns state="unknown" if gh is missing / unauthed / the call fai
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
+from datetime import datetime
+from pathlib import Path
+
+from loom.core.config import LOOM_HOME
 
 _cache: dict[tuple[str, str], tuple[float, dict]] = {}
 _TTL = 60.0  # seconds
@@ -123,3 +128,116 @@ def pr_status(repo: str | None, number: str | int) -> dict:
         })
     _cache[key] = (now, base)
     return base
+
+
+# --- which PRs a chat CREATED -------------------------------------------------------
+# A PR's createdAt never changes, so it's cached on disk forever: {"owner/repo#n": epoch},
+# 0 = no such PR (bad link / no access). Only successful lookups are cached.
+CREATED_CACHE = LOOM_HOME / "pr_created.json"
+_SLACK = 120.0  # seconds of clock skew / gh latency allowed around a tool window
+_created: dict | None = None
+
+
+def _load_created() -> dict:
+    global _created
+    if _created is None:
+        try:
+            _created = json.loads(CREATED_CACHE.read_text())
+        except (OSError, json.JSONDecodeError):
+            _created = {}
+    return _created
+
+
+def _save_created(data: dict) -> None:
+    tmp = CREATED_CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, CREATED_CACHE)
+
+
+def _iso(value: str | None) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def pr_created_at(keys: list[str]) -> dict[str, float]:
+    """{"owner/repo#n": createdAt epoch (0 = no such PR)} for the keys GitHub could answer.
+    Uncached keys are fetched in one GraphQL call per repo (chunks of 50). Keys missing from
+    the result couldn't be checked (gh missing / offline) — the caller decides."""
+    cache = _load_created()
+    missing: dict[str, list[int]] = {}
+    for k in keys:
+        if k not in cache:
+            repo, _, n = k.rpartition("#")
+            missing.setdefault(repo, []).append(int(n))
+    gh = shutil.which("gh")
+    dirty = False
+    for repo, nums in missing.items() if gh else ():
+        owner, _, name = repo.partition("/")
+        for i in range(0, len(nums), 50):
+            chunk = nums[i:i + 50]
+            fields = " ".join(f"p{n}: pullRequest(number: {n}) {{ createdAt }}" for n in chunk)
+            q = f'query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ {fields} }} }}'
+            try:
+                # Not-found PRs make gh exit 1 but still print the partial data — read it anyway.
+                p = subprocess.run([gh, "api", "graphql", "-f", f"query={q}"],
+                                   capture_output=True, text=True, timeout=20)
+                data = (json.loads(p.stdout or "null") or {}).get("data")
+            except Exception:  # noqa: BLE001 — offline/timeout → leave uncached, retry later
+                continue
+            if not isinstance(data, dict):
+                continue
+            node = data.get("repository") or {}
+            for n in chunk:
+                pr = node.get(f"p{n}") if isinstance(node, dict) else None
+                cache[f"{repo}#{n}"] = (_iso(pr.get("createdAt")) or 0.0) if isinstance(pr, dict) else 0.0
+            dirty = True
+    if dirty:
+        try:
+            _save_created(cache)
+        except OSError:
+            pass
+    return {k: cache[k] for k in keys if k in cache}
+
+
+def created_prs(seen: dict, windows: list) -> list[str]:
+    """The "owner/repo#n" keys of PRs the chat itself created, in first-seen order.
+
+    `seen` / `windows` are the transcript evidence from sessions._PrEvidence: PR URLs that
+    appeared on the agent's side, and the spans its tool calls ran. Created here ⇔ GitHub's
+    createdAt falls inside a tool window (± _SLACK). A pasted/looked-up old PR fails that. If
+    GitHub can't be asked, fall back to trusting Claude's own pr-link records (the pre-check
+    behaviour), so an offline loom still shows the obvious ones."""
+    order = sorted(seen, key=lambda k: seen[k][0] or 0)
+    created = pr_created_at(order)
+    out = []
+    for k in order:
+        c = created.get(k)
+        if c is None:
+            if seen[k][1] == "pr-link":
+                out.append(k)
+        elif c and any(s - _SLACK <= c <= e + _SLACK for s, e in windows):
+            out.append(k)
+    return out
+
+
+_repo_for_dir: dict[str, str | None] = {}
+
+
+def repo_for_dir(path: str | None) -> str | None:
+    """"owner/repo" of the GitHub repo a directory belongs to (cached per path)."""
+    if not path or not Path(path).is_dir():
+        return None
+    if path not in _repo_for_dir:
+        gh = shutil.which("gh")
+        repo = None
+        if gh:
+            try:
+                p = subprocess.run([gh, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+                                   cwd=path, capture_output=True, text=True, timeout=15)
+                repo = (p.stdout.strip() or None) if p.returncode == 0 else None
+            except Exception:  # noqa: BLE001
+                repo = None
+        _repo_for_dir[path] = repo
+    return _repo_for_dir[path]
