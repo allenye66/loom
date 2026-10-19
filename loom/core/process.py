@@ -7,6 +7,7 @@ only ever clean up by *this task's* ports — never a blanket pkill.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -71,12 +72,17 @@ def kill_group(pid: int, timeout: float = 5.0) -> None:
         return
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # Reap it if it's our child (spawn() never waits): an unreaped exit lingers as a zombie,
+        # which is_alive() reads as alive — so we'd wait out the full timeout, then SIGKILL a
+        # zombie-only group, which macOS rejects with EPERM.
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
         if not is_alive(pid):
             return
         time.sleep(0.1)
     try:
         os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
 

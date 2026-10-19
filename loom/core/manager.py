@@ -166,14 +166,15 @@ def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> T
     # back, or `{offset}`/`{backend_port}` render literally and the commands break.
     if not task.ports:
         task = reallocate_ports(cfg, task_id) or task
-    if only:
-        # Clean (re)start of just the named services: free their port from whatever is actually
-        # LISTENING now (kill_port is LISTEN-only). Do NOT kill_group(svc.pid) — a stored pid can be
-        # stale/reused and the supervisor calls this on a loop, so acting on current port state
-        # (not a remembered pid) avoids killing an unrelated process. Other services stay running.
-        for svc in task.services:
-            if svc.name in only and svc.port:
-                process.kill_port(svc.port)
+    # Tear down whatever we're about to replace (just the `only` services, else the whole stack)
+    # BEFORE spawning its successor. The port kill alone isn't enough: a server that crashed during
+    # startup but stayed alive (Django's autoreloader on an ImportError) never LISTENs, so
+    # kill_port misses it — and with the supervisor restarting on a loop, every restart orphaned
+    # one more (646 python procs / ~19 GB → swap exhaustion). `_teardown` also group-kills the
+    # stored pid when this run spawned it. Other services stay running.
+    for svc in task.services:
+        if not only or svc.name in only:
+            _teardown(svc)
     procs: list[ServiceProc] = []
     for svc in cfg.services:
         if only and svc.name not in only:
@@ -197,22 +198,38 @@ def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> T
     return registry.upsert(task)
 
 
+def _teardown(svc: ServiceProc) -> None:
+    # Trust a stored pid only if THIS process spawned it: a pid recorded by an earlier
+    # loom run may have been reused by an unrelated process by now (the reaper acts on
+    # weeks-old records). For those, the port kill below — current LISTEN state — is the
+    # safe teardown.
+    if svc.pid and process.spawned_this_run(svc.pid):
+        process.kill_group(svc.pid)
+    if svc.port:
+        process.kill_port(svc.port)
+
+
 def stop_task(task_id: str) -> None:
     task = registry.get_task(task_id)
     if not task:
         return
     for svc in task.services:
-        # Trust a stored pid only if THIS process spawned it: a pid recorded by an earlier
-        # loom run may have been reused by an unrelated process by now (the reaper acts on
-        # weeks-old records). For those, the port kill below — current LISTEN state, same
-        # policy as start_task's `only=` path — is the safe teardown.
-        if svc.pid and process.spawned_this_run(svc.pid):
-            process.kill_group(svc.pid)
-        if svc.port:
-            process.kill_port(svc.port)
+        _teardown(svc)
     task.services = []
     if task.state == TaskState.running:
         task.state = TaskState.stopped
+    registry.upsert(task)
+
+
+def stop_services(task_id: str, names: set[str]) -> None:
+    """Tear down just the named services; the rest of the task's stack keeps running."""
+    task = registry.get_task(task_id)
+    if not task:
+        return
+    for svc in task.services:
+        if svc.name in names:
+            _teardown(svc)
+    task.services = [s for s in task.services if s.name not in names]
     registry.upsert(task)
 
 

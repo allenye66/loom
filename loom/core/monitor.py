@@ -21,6 +21,8 @@ Scope/intent:
     A *reaped* task also lands on `stopped`, so the supervisor won't resurrect it either;
     reopening its chat needs a manual start from the task card.
   • Services without a `health:` URL in `.loom.yaml` aren't probed (we won't blindly restart them).
+  • A service that stays down through `LOOM_SUPERVISE_MAX_RESTARTS` restarts (default 3) is torn
+    down and given up on until you start it again — a broken boot isn't retried forever.
   • Disable with `LOOM_SUPERVISE=0` / `LOOM_REAP=0`; tune with `LOOM_SUPERVISE_INTERVAL`,
     `LOOM_REAP_INTERVAL`, `LOOM_REAP_IDLE_HOURS`.
 """
@@ -56,6 +58,13 @@ _last_restart: dict[str, float] = {}
 _PROBE_TIMEOUT = 5.0
 _DOWN_STREAK = 3
 _down_streaks: dict[tuple[str, str], int] = {}  # (task_id, service) -> consecutive failed probes
+# A service that never comes up (e.g. an ImportError on boot) would otherwise be restarted
+# forever. After _MAX_RESTARTS restarts with no healthy probe in between, the supervisor gives
+# up: it tears the service down and leaves it alone until something else starts it again (the
+# task card's start → it reappears in task.services). Reset by any healthy probe.
+_MAX_RESTARTS = int(os.environ.get("LOOM_SUPERVISE_MAX_RESTARTS", "3"))
+_restarts: dict[tuple[str, str], int] = {}  # (task_id, service) -> restarts since last healthy
+_gave_up: set[tuple[str, str]] = set()
 
 _REAP = os.environ.get("LOOM_REAP", "1") == "1"
 _REAP_INTERVAL = float(os.environ.get("LOOM_REAP_INTERVAL", "600"))  # seconds between reap passes
@@ -87,6 +96,7 @@ def _confirmed_down(task, cfg, down: list[str]) -> list[str]:
                 confirmed.append(svc.name)
         else:
             _down_streaks.pop(key, None)
+            _restarts.pop(key, None)
     return confirmed
 
 
@@ -109,7 +119,12 @@ def _sweep() -> None:
             cfg = load_repo_config(task.repo_root)
         except Exception:  # noqa: BLE001 — missing/garbled .loom.yaml → skip this task
             continue
-        down = _confirmed_down(task, cfg, _down_services(task, cfg))
+        # A given-up service that's back in task.services was started by hand — supervise it afresh.
+        running = {s.name for s in task.services}
+        for key in [k for k in _gave_up if k[0] == task.id and k[1] in running]:
+            _gave_up.discard(key)
+            _restarts.pop(key, None)
+        down = [n for n in _confirmed_down(task, cfg, _down_services(task, cfg)) if (task.id, n) not in _gave_up]
         if not down:
             continue
         # Cooldown: give a just-(re)started service time to come up instead of restarting it again.
@@ -119,6 +134,23 @@ def _sweep() -> None:
         fresh = registry.get_task(task.id)
         if not fresh or fresh.state.value in _SKIP_STATES:
             continue
+        exhausted = {n for n in down if _restarts.get((task.id, n), 0) >= _MAX_RESTARTS}
+        if exhausted:
+            with contextlib.suppress(Exception):
+                manager.stop_services(task.id, exhausted)
+            for name in exhausted:
+                _gave_up.add((task.id, name))
+                _down_streaks.pop((task.id, name), None)
+            print(
+                f"[loom supervisor] {task.id}: gave up on {', '.join(sorted(exhausted))} after "
+                f"{_MAX_RESTARTS} failed restarts — check its log, then start it from the task card",
+                flush=True,
+            )
+            down = [n for n in down if n not in exhausted]
+            if not down:
+                continue
+        for name in down:  # count the attempt even if start_task raises — that's a failure too
+            _restarts[(task.id, name)] = _restarts.get((task.id, name), 0) + 1
         with contextlib.suppress(Exception):
             manager.start_task(cfg, task.id, only=set(down))
             _last_restart[task.id] = time.monotonic()
