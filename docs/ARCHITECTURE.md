@@ -101,11 +101,11 @@ locked per chat), so every slash command / permission prompt / feature works wit
 zero reimplementation. A claude chat runs
 
 ```
-claude --effort max --permission-mode bypassPermissions --settings '{...theme,hooks[,tui]}'
+claude --effort xhigh --permission-mode bypassPermissions --settings '{...theme,hooks[,tui]}'
        [--append-system-prompt <loom-runtime note>] (--resume|--session-id <chat_id>)
 ```
 
-(grok: `--effort max --permission-mode acceptEdits [--no-alt-screen --minimal]`;
+(grok: `--effort xhigh --permission-mode acceptEdits [--no-alt-screen --minimal]`;
 codex: `[resume <bound id>] -c model_reasoning_effort="xhigh"
 --dangerously-bypass-approvals-and-sandbox --search -c notify=[<needs-hook>]
 [--no-alt-screen]` — argv per agent built in `core/agents.py`)

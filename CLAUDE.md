@@ -62,7 +62,7 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   tmux** host only drives a still-live old session. Both scrub `CLAUDECODE`/`CLAUDE_CODE_*`
   from the child so the nested `claude` doesn't inherit auto-approve (see
   `docs/CLAUDE_AGENT_SDK_NOTES.md`).
-- Terminal sessions launch with max effort (and agent-specific flags from
+- Terminal sessions launch with xhigh effort (and agent-specific flags from
   `core/agents.py`). Agent is chosen when creating a task (`agent:
   claude|grok|codex`) and stored sticky in the chat overlay — never switch
   mid-session.

@@ -44,7 +44,7 @@ def _claude() -> str:
     return shutil.which("claude") or "claude"
 
 
-def open_session(worktree_path: str, prompt: str | None = None, prefer: str = "auto", effort: str = "max") -> str:
+def open_session(worktree_path: str, prompt: str | None = None, prefer: str = "auto", effort: str = "xhigh") -> str:
     """Start a fresh Claude session in a worktree, optionally seeding a /skill."""
     inner = f"cd {shlex.quote(worktree_path)} && {shlex.quote(_claude())} --effort {shlex.quote(effort)}"
     if prompt:
@@ -52,7 +52,7 @@ def open_session(worktree_path: str, prompt: str | None = None, prefer: str = "a
     return _launch(inner, label=Path(worktree_path).name, prefer=prefer)
 
 
-def resume_session(cwd: str, session_id: str, fork: bool = False, prefer: str = "auto", effort: str = "max") -> str:
+def resume_session(cwd: str, session_id: str, fork: bool = False, prefer: str = "auto", effort: str = "xhigh") -> str:
     """Reopen an existing chat by id (replaces /resume). `fork` branches it.
 
     Always passes `--effort` so a terminal handoff keeps the same effort as the

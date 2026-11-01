@@ -325,7 +325,7 @@ def build_argv(
             # sessions — codex picks the uuid; loom discovers + binds it after launch.
             argv += ["resume", sid]
         argv += [
-            # loom's `--effort max` analogue (config key verified in 0.160).
+            # Same level as claude's `--effort xhigh` (config key verified in 0.160).
             "-c", "model_reasoning_effort=\"xhigh\"",
             # Parity with claude's bypassPermissions (loom chats live in disposable
             # worktrees). Soften to ["-s", "workspace-write", "-a", "on-request"]
@@ -352,7 +352,7 @@ def build_argv(
         ensure_grok_needs_hook()
         argv = [
             binary("grok"),
-            "--effort", "max",
+            "--effort", "xhigh",  # grok's top level (its levels: low/medium/high/xhigh)
             "--permission-mode", "acceptEdits",
         ]
         # pty host wants native scrollback (no alt-screen); tmux keeps default fullscreen.
@@ -370,7 +370,7 @@ def build_argv(
     settings = _claude_settings(chat_id, fullscreen=fullscreen)
     argv = [
         binary("claude"),
-        "--effort", "max",
+        "--effort", "xhigh",
         "--permission-mode", "bypassPermissions",
         "--settings", json.dumps(settings),
     ]

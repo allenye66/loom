@@ -56,6 +56,8 @@ session* inherits env that auto-approves. So run loom from a plain terminal.
 ## D8 — Sessions run at effort="max" (2026-06-04)
 `ClaudeAgentOptions.effort` defaults to `None` (SDK default, not max), so loom sets
 `effort="max"` explicitly (overridable per session via the `start` message).
+**2026-11-01:** terminal launches now default to `xhigh` (claude `--effort xhigh`, grok
+`--effort xhigh`, codex `model_reasoning_effort="xhigh"`) — Allen's preference over max.
 
 ## D9 — Assistant messages render as markdown (2026-06-04)
 react-markdown + remark-gfm + rehype-highlight. Raw text read as broken.
@@ -177,7 +179,7 @@ link as authoritative over transcript-cwd inference and homes the chat in the ta
 until the first prompt (verified) — same pending-row UX as claude. Zero-content rollouts that
 no loom chat opened are hidden as junk (codex writes env-wrapper records even for untyped
 sessions). Launch flags mirror the claude posture: `model_reasoning_effort="xhigh"` (≈
-`--effort max`), `--dangerously-bypass-approvals-and-sandbox` (≈ `bypassPermissions`, D-adj
+`--effort xhigh`), `--dangerously-bypass-approvals-and-sandbox` (≈ `bypassPermissions`, D-adj
 to taste: `-s workspace-write -a on-request`), `--search`, `--no-alt-screen` on the pty host.
 
 ## D18 — Status briefs: loom summarizes the transcript; the agent doesn't self-report (2026-10-11)
