@@ -6,9 +6,9 @@ import {
   addCategory,
   assignChat,
   claimUnscopedCategories,
-  moveCategory,
   removeCategory,
   renameCategory,
+  setCategoryOrder,
   useCategories,
 } from '../categories/categoriesStore';
 import {
@@ -519,6 +519,37 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     return a && validCatIds.has(a) ? a : null;
   };
   const grouped = !q && categories.length > 0;
+  // The sidebar's groups top to bottom: Uncategorized (always first), then the project's
+  // categories in order. A category can be dragged by its header to move it.
+  const groups: { id: string | null; key: string; name: string }[] = [
+    { id: null, key: 'uncat', name: 'Uncategorized' },
+    ...categories.map((c) => ({ id: c.id, key: c.id, name: c.name })),
+  ];
+  const dragCat = useRef<string | null>(null); // id of the category being dragged (handlers read this)
+  const [draggingCat, setDraggingCat] = useState<string | null>(null); // same, for styling
+  const [catDropAt, setCatDropAt] = useState<{ key: string; after: boolean } | null>(null);
+  const endCatDrag = () => {
+    dragCat.current = null;
+    setDraggingCat(null);
+    setCatDropAt(null);
+  };
+  // Over a group's top half the dragged category lands before it, over its bottom half after it.
+  // Uncategorized stays pinned first, so dropping anywhere on it lands just after it.
+  const dropsAfter = (e: React.DragEvent, key: string) => {
+    if (key === 'uncat') return true;
+    const r = e.currentTarget.getBoundingClientRect();
+    return e.clientY > r.top + r.height / 2;
+  };
+  const dropCat = (toKey: string, after: boolean) => {
+    const from = dragCat.current;
+    endCatDrag();
+    if (!from || from === toKey) return;
+    const keys = groups.map((g) => g.key).filter((k) => k !== from);
+    const ti = keys.indexOf(toKey);
+    if (ti < 0) return;
+    keys.splice(after ? ti + 1 : ti, 0, from);
+    setCategoryOrder(keys.filter((k) => k !== 'uncat'));
+  };
   const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsed);
   const [dragOverGroup, setDragOverGroup] = useState<string | null>(null);
   const [dragOverRow, setDragOverRow] = useState<string | null>(null); // row the drop would land just before
@@ -617,6 +648,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           if (dragId.current && dragId.current !== r.id) setDragOverRow(r.id);
         }}
         onDrop={(e) => {
+          if (dragCat.current) return; // a group is being dragged — its section's drop handles it
           e.preventDefault();
           e.stopPropagation(); // don't also fire the group's drop
           const from = dragId.current;
@@ -693,62 +725,75 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     );
   };
 
-  // A category section header: click anywhere on chevron/name/count to collapse or expand
-  // (Uncategorized is fixed; custom categories can be renamed ✎, reordered ▲▼, deleted ✕).
+  // A category section header: click anywhere on chevron/name/count to collapse or expand.
+  // Custom categories can also be dragged to move the whole group, renamed ✎ and deleted ✕
+  // (Uncategorized is pinned first).
   const renderGroupHeader = (
     g: { id: string | null; key: string; name: string; count: number },
     isColl: boolean,
-  ) => (
-    <div
-      onDragOver={() => setDragOverRow(null)}
-      className="group/gh px-2 py-1.5 flex items-center gap-1 bg-surface/95 sticky top-0 z-[1]"
-    >
-      {renamingCat === g.id && g.id !== null ? (
-        <input
-          autoFocus
-          value={renameDraft}
-          onChange={(e) => setRenameDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') commitRename();
-            if (e.key === 'Escape') setRenamingCat(null);
-          }}
-          onBlur={commitRename}
-          className="flex-1 min-w-0 mono text-[10px] px-1 py-0.5 rounded bg-canvas border border-edge outline-none focus:border-accent"
-        />
-      ) : (
-        <button
-          onClick={() => toggleCollapse(g.key)}
-          aria-expanded={!isColl}
-          title={isColl ? 'expand' : 'collapse'}
-          className="flex-1 min-w-0 flex items-center gap-1.5 text-left text-muted hover:text-ink"
-        >
-          <span className="w-3 shrink-0 text-[11px] leading-none">{isColl ? '▸' : '▾'}</span>
-          <span className="flex-1 min-w-0 text-[10px] mono uppercase tracking-wide truncate">{g.name}</span>
-          <span className="text-[9px] mono shrink-0">{g.count}</span>
-        </button>
-      )}
-      {g.id !== null && (
-        <>
+  ) => {
+    const renaming = g.id !== null && renamingCat === g.id;
+    const movable = g.id !== null && !renaming;
+    return (
+      <div
+        draggable={movable}
+        onDragStart={(e) => {
+          dragCat.current = g.key;
+          setDraggingCat(g.key);
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', g.key); // Firefox needs data set to start a drag
+        }}
+        onDragEnd={endCatDrag}
+        onDragOver={() => setDragOverRow(null)}
+        className={`group/gh px-2 py-1.5 flex items-center gap-1 bg-surface/95 sticky top-0 z-[1] ${
+          movable ? 'cursor-grab active:cursor-grabbing' : ''
+        }`}
+      >
+        {renaming ? (
+          <input
+            autoFocus
+            value={renameDraft}
+            onChange={(e) => setRenameDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') commitRename();
+              if (e.key === 'Escape') setRenamingCat(null);
+            }}
+            onBlur={commitRename}
+            className="flex-1 min-w-0 mono text-[10px] px-1 py-0.5 rounded bg-canvas border border-edge outline-none focus:border-accent"
+          />
+        ) : (
           <button
-            onClick={() => { setRenamingCat(g.id); setRenameDraft(g.name); }}
-            title="rename category"
-            className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-ink shrink-0 leading-none"
+            onClick={() => toggleCollapse(g.key)}
+            aria-expanded={!isColl}
+            title={`${isColl ? 'expand' : 'collapse'}${movable ? ' · drag to move' : ''}`}
+            className="flex-1 min-w-0 flex items-center gap-1.5 text-left text-muted hover:text-ink"
           >
-            ✎
+            <span className="w-3 shrink-0 text-[11px] leading-none">{isColl ? '▸' : '▾'}</span>
+            <span className="flex-1 min-w-0 text-[10px] mono uppercase tracking-wide truncate">{g.name}</span>
+            <span className="text-[9px] mono shrink-0">{g.count}</span>
           </button>
-          <button onClick={() => moveCategory(g.id!, -1)} title="move up" className="opacity-0 group-hover/gh:opacity-100 text-[9px] text-muted hover:text-ink shrink-0 leading-none">▲</button>
-          <button onClick={() => moveCategory(g.id!, 1)} title="move down" className="opacity-0 group-hover/gh:opacity-100 text-[9px] text-muted hover:text-ink shrink-0 leading-none">▼</button>
-          <button
-            onClick={() => { if (confirm(`Delete category "${g.name}"?\n\nChats stay — they move back to Uncategorized.`)) removeCategory(g.id!); }}
-            title="delete category"
-            className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-bad shrink-0 leading-none"
-          >
-            ✕
-          </button>
-        </>
-      )}
-    </div>
-  );
+        )}
+        {g.id !== null && (
+          <>
+            <button
+              onClick={() => { setRenamingCat(g.id); setRenameDraft(g.name); }}
+              title="rename category"
+              className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-ink shrink-0 leading-none"
+            >
+              ✎
+            </button>
+            <button
+              onClick={() => { if (confirm(`Delete category "${g.name}"?\n\nChats stay — they move back to Uncategorized.`)) removeCategory(g.id!); }}
+              title="delete category"
+              className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-bad shrink-0 leading-none"
+            >
+              ✕
+            </button>
+          </>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="w-56 shrink-0 border-r border-edge bg-surface flex flex-col h-full">
@@ -878,13 +923,10 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       {/* Ungrouped list — no categories yet, or while searching. */}
       {!grouped && orderedRows.map((r) => renderRow(r))}
 
-      {/* Grouped by category: Uncategorized first, then each category in order. Drop a chat on
-          a group (or a row within it) to file it there. */}
+      {/* Grouped by category, in the order the groups were dragged into. Drop a chat on a group
+          (or a row within it) to file it there; drop a dragged group header to move that group. */}
       {grouped &&
-        [
-          { id: null as string | null, key: 'uncat', name: 'Uncategorized' },
-          ...categories.map((c) => ({ id: c.id as string | null, key: c.id, name: c.name })),
-        ].map((g) => {
+        groups.map((g) => {
           const groupRows = orderedRows.filter((r) => catOf(r.id) === g.id);
           if (g.id === null && groupRows.length === 0) return null; // hide an empty Uncategorized bucket
           const isColl = collapsed.has(g.key);
@@ -894,15 +936,31 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
               onDragOver={(e) => {
                 if (q) return;
                 e.preventDefault();
+                if (dragCat.current) {
+                  const after = dropsAfter(e, g.key);
+                  if (catDropAt?.key !== g.key || catDropAt.after !== after) setCatDropAt({ key: g.key, after });
+                  return;
+                }
                 if (dragOverGroup !== g.key) setDragOverGroup(g.key);
               }}
               onDragLeave={() => setDragOverGroup((v) => (v === g.key ? null : v))}
               onDrop={(e) => {
                 e.preventDefault();
-                assignTo(g.id);
+                if (dragCat.current) dropCat(g.key, dropsAfter(e, g.key));
+                else assignTo(g.id);
               }}
-              className={dragOverGroup === g.key ? 'bg-accent/5' : ''}
+              className={`relative ${dragOverGroup === g.key ? 'bg-accent/5' : ''} ${
+                draggingCat === g.key ? 'opacity-40' : ''
+              }`}
             >
+              {/* Insertion indicator: the dragged category lands just above / below this group. */}
+              {catDropAt?.key === g.key && draggingCat !== g.key && (
+                <span
+                  className={`pointer-events-none absolute inset-x-1 ${
+                    catDropAt.after ? '-bottom-px' : '-top-px'
+                  } h-0.5 rounded-full bg-accent shadow-[0_0_4px_var(--color-accent)] z-10`}
+                />
+              )}
               {renderGroupHeader({ ...g, count: groupRows.length }, isColl)}
               {!isColl && groupRows.map((r) => renderRow(r, g.id))}
               {!isColl && groupRows.length === 0 && (

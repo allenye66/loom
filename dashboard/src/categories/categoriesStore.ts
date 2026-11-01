@@ -71,11 +71,13 @@ function newId(): string {
   return `cat_${Date.now().toString(36)}_${rnd}`;
 }
 
+/** Make a category. It goes first among its project's categories (just under Uncategorized),
+ *  so it shows up near the top of the sidebar, ready to drag chats into. */
 export function addCategory(name: string, repo?: string): string {
   const n = name.trim();
   if (!n) return '';
   const id = newId();
-  state = { ...state, categories: [...state.categories, { id, name: n, ...(repo ? { repo } : {}) }] };
+  state = { ...state, categories: [{ id, name: n, ...(repo ? { repo } : {}) }, ...state.categories] };
   persist();
   emit();
   return id;
@@ -108,16 +110,15 @@ export function assignChat(chatId: string, categoryId: string | null) {
   emit();
 }
 
-/** Nudge a category one slot up (-1) or down (+1) among its own project's categories. */
-export function moveCategory(id: string, dir: -1 | 1) {
-  const idx = state.categories.findIndex((c) => c.id === id);
-  if (idx < 0) return;
-  const repo = state.categories[idx].repo;
-  let j = idx + dir;
-  while (j >= 0 && j < state.categories.length && state.categories[j].repo !== repo) j += dir;
-  if (j < 0 || j >= state.categories.length) return;
-  const categories = [...state.categories];
-  [categories[idx], categories[j]] = [categories[j], categories[idx]];
+/** Save a new order for some categories after a drag in the sidebar: `ids` = one project's
+ *  categories top to bottom. Every other category keeps its slot in the global list. */
+export function setCategoryOrder(ids: string[]) {
+  const byId = new Map(state.categories.map((c) => [c.id, c]));
+  const ordered = ids.filter((id) => byId.has(id));
+  const moving = new Set(ordered);
+  const queue = ordered.map((id) => byId.get(id)!);
+  // Refill the slots these categories already hold, in their new order.
+  const categories = state.categories.map((c) => (moving.has(c.id) ? queue.shift()! : c));
   state = { ...state, categories };
   persist();
   emit();
