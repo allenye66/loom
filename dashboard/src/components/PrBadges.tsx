@@ -65,7 +65,12 @@ export function PrBadges({ sid, prs, repo }: { sid?: string; prs: (number | stri
     refresh();
   };
 
-  const list: Pr[] = data ?? prs.map((n) => ({ number: n, repo, state: 'unknown' }));
+  // Always in PR-number order (grouped by repo), however they were created or pinned.
+  const list: Pr[] = [...(data ?? prs.map((n) => ({ number: n, repo, state: 'unknown' })))].sort(
+    (a, b) =>
+      (a.repo ?? '').localeCompare(b.repo ?? '') ||
+      String(a.number).localeCompare(String(b.number), undefined, { numeric: true }),
+  );
   return (
     <>
       {list.map((p) => {
