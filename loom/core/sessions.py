@@ -762,13 +762,22 @@ def _is_contentless_junk(r: dict) -> bool:
     it non-empty and it stays on its own). Starred always survives."""
     if r.get("starred"):
         return False
+    # A chat loom deliberately opened a terminal for (overlay carries `opened_at`) is a real
+    # chat the user created — never junk, whatever the transcript holds so far. This covers the
+    # window after a slash command (e.g. `/effort`) but before the first real prompt: claude has
+    # written a transcript of pure command-noise (n_user > 0, no first_prompt/title), which both
+    # disqualifies the chat from `_pending_chat_rows` AND would trip the junk test below, so the
+    # chat would vanish from the sidebar until the first message lands. `/clear`-offspring junk
+    # gets a fresh session id loom never attached a terminal to, so its overlay has no opened_at
+    # → still correctly hidden.
+    if r.get("opened"):
+        return False
     if r.get("name") or r.get("title") or r.get("first_prompt") or r.get("preview") or r.get("n_assistant"):
         return False
     # Codex writes a rollout (session_meta + env wrappers) even for a session nobody
     # typed in, so a zero-content rollout that no loom chat opened/claimed is pure
     # noise — unlike claude, where an untyped session writes no transcript at all.
-    # Loom's own just-opened codex chats survive via `opened` (overlay opened_at).
-    if r.get("agent") == "codex" and not r.get("opened"):
+    if r.get("agent") == "codex":
         return True
     return (r.get("n_user") or 0) > 0
 
