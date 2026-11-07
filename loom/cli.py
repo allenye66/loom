@@ -26,6 +26,7 @@ console = Console()
 app.add_typer(harness.chats_app, name="chats")
 app.add_typer(harness.categories_app, name="categories")
 app.command("whoami")(harness.whoami)
+app.command("projects")(harness.projects)
 
 
 @app.command()

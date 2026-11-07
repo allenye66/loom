@@ -624,6 +624,33 @@ def whoami(as_json: bool = typer.Option(False, "--json")) -> None:
     _print_meta(w, c)
 
 
+def projects(as_json: bool = typer.Option(False, "--json")) -> None:
+    """The user's projects (registered repos) with their chat counts; * = this chat's / cwd's."""
+    w = _World()
+    here = w.default_project()
+    data = []
+    for r in _api("GET", "/repos")["repos"]:
+        mine = [c for c in w.loom_chats if c.get("repo") == r["name"]]
+        active = [c for c in mine if not c.get("archived") and not c.get("hidden")]
+        data.append({
+            "name": r["name"],
+            "root": r.get("root"),
+            "current": r["name"] == here,
+            "active": len(active),
+            "archived": sum(1 for c in mine if c.get("archived")),
+            "working": sum(1 for c in active if w.status(c["id"]) == "working"),
+            "needs_you": sum(1 for c in active if w.status(c["id"]) in ("needs-you", "blocked")),
+        })
+    if as_json:
+        _out_json(data)
+        return
+    _table(
+        ["", "PROJECT", "ACTIVE", "WORKING", "NEEDS-YOU", "ARCHIVED", "ROOT"],
+        [["*" if d["current"] else "", d["name"], str(d["active"]), str(d["working"]), str(d["needs_you"]),
+          str(d["archived"]), d["root"] or "-"] for d in data],
+    )
+
+
 # --- categories -----------------------------------------------------------------------------
 def _cat_scope(w: _World, project: str | None, all_projects: bool) -> tuple[list[dict], str | None]:
     proj = None if all_projects else (project or w.default_project())

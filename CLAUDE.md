@@ -75,8 +75,9 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   → rollout cwd-scan) and resume goes through `codex resume <that id>`. See
   `docs/DECISIONS.md` D17 before touching that flow.
 - **loom is self-aware (D20)**: every chat's agent is told (system-prompt `<loom-harness>` note)
-  it can drive loom with `loom chats …` / `loom categories …` / `loom whoami` (`loom/harness.py`,
-  a thin client of the running server). Categories are server-side (`~/.loom/categories.json`).
+  it can drive loom with `loom chats …` / `loom categories …` / `loom whoami` / `loom projects`
+  (`loom/harness.py`, a thin client of the running server), scoped to the chat's own project
+  unless told `--project` / `-A`. Categories are server-side (`~/.loom/categories.json`).
   Archiving a chat also stops its agent.
 - Match the existing code style; keep Python imports at top of file.
 

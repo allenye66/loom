@@ -64,8 +64,11 @@ loom chats archive <id...>                   # archive (also stops its agent) ·
 loom chats categorize <id...> Payments --create
 loom chats spawn --branch fix-x --prompt "…handoff…" --category Payments
 loom chats send <id> "also cover the refund path"
-loom categories ls · loom whoami
+loom categories ls · loom whoami · loom projects
 ```
+
+Commands default to the chat's own project (or the repo you're `cd`'d into); add
+`--project NAME` for another one, or `-A` to `ls` / `categories ls` for every project.
 
 ## How isolation works (Phase 1)
 

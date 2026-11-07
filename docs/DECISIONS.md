@@ -237,6 +237,12 @@ only a UI around them. Decisions:
   the live agent processes, and one writer avoids racing the dashboard. Output is plain text
   (chat titles contain `[brackets]` that rich would eat as markup), `--json` for scripting,
   `ls --ids | xargs …` for bulk. Chat refs: id, unique prefix, name, branch, task, or `self`.
+- **Project-scoped by default.** The user runs several projects at once, and "archive all the
+  idle chats" said inside a Payments-repo chat means that project's chats. So `ls`, `spawn` and
+  `categories` default to the caller chat's project (else the repo containing the cwd; `spawn`
+  with neither asks which). `--project NAME` picks another, `-A` means every project, and
+  `loom projects` lists them. Chat refs resolve across projects (an id names one chat
+  anywhere); categories stay per project, so filing a chat uses its own project's categories.
 - **Categories moved server-side** (`~/.loom/categories.json`, `core/categories.py`). They lived
   in localStorage, invisible to any agent. The dashboard store keeps its API (optimistic update →
   adopt the server's response, 4 s poll so agent edits appear), imports a browser's legacy
