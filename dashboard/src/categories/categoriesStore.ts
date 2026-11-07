@@ -1,9 +1,17 @@
 /**
- * User-defined chat categories + which category each chat sits in, persisted to this
- * browser's localStorage. Drives the sidebar's category groups. Each category belongs to one
- * project (`repo`), so every project has its own set. Same tiny-external-store shape as
- * notesStore: a module-level value replaced on each change, exposed via a
- * `useSyncExternalStore` hook, synced across tabs through the `storage` event.
+ * User-defined chat categories + which category each chat sits in. Drives the sidebar's
+ * category groups. Each category belongs to one project (`repo`), so every project has its own
+ * set.
+ *
+ * Server-side (`~/.loom/categories.json` via /api/categories) so loom's agents can see and
+ * change them too (`loom chats categorize …`, D20). This module is a tiny external store over
+ * that: a module-level value replaced on each change, exposed via a `useSyncExternalStore`
+ * hook. Mutations apply optimistically, then adopt the server's state from the response; a
+ * light poll (while anything is subscribed) picks up changes made by agents or other tabs.
+ *
+ * Categories used to live in this browser's localStorage (`loom.chatCategories`). The first
+ * load imports them into the server once (an idempotent merge) and leaves the old key in place
+ * as a backup.
  */
 import { useSyncExternalStore } from 'react';
 
@@ -15,55 +23,127 @@ type State = {
   assign: Record<string, string>; // chatId -> categoryId
 };
 
-const KEY = 'loom.chatCategories';
+const LEGACY_KEY = 'loom.chatCategories';
+const IMPORTED_KEY = 'loom.chatCategories.importedToServer';
+const POLL_MS = 4000;
 
-function load(): State {
+let state: State = { categories: [], assign: {} };
+let loaded = false;
+const listeners = new Set<() => void>();
+const emit = () => listeners.forEach((l) => l());
+
+function sanitize(raw: any): State {
+  const categories = Array.isArray(raw?.categories)
+    ? raw.categories
+        .filter((c: any) => c && typeof c.id === 'string' && typeof c.name === 'string')
+        .map((c: any) => ({ id: c.id, name: c.name, ...(typeof c.repo === 'string' ? { repo: c.repo } : {}) }))
+    : [];
+  const assign =
+    raw?.assign && typeof raw.assign === 'object'
+      ? Object.fromEntries(Object.entries(raw.assign as Record<string, unknown>).filter(([, v]) => typeof v === 'string'))
+      : {};
+  return { categories, assign: assign as Record<string, string> };
+}
+
+/** Adopt a server state, notifying only if it actually changed (the poll mustn't re-render). */
+function adopt(next: State) {
+  loaded = true;
+  if (JSON.stringify(next) === JSON.stringify(state)) return;
+  state = next;
+  emit();
+}
+
+async function call(method: string, path: string, body?: unknown): Promise<void> {
   try {
-    const raw = JSON.parse(localStorage.getItem(KEY) || '{}');
-    const categories = Array.isArray(raw?.categories)
-      ? raw.categories
-          .filter((c: any) => c && typeof c.id === 'string' && typeof c.name === 'string')
-          .map((c: any) => ({ id: c.id, name: c.name, ...(typeof c.repo === 'string' ? { repo: c.repo } : {}) }))
-      : [];
-    const assign =
-      raw?.assign && typeof raw.assign === 'object'
-        ? Object.fromEntries(
-            Object.entries(raw.assign as Record<string, unknown>).filter(
-              ([, v]) => typeof v === 'string',
-            ),
-          )
-        : {};
-    return { categories, assign: assign as Record<string, string> };
+    const r = await fetch(`/api${path}`, {
+      method,
+      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (r.ok) adopt(sanitize(await r.json()));
+    else void refresh(); // rejected → resync from the server instead of keeping the optimistic guess
   } catch {
-    return { categories: [], assign: {} };
+    /* offline — the next poll resyncs */
   }
 }
 
-let state: State = load();
-const listeners = new Set<() => void>();
-const emit = () => listeners.forEach((l) => l());
+/** One-time import of this browser's legacy localStorage categories into the server. */
+async function importLegacy(): Promise<void> {
+  let legacy: State;
+  try {
+    if (localStorage.getItem(IMPORTED_KEY)) return;
+    legacy = sanitize(JSON.parse(localStorage.getItem(LEGACY_KEY) || '{}'));
+  } catch {
+    return;
+  }
+  if (legacy.categories.length === 0 && Object.keys(legacy.assign).length === 0) {
+    try {
+      localStorage.setItem(IMPORTED_KEY, '1');
+    } catch {
+      /* private mode */
+    }
+    return;
+  }
+  const r = await fetch('/api/categories-import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(legacy),
+  });
+  if (!r.ok) return; // try again next load
+  adopt(sanitize(await r.json()));
+  try {
+    localStorage.setItem(IMPORTED_KEY, '1');
+  } catch {
+    /* private mode — the import is idempotent, so re-running it next load is harmless */
+  }
+}
+
+let refreshing: Promise<void> | null = null;
+function refresh(): Promise<void> {
+  refreshing ??= (async () => {
+    try {
+      if (!loaded) await importLegacy();
+      const r = await fetch('/api/categories');
+      if (r.ok) adopt(sanitize(await r.json()));
+      else if (r.status === 404 && !loaded) {
+        // A loom server older than this dashboard (rebuilt but not restarted yet): show this
+        // browser's legacy categories so the sidebar doesn't look emptied. `loaded` stays false,
+        // so the import runs as soon as the server knows /api/categories.
+        const legacy = sanitize(JSON.parse(localStorage.getItem(LEGACY_KEY) || '{}'));
+        if (JSON.stringify(legacy) !== JSON.stringify(state)) setLocal(legacy);
+      }
+    } catch {
+      /* server down — keep what we have */
+    } finally {
+      refreshing = null;
+    }
+  })();
+  return refreshing;
+}
+
+let pollTimer: number | undefined;
+const onFocus = () => void refresh();
 const subscribe = (fn: () => void) => {
   listeners.add(fn);
+  if (listeners.size === 1) {
+    void refresh();
+    pollTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refresh();
+    }, POLL_MS);
+    window.addEventListener('focus', onFocus);
+  }
   return () => {
     listeners.delete(fn);
+    if (listeners.size === 0) {
+      window.clearInterval(pollTimer);
+      window.removeEventListener('focus', onFocus);
+    }
   };
 };
 
-function persist() {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(state));
-  } catch {
-    /* private mode / quota — categories just won't persist this session */
-  }
-}
-
-if (typeof window !== 'undefined') {
-  window.addEventListener('storage', (e) => {
-    if (e.key === KEY) {
-      state = load();
-      emit();
-    }
-  });
+function setLocal(next: State) {
+  state = next;
+  emit();
 }
 
 function newId(): string {
@@ -77,27 +157,24 @@ export function addCategory(name: string, repo?: string): string {
   const n = name.trim();
   if (!n) return '';
   const id = newId();
-  state = { ...state, categories: [{ id, name: n, ...(repo ? { repo } : {}) }, ...state.categories] };
-  persist();
-  emit();
+  setLocal({ ...state, categories: [{ id, name: n, ...(repo ? { repo } : {}) }, ...state.categories] });
+  void call('POST', '/categories', { id, name: n, repo: repo ?? null });
   return id;
 }
 
 export function renameCategory(id: string, name: string) {
   const n = name.trim();
   if (!n) return;
-  state = { ...state, categories: state.categories.map((c) => (c.id === id ? { ...c, name: n } : c)) };
-  persist();
-  emit();
+  setLocal({ ...state, categories: state.categories.map((c) => (c.id === id ? { ...c, name: n } : c)) });
+  void call('PATCH', `/categories/${encodeURIComponent(id)}`, { name: n });
 }
 
 /** Drop a category — its chats fall back to Uncategorized (their assignments are cleared). */
 export function removeCategory(id: string) {
   const assign = { ...state.assign };
   for (const k of Object.keys(assign)) if (assign[k] === id) delete assign[k];
-  state = { categories: state.categories.filter((c) => c.id !== id), assign };
-  persist();
-  emit();
+  setLocal({ categories: state.categories.filter((c) => c.id !== id), assign });
+  void call('DELETE', `/categories/${encodeURIComponent(id)}`);
 }
 
 /** Assign a chat to a category, or pass null to move it back to Uncategorized. */
@@ -105,9 +182,8 @@ export function assignChat(chatId: string, categoryId: string | null) {
   const assign = { ...state.assign };
   if (!categoryId) delete assign[chatId];
   else assign[chatId] = categoryId;
-  state = { ...state, assign };
-  persist();
-  emit();
+  setLocal({ ...state, assign });
+  void call('PUT', '/categories-assign', { chat_ids: [chatId], category_id: categoryId });
 }
 
 /** Save a new order for some categories after a drag in the sidebar: `ids` = one project's
@@ -118,23 +194,25 @@ export function setCategoryOrder(ids: string[]) {
   const moving = new Set(ordered);
   const queue = ordered.map((id) => byId.get(id)!);
   // Refill the slots these categories already hold, in their new order.
-  const categories = state.categories.map((c) => (moving.has(c.id) ? queue.shift()! : c));
-  state = { ...state, categories };
-  persist();
-  emit();
+  setLocal({ ...state, categories: state.categories.map((c) => (moving.has(c.id) ? queue.shift()! : c)) });
+  void call('PUT', '/categories-order', { ids: ordered });
 }
 
 /** File every category that has no project yet under `pick(its chat ids)`. A no-op once all
- *  are filed, so it's cheap to call on every chat-list refresh. */
+ *  are filed, so it's cheap to call on every chat-list refresh. Waits for the first server
+ *  load so it never files categories it hasn't seen yet. */
 export function claimUnscopedCategories(pick: (chatIds: string[]) => string) {
-  if (!state.categories.some((c) => !c.repo)) return;
+  if (!loaded || !state.categories.some((c) => !c.repo)) return;
   const chatsIn = (catId: string) => Object.keys(state.assign).filter((k) => state.assign[k] === catId);
-  state = {
+  const claims = state.categories.filter((c) => !c.repo).map((c) => ({ id: c.id, repo: pick(chatsIn(c.id)) }));
+  setLocal({
     ...state,
-    categories: state.categories.map((c) => (c.repo ? c : { ...c, repo: pick(chatsIn(c.id)) })),
-  };
-  persist();
-  emit();
+    categories: state.categories.map((c) => {
+      const cl = claims.find((x) => x.id === c.id);
+      return cl && cl.repo ? { ...c, repo: cl.repo } : c;
+    }),
+  });
+  for (const cl of claims) if (cl.repo) void call('PATCH', `/categories/${encodeURIComponent(cl.id)}`, { repo: cl.repo });
 }
 
 export function useCategories(): State {

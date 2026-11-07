@@ -74,6 +74,10 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   binds the discovered native id as `agent_session_id` post-launch (notify hook
   → rollout cwd-scan) and resume goes through `codex resume <that id>`. See
   `docs/DECISIONS.md` D17 before touching that flow.
+- **loom is self-aware (D20)**: every chat's agent is told (system-prompt `<loom-harness>` note)
+  it can drive loom with `loom chats …` / `loom categories …` / `loom whoami` (`loom/harness.py`,
+  a thin client of the running server). Categories are server-side (`~/.loom/categories.json`).
+  Archiving a chat also stops its agent.
 - Match the existing code style; keep Python imports at top of file.
 
 ## Docs
@@ -97,6 +101,9 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 - **Sidebar-first shell** — the chat rail *is* the app (no separate Tasks/Chats pages):
   loom's task chats with active/archived tabs, search, drag-to-reorder, collapsible
   categories, per-chat needs-you / working status, and notes.
+- **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
+  categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
+  working on a handoff prompt).
 - **In-chat tools** — dev-stack start/stop + FE/BE/test logs, transcript search,
   copy-text panel, ⌘↑/⌘↓ message jumps, image drop, PR badges, Claude usage chip,
   `⧉ terminal` (plain shell in the worktree), open-in-editor.

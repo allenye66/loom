@@ -222,6 +222,54 @@ all created before the chat or by someone else while it was idle (a chat that pi
 existing PR). For those, `+ pr` pins one (`prs_pinned`), and × hides a wrong one (`prs_hidden`).
 Offline (gh can't answer), pr-link PRs are still trusted. Grok: no tool output seen yet to parse.
 
+## D20 — loom is self-aware: agents drive loom through the `loom chats` CLI (2026-11-06)
+Goal: tell the agent in any chat "close and archive these", "hand this off to a new loom
+session", "break down every active chat in category X" — loom as a tool the agents use, not
+only a UI around them. Decisions:
+- **Interface = a CLI + a system-prompt note, not MCP.** `loom chats ls|show|brief|archive|
+  unarchive|close|star|rename|categorize|spawn|send|open`, `loom categories ls|add|rm|rename`,
+  `loom whoami` (`loom/harness.py`). It works the same in claude, grok and codex (all have a
+  shell), from a Claude outside loom, and by hand. Every chat gets a short `<loom-harness>` note
+  (`runtime.HARNESS_NOTE`, appended to the worktree note) plus `LOOM_CHAT_ID` (who `self` is),
+  `LOOM_API_URL` (set by `loom serve`, so a chat reaches the server that launched it) and loom's
+  venv bin on PATH. An MCP wrapper can come later if typed tools are wanted.
+- **The CLI is a thin HTTP client of the running server**, never the JSON files: the server owns
+  the live agent processes, and one writer avoids racing the dashboard. Output is plain text
+  (chat titles contain `[brackets]` that rich would eat as markup), `--json` for scripting,
+  `ls --ids | xargs …` for bulk. Chat refs: id, unique prefix, name, branch, task, or `self`.
+- **Categories moved server-side** (`~/.loom/categories.json`, `core/categories.py`). They lived
+  in localStorage, invisible to any agent. The dashboard store keeps its API (optimistic update →
+  adopt the server's response, 4 s poll so agent edits appear), imports a browser's legacy
+  localStorage categories once (idempotent merge: missing ids appended, a chat's assignment only
+  if the server has none; the old key is left as a backup), and shows the legacy ones read-only
+  if the server is older than the dashboard (rebuilt, not yet restarted).
+- **Archive stops the agent.** Archiving already stopped the dev stack and freed ports; the agent
+  process kept running behind an archived chat. Now `PATCH archived:true` also closes it (the
+  sidebar ⊘ too) — except when the caller is that chat itself (`X-Loom-Chat` header), which would
+  kill the turn asking. `close` = stop the agent but stay active. Transcripts stay (D16); reopening
+  or `send` resumes. Open tabs get `{type:"exit"}` ("exited — close and reopen").
+- **Headless start.** A chat's agent used to start only when a browser attached. `start_chat`
+  launches it with no subscriber; `spawn` = `create_task` + category + `start_chat`. The first
+  message rides as the CLI's trailing positional prompt (claude `[prompt]`, grok `[PROMPT]`,
+  codex `[PROMPT]`; brand-new sessions only) — no typing into a TUI that's still booting. Verified:
+  a headless claude answers in ~5 s, and opening it later in the browser shows the full exchange.
+- **`send` types through the normal input funnel** (bracketed paste so multi-line stays one
+  message, 0.3 s, then Enter), so the /clear guard still applies and a busy agent queues it. A
+  stopped chat is resumed first (wait until its output goes quiet). It refuses (409) to splice into
+  someone's draft: the composer line is known non-empty, or unknown (cursor keys since the last
+  submit) within 2 min of real keystrokes. Testing this found that **focus reports (`ESC[I`/`ESC[O`,
+  sent on every click into the terminal) tainted the line tracker** — the /clear guard (D16)
+  failed open from the first click. They're now transparent, like mouse reports.
+- **Claude's folder-trust prompt is reported, never answered.** A repo Claude has never trusted (a
+  worktree inherits its main repo's trust) opens on "Is this a project you trust?", defaulting to
+  "No, exit"; a headless first message waits behind it. `waiting_on()` spots it in the output tail,
+  `spawn` warns, `ls`/`show` say `blocked`, and `send` refuses (its Enter would pick "No, exit").
+  Answering a security prompt for the user is not loom's call. (In the browser the prompt can paint
+  blank until you click into the pane — the focus report makes claude redraw it.)
+- Guard rails: an agent can't `close` or `send` to itself without `--force`; bulk verbs take
+  `--dry-run`; the note says "only act on other chats when the user asks"; spawned chats record
+  `spawned_by` (shown by `show`).
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

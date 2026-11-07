@@ -50,6 +50,23 @@ loom ls
 loom rm my-feature
 ```
 
+### Agents that drive loom
+
+Every chat's agent knows it runs inside loom, so you can ask it things like "archive all the
+chats in Payments", "spawn a new loom session and hand this off", or "give me a breakdown of
+every active chat in this category". It uses the same CLI you can run yourself:
+
+```bash
+loom chats ls --category Payments            # status, category, branch, recency (--json, --ids)
+loom chats show <id> --tail 10               # details + the end of its conversation
+loom chats brief <id>                        # loom's status brief (goal, status, needs-you)
+loom chats archive <id...>                   # archive (also stops its agent) · close = just stop
+loom chats categorize <id...> Payments --create
+loom chats spawn --branch fix-x --prompt "…handoff…" --category Payments
+loom chats send <id> "also cover the refund path"
+loom categories ls · loom whoami
+```
+
 ## How isolation works (Phase 1)
 
 | Concern | Approach |
@@ -86,5 +103,6 @@ projects/           # reference .loom.yaml configs
 
 Working: worktree tasks with isolated ports + test runs; per-worktree dev stacks
 (start/stop from each chat, kept up while the chat is open); and the in-browser agent
-terminal (claude / grok / codex) with the chat sidebar. Not built: a live preview of a
+terminal (claude / grok / codex) with the chat sidebar; agents that manage loom's chats
+themselves (`loom chats …`). Not built: a live preview of a
 worktree's app inside the dashboard. See `docs/ARCHITECTURE.md` § Roadmap.

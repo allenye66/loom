@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from loom import harness
 from loom.core import claude_session
 from loom.core import doctor as doctor_mod
 from loom.core import manager, registry
@@ -19,6 +20,12 @@ from loom.core.tests import build_test_run, serialize_lock
 
 app = typer.Typer(no_args_is_help=True, add_completion=False, help="parallel git-worktree dev orchestrator")
 console = Console()
+
+# The agent-facing harness (loom/harness.py): see + drive loom's chats from any shell — every
+# loom chat's agent is told about these in its system prompt.
+app.add_typer(harness.chats_app, name="chats")
+app.add_typer(harness.categories_app, name="categories")
+app.command("whoami")(harness.whoami)
 
 
 @app.command()
@@ -43,6 +50,8 @@ def serve(
     import uvicorn
 
     url = f"http://{host}:{port}"
+    # Chats this server launches inherit it, so their `loom` CLI talks to THIS server.
+    os.environ["LOOM_API_URL"] = url
     console.print(f"[bold magenta]loom[/] → {url}")
     if open_browser:
         with contextlib.suppress(Exception):

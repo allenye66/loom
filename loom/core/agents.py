@@ -21,7 +21,7 @@ from typing import Literal
 from urllib.parse import quote
 
 from loom.core.config import LOOM_HOME
-from loom.core.runtime import _loom_runtime
+from loom.core.runtime import agent_note, harness_env
 
 AgentId = Literal["claude", "grok", "codex"]
 AGENTS: tuple[AgentId, ...] = ("claude", "grok", "codex")
@@ -308,14 +308,24 @@ def build_argv(
     *,
     fullscreen: bool,
     agent_session_id: str | None = None,
+    initial_prompt: str | None = None,
 ) -> list[str]:
     """CLI argv for a new or resumed session under the given agent.
 
     `agent_session_id` is the agent-native session id when it differs from the loom
     chat id — only codex today (codex mints its own id; terminals.py binds it into
-    the overlay post-launch and passes it here for resume)."""
-    _, note = _loom_runtime(cwd)
+    the overlay post-launch and passes it here for resume).
+
+    `initial_prompt` = the first message of a brand-new session (headless `loom chats
+    spawn`): all three CLIs take a trailing positional prompt that starts the interactive
+    session already working on it. Ignored on resume (a resumed chat gets the message typed
+    in instead — terminals.send_text)."""
+    note = agent_note(cwd)
     exists = session_exists(agent, agent_session_id or chat_id, cwd)
+    # Trailing positional; a leading "-" would parse as a flag, so pad it.
+    tail: list[str] = []
+    if initial_prompt and not exists:
+        tail = [(" " + initial_prompt) if initial_prompt.startswith("-") else initial_prompt]
 
     if agent == "codex":
         sid = agent_session_id or chat_id
@@ -346,7 +356,7 @@ def build_argv(
             # Best-effort injection of the per-worktree runtime note; the LOOM_* env
             # vars carry the same facts regardless.
             argv += ["-c", f"developer_instructions={json.dumps(note)}"]
-        return argv
+        return argv + tail
 
     if agent == "grok":
         ensure_grok_needs_hook()
@@ -364,7 +374,7 @@ def build_argv(
             argv += ["--resume", chat_id]
         else:
             argv += ["--session-id", chat_id]
-        return argv
+        return argv + tail
 
     # --- claude ---
     settings = _claude_settings(chat_id, fullscreen=fullscreen)
@@ -380,7 +390,7 @@ def build_argv(
         argv += ["--resume", chat_id]
     else:
         argv += ["--session-id", chat_id]
-    return argv
+    return argv + tail
 
 
 def child_env(agent: AgentId, chat_id: str, base: dict[str, str]) -> dict[str, str]:
@@ -389,6 +399,7 @@ def child_env(agent: AgentId, chat_id: str, base: dict[str, str]) -> dict[str, s
     env["TERM"] = env.get("TERM") or "xterm-256color"
     env["LOOM_AGENT"] = agent
     env["LOOM_CHAT_ID"] = chat_id
+    env.update(harness_env())  # LOOM_API_URL + loom's bin on PATH → the `loom` CLI works in-chat
     if agent == "grok":
         NEEDS_DIR.mkdir(parents=True, exist_ok=True)
         env["LOOM_NEEDS_MARK"] = str(_marker_path(chat_id))

@@ -747,6 +747,7 @@ def _merge(s: dict, resolve=None) -> dict:
         "deleted": ov.get("deleted", False),  # trashed = unlisted everywhere (transcript untouched)
         "mode": ov.get("mode"),  # "chat" | "terminal" | None (not yet chosen)
         "opened": bool(ov.get("opened_at")),  # loom ever attached a terminal to this chat
+        "spawned_by": ov.get("spawned_by"),  # the chat that handed this one off (`loom chats spawn`)
     }
 
 

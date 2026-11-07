@@ -127,11 +127,14 @@ def _codex_session_id(chat_id: str, cwd: str | None, *, fresh_after: float | Non
     return asid
 
 
-def _agent_argv(chat_id: str, cwd: str | None, *, fullscreen: bool) -> list[str]:
-    """Build argv for the chat's locked agent (resume if transcript exists, else mint id)."""
+def _agent_argv(chat_id: str, cwd: str | None, *, fullscreen: bool, initial_prompt: str | None = None) -> list[str]:
+    """Build argv for the chat's locked agent (resume if transcript exists, else mint id).
+    `initial_prompt` = the first message for a brand-new session (headless spawn)."""
     agent = _agent_for(chat_id)
     asid = _codex_session_id(chat_id, cwd) if agent == "codex" else None
-    return agents.build_argv(agent, chat_id, cwd, fullscreen=fullscreen, agent_session_id=asid)
+    return agents.build_argv(
+        agent, chat_id, cwd, fullscreen=fullscreen, agent_session_id=asid, initial_prompt=initial_prompt,
+    )
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -165,6 +168,10 @@ class _SessionBase:
         # from the input stream instead (clear_needs_on_typing, set by open_terminal).
         self._typed = False
         self.clear_needs_on_typing = False
+        self.last_input = 0.0  # monotonic time of the last input written (keystrokes or loom's own)
+        # First message for a brand-new session, passed as the CLI's startup prompt (headless
+        # spawn — see start_chat). Consumed by the launch; never reused on a relaunch.
+        self.initial_prompt: str | None = None
         self.subscribers: set = set()
         self.backlog = bytearray()
         self.outq: asyncio.Queue = asyncio.Queue()
@@ -277,6 +284,14 @@ class _SessionBase:
                     out += data[i:mend]
                     i = mend
                     continue
+                # Focus reports (ESC[I / ESC[O — the agents enable ?1004h, so xterm sends one every
+                # time the terminal gains/loses focus, i.e. on the click before you type) aren't
+                # composer edits either. Tainting on them made the line unknowable from the first
+                # click — the /clear guard failed open and `loom chats send` couldn't see a draft.
+                if data[i + 1:i + 3] in (b"[I", b"[O"):
+                    out += data[i:i + 3]
+                    i += 3
+                    continue
                 self._line_buf = None  # real (non-mouse) escape sequence → composer state unknowable
                 out.append(b)
                 i += 1
@@ -334,6 +349,7 @@ class _SessionBase:
     def write(self, data: bytes) -> None:
         if self._write_fd() is None or not data:
             return
+        self.last_input = time.monotonic()
         data = self._guard_input(data)
         if self._typed:
             self._typed = False
@@ -577,6 +593,7 @@ class TmuxTerminalSession(_SessionBase):
     async def close(self) -> None:
         """Hard stop: kill the tmux session + PTY (used on delete / backend switch)."""
         self._closed = True
+        await self._broadcast_json({"type": "exit"})
         self._detach_pty()
         tm = _tmux()
         if tm:
@@ -762,8 +779,9 @@ class PtyTerminalSession(_SessionBase):
             sys.executable, "-m", "loom.core.pty_server", self.socket_path,
             "--rows", str(self.rows), "--cols", str(self.cols),
             "--cwd", cwd, "--",
-            *_agent_argv(self.chat_id, self.cwd, fullscreen=False),
+            *_agent_argv(self.chat_id, self.cwd, fullscreen=False, initial_prompt=self.initial_prompt),
         ]
+        self.initial_prompt = None  # one launch only — a later relaunch resumes, never re-sends
         # Daemon logs (its stderr) go to a per-session file — with DEVNULL a failed
         # launch would be undiagnosable.
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -855,6 +873,7 @@ class PtyTerminalSession(_SessionBase):
         backend switch. A plain browser-tab close is just unsubscribe — the daemon (and
         claude) keep running."""
         self._closed = True
+        await self._broadcast_json({"type": "exit"})  # open tabs show "exited — reopen to resume"
         self._detach_socket()
         await asyncio.get_running_loop().run_in_executor(None, kill_session, self.socket_path)
         with contextlib.suppress(Exception):
@@ -900,22 +919,60 @@ def get(key: str) -> _SessionBase | None:
     return _registry.get(key)
 
 
-def list_active() -> list[dict]:
+def list_active(detached: bool = False) -> list[dict]:
     """Per live terminal session: seconds since last output (`idle_sec`) + whether claude has
     signaled it's waiting on you (`needs`, from the hook marker). The sidebar shows a 'working'
     pulse from `idle_sec` and a 'needs you' dot from `needs`. Only sessions currently
-    attached (i.e. opened this loom run)."""
+    attached (i.e. opened this loom run) — unless `detached`, which also lists agents whose
+    pty daemon is alive but that loom hasn't re-attached since a restart (`attached: false`,
+    `idle_sec: null` — loom isn't reading their output, so it can't tell working from idle).
+    Blocking (socket-dir scan) when `detached` — call off the event loop."""
     now = time.monotonic()
     out: list[dict] = []
-    for ts in _registry.values():
+    for ts in list(_registry.values()):
         if not ts.attached:
             continue  # not attached / claude exited
         out.append({
             "chat_id": ts.chat_id,
             "idle_sec": round(now - ts.last_output, 1),
             "needs": _marker_path(ts.chat_id).exists(),
+            "attached": True,
+            "waiting_on": waiting_on(ts),
         })
+    if detached:
+        seen = {d["chat_id"] for d in out}
+        for cid in _alive_daemon_ids():
+            if cid not in seen:
+                out.append({
+                    "chat_id": cid, "idle_sec": None, "needs": _marker_path(cid).exists(),
+                    "attached": False, "waiting_on": None,
+                })
     return out
+
+
+def _alive_daemon_ids() -> list[str]:
+    """Chat ids whose pty daemon is running (whether or not loom is attached to it). A socket
+    is named from the chat id (`session_name`), which is the id itself for every uuid chat id."""
+    out: list[str] = []
+    with contextlib.suppress(OSError):
+        for p in _SOCK_DIR.glob("loomx-*.sock"):
+            if is_session_alive(str(p)):
+                out.append(p.name[len("loomx-"):-len(".sock")])
+    return out
+
+
+def process_alive(chat_id: str) -> bool:
+    """Is this chat's agent process running at all (attached or not, pty or legacy tmux)?
+    Blocking — call via run_in_executor on the loop."""
+    ts = _registry.get(chat_id)
+    if ts is not None and ts.attached:
+        return True
+    if is_session_alive(_socket_path(chat_id)):
+        return True
+    tm = _tmux()
+    return bool(tm) and subprocess.run(
+        [tm, "has-session", "-t", session_name(chat_id)], capture_output=True,
+    ).returncode == 0
 
 
 def active_sessions() -> list[_SessionBase]:
@@ -965,7 +1022,11 @@ async def _codex_bind_watch(chat_id: str, cwd: str | None, launched_at: float) -
         _codex_watchers.pop(chat_id, None)
 
 
-async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: int = 32) -> _SessionBase:
+async def open_terminal(
+    chat_id: str, cwd: str | None, cols: int = 120, rows: int = 32, *, initial_prompt: str | None = None,
+) -> _SessionBase:
+    """Attach to (or launch) a chat's agent. `initial_prompt` only takes effect when this call
+    actually starts a brand-new session — it becomes the CLI's startup prompt."""
     loop = asyncio.get_running_loop()
     backend = await loop.run_in_executor(None, terminal_backend, chat_id)
     agent = await loop.run_in_executor(None, _agent_for, chat_id)
@@ -988,9 +1049,135 @@ async def open_terminal(chat_id: str, cwd: str | None, cols: int = 120, rows: in
             None, sessions_mod.set_overlay, chat_id, {"opened_at": time.time()},
         )
     ts.clear_needs_on_typing = agent == "codex"  # codex has no prompt-submit hook (see write())
+    if initial_prompt and not ts.attached:
+        ts.initial_prompt = initial_prompt
     await ts.open()
     if agent == "codex":
         live = _codex_watchers.get(chat_id)
         if live is None or live.done():
             _codex_watchers[chat_id] = asyncio.create_task(_codex_bind_watch(chat_id, cwd, time.time()))
     return ts
+
+
+# --- headless control (the agent-facing `loom chats` harness — docs/DECISIONS.md D20) --------
+class ComposerBusy(RuntimeError):
+    """The chat's input box holds text someone typed but hasn't sent — typing a message into it
+    would splice into their draft."""
+
+
+async def start_chat(chat_id: str, cwd: str | None, *, initial_prompt: str | None = None) -> tuple[_SessionBase, bool]:
+    """Make sure a chat's agent is running, with no browser attached. Returns (session,
+    launched) — `launched` = this call started a new agent process (vs. attaching to a running
+    one). A brand-new session gets `initial_prompt` as its startup prompt; a resumed one does
+    not (use send_text)."""
+    ts = _registry.get(chat_id)
+    if ts is not None and ts.attached:
+        return ts, False
+    loop = asyncio.get_running_loop()
+    was_alive = await loop.run_in_executor(None, process_alive, chat_id)
+    ts = await open_terminal(chat_id, cwd, initial_prompt=None if was_alive else initial_prompt)
+    return ts, not was_alive
+
+
+async def _wait_quiet(ts: _SessionBase, *, quiet: float = 2.0, timeout: float = 45.0) -> None:
+    """Wait for a just-launched TUI to finish booting: output silent for `quiet` seconds (an
+    idle input box doesn't animate), bounded by `timeout`."""
+    start = time.monotonic()
+    await asyncio.sleep(0.5)
+    while time.monotonic() - start < timeout:
+        if time.monotonic() - ts.last_output >= quiet:
+            return
+        await asyncio.sleep(0.25)
+
+
+# A startup prompt that blocks the agent before it does anything — the startup message waits
+# behind it. Claude's folder-trust check is the one that matters: it appears for a repo Claude
+# has never been told to trust (a worktree inherits its main repo's trust), defaults to "No,
+# exit", and is a security decision — loom reports it, it never answers it for you.
+_ANSI_RE = re.compile(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[78=>]")
+_BLOCKERS = ((b"yes,itrustthisfolder", "folder-trust prompt"),)
+
+
+def waiting_on(ts: _SessionBase) -> str | None:
+    """Name of a startup prompt the agent is sitting at (judged from the tail of its output), or
+    None. Once answered, the TUI redraws well past it, so it drops out of the tail."""
+    tail = _ANSI_RE.sub(b"", bytes(ts.backlog[-8192:]))
+    flat = re.sub(rb"\s+", b"", tail).lower()
+    return next((name for needle, name in _BLOCKERS if needle in flat), None)
+
+
+async def settle_after_launch(ts: _SessionBase, *, timeout: float = 8.0) -> str | None:
+    """After a headless launch, give the TUI a moment to draw: return as soon as it shows a
+    blocking startup prompt (its name), or once it has drawn and gone quiet (None)."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        await asyncio.sleep(0.5)
+        blocked = waiting_on(ts)
+        if blocked:
+            return blocked
+        if ts.backlog and time.monotonic() - ts.last_output >= 1.5:
+            return None
+    return waiting_on(ts)
+
+
+_RECENT_TYPING_S = 120.0
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # control chars except \t and \n
+
+
+async def send_text(chat_id: str, cwd: str | None, text: str, *, submit: bool = True, force: bool = False) -> dict:
+    """Type a message into a chat's agent, as if you'd pasted it into its input box and hit
+    Enter. Starts/resumes the agent first if it isn't running (and waits for it to boot). Goes
+    through the normal input funnel, so the /clear guard (D16) still applies. Mid-turn, the
+    agent queues it like any message typed while it works.
+
+    Raises ComposerBusy if the box holds an unsent draft (unless `force`)."""
+    ts, launched = await start_chat(chat_id, cwd)
+    if launched:
+        await _wait_quiet(ts)
+    blocked = waiting_on(ts)
+    if blocked:
+        # Typed text + Enter would land on the prompt (Enter on claude's trust prompt = "No, exit").
+        raise ComposerBusy(f"the agent is waiting on its {blocked} — open the chat and answer it first")
+    buf = ts._line_buf
+    if not force and buf is not None and bytes(buf).strip():
+        raise ComposerBusy("the chat's input box has unsent text — someone is typing there (--force to send anyway)")
+    if not force and buf is None and time.monotonic() - ts.last_input < _RECENT_TYPING_S:
+        # Unknown composer state (cursor keys / history recall since the last submit) right after
+        # someone was at the keyboard: assume a draft rather than risk splicing into it.
+        raise ComposerBusy("someone was just typing in this chat and its input box may hold a draft (--force to send anyway)")
+    body = _CTRL_RE.sub("", text.replace("\r\n", "\n").replace("\r", "\n")).strip("\n")
+    tail = bytes(ts.backlog[-65536:])
+    # Bracketed paste keeps a multi-line message as ONE message (a bare newline would submit
+    # each line). All three CLIs enable it; if this one has visibly turned it off, flatten.
+    paste = tail.rfind(b"\x1b[?2004l") <= tail.rfind(b"\x1b[?2004h")
+    if paste:
+        ts.write(ts._PASTE_ON + body.encode() + ts._PASTE_OFF)
+    else:
+        ts.write(" ".join(body.split("\n")).encode())
+    if submit:
+        await asyncio.sleep(0.3)  # let the TUI settle the paste before Enter, or it can land as a newline
+        ts.write(b"\r")
+    return {"launched": launched, "submitted": submit}
+
+
+async def close_chat(chat_id: str) -> bool:
+    """Stop a chat's agent process (the transcript stays; reopening the chat resumes it).
+    Returns whether anything was running."""
+    ts = _registry.get(chat_id)
+    if ts is not None:
+        await ts.close()
+        return True
+    loop = asyncio.get_running_loop()
+    sock = _socket_path(chat_id)
+    if await loop.run_in_executor(None, is_session_alive, sock):
+        await loop.run_in_executor(None, kill_session, sock)
+        with contextlib.suppress(Exception):
+            _marker_path(chat_id).unlink(missing_ok=True)
+        return True
+    tm = _tmux()
+    if tm:
+        r = await loop.run_in_executor(
+            None, lambda: subprocess.run([tm, "kill-session", "-t", session_name(chat_id)], capture_output=True),
+        )
+        return r.returncode == 0
+    return False
