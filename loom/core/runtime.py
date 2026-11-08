@@ -93,12 +93,15 @@ is $LOOM_CHAT_ID. When the user asks you to look at or manage their loom chats, 
   loom chats show <id> [--tail N]  ·  loom chats brief <id>     read a chat / its status brief
   loom chats archive|unarchive|close <id...>    archive also stops the agent; close only stops it
   loom chats categorize <id...> <category>  ·  loom chats rename <id> <name>
-  loom chats spawn --branch <b> --prompt <text> [--category C]   new worktree + chat, already working
+  loom chats spawn --branch <b> --prompt <text> [--category C] [--model M] [--effort E]
+                                                new worktree + chat, already working
   loom chats send <id> <text>                   type a message into another chat
   loom categories ls|add|rm|rename
 The user has several projects (repos); `ls`, `spawn`, and `categories` default to THIS chat's \
 project — pass `--project NAME`, or `-A` (all projects) to `ls` / `categories ls`, when the user \
-means another project or "all my chats". Categories belong to a project. \
+means another project or "all my chats". Categories belong to a project. A spawned chat runs \
+this chat's agent, model and effort unless the user asks for others (`--agent`, `--model` e.g. \
+opus/sonnet/fable, `--effort` low|medium|high|xhigh|max). \
 <id> is an id, unique id prefix, name, branch, or `self` (ids work across projects). Run \
 `loom chats --help` for more. \
 Only act on other chats when the user asks you to.

@@ -243,6 +243,17 @@ only a UI around them. Decisions:
   with neither asks which). `--project NAME` picks another, `-A` means every project, and
   `loom projects` lists them. Chat refs resolve across projects (an id names one chat
   anywhere); categories stay per project, so filing a chat uses its own project's categories.
+- **A spawned chat matches its spawner's model and effort** unless told otherwise (`--model`,
+  `--effort`). "Match" means what the spawner is running *now*, read from its own session files
+  (`agents.live_settings`: claude transcript `requestedModel` + `effort` on each assistant
+  record, so a mid-chat `/model` counts; grok `summary.json`; codex `turn_context`, unverified),
+  else its pin, else the CLI's default model and xhigh. The model carries over only to the same
+  CLI (model names don't cross CLIs); the effort carries over when the new CLI has that level.
+  The result is **pinned** in the new chat's overlay (`model`, `effort`) and passed on every
+  launch, resume included, so it never silently drifts to a different global default. Chats
+  without a pin launch exactly as before. Efforts are validated per CLI (400 before any worktree
+  is made); models aren't (no list exists) — claude only rejects a bad one on its first request,
+  so spawn watches for that error and reports it.
 - **Categories moved server-side** (`~/.loom/categories.json`, `core/categories.py`). They lived
   in localStorage, invisible to any agent. The dashboard store keeps its API (optimistic update →
   adopt the server's response, 4 s poll so agent edits appear), imports a browser's legacy

@@ -128,13 +128,32 @@ def _codex_session_id(chat_id: str, cwd: str | None, *, fresh_after: float | Non
 
 
 def _agent_argv(chat_id: str, cwd: str | None, *, fullscreen: bool, initial_prompt: str | None = None) -> list[str]:
-    """Build argv for the chat's locked agent (resume if transcript exists, else mint id).
+    """Build argv for the chat's locked agent (resume if transcript exists, else mint id), on its
+    pinned model / effort if it has them (overlay — set by `loom chats spawn`).
     `initial_prompt` = the first message for a brand-new session (headless spawn)."""
     agent = _agent_for(chat_id)
+    ov = sessions_mod.get_overlay(chat_id)
     asid = _codex_session_id(chat_id, cwd) if agent == "codex" else None
     return agents.build_argv(
         agent, chat_id, cwd, fullscreen=fullscreen, agent_session_id=asid, initial_prompt=initial_prompt,
+        model=ov.get("model"), effort=ov.get("effort"),
     )
+
+
+def chat_settings(chat_id: str, cwd: str | None) -> dict:
+    """A chat's agent and the model / effort it runs on. model/effort = what its session files
+    say it's using now (so a mid-chat /model counts), else what loom launches it with: its pin,
+    else the CLI's default model (None) and loom's default effort. `pinned_*` = the pin alone."""
+    agent = _agent_for(chat_id)
+    ov = sessions_mod.get_overlay(chat_id)
+    live = agents.live_settings(agent, chat_id, cwd, ov.get("agent_session_id") if agent == "codex" else None)
+    return {
+        "agent": agent,
+        "model": live["model"] or ov.get("model"),
+        "effort": live["effort"] or ov.get("effort") or agents.DEFAULT_EFFORT,
+        "pinned_model": ov.get("model"),
+        "pinned_effort": ov.get("effort"),
+    }
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -1104,6 +1123,18 @@ def waiting_on(ts: _SessionBase) -> str | None:
     tail = _ANSI_RE.sub(b"", bytes(ts.backlog[-8192:]))
     flat = re.sub(rb"\s+", b"", tail).lower()
     return next((name for needle, name in _BLOCKERS if needle in flat), None)
+
+
+# Errors a freshly launched agent can print that leave it unable to work (judged like _BLOCKERS).
+# claude starts fine on a model it doesn't know and fails on its first request with "There's an
+# issue with the selected model (X). It may not exist or you may not have access to it."
+_LAUNCH_ERRORS = ((b"anissuewiththeselectedmodel", "the agent rejected its model (unknown, or no access)"),)
+
+
+def launch_error(ts: _SessionBase) -> str | None:
+    """A fatal-looking error in the tail of a just-launched agent's output, or None."""
+    flat = re.sub(rb"\s+", b"", _ANSI_RE.sub(b"", bytes(ts.backlog[-8192:]))).lower()
+    return next((msg for needle, msg in _LAUNCH_ERRORS if needle in flat), None)
 
 
 async def settle_after_launch(ts: _SessionBase, *, timeout: float = 8.0) -> str | None:

@@ -297,6 +297,23 @@ def _render_item(it: dict, full: bool) -> list[str]:
     return out
 
 
+def _settings(sid: str) -> dict:
+    """{model, effort, pinned_model, pinned_effort} for a chat; {} if the server can't say."""
+    try:
+        r = httpx.get(f"{_base()}/api/chats/{sid}/settings", timeout=15)
+        return r.json() if r.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError):
+        return {}
+
+
+def _model_line(s: dict) -> str:
+    if not s:
+        return "-"
+    out = f"{s.get('model') or 'CLI default'} · effort {s.get('effort') or '-'}"
+    pins = [x for x in (s.get("pinned_model"), s.get("pinned_effort") and f"effort {s['pinned_effort']}") if x]
+    return out + (f"  (pinned: {', '.join(pins)})" if pins else "")
+
+
 def _print_meta(w: _World, c: dict) -> None:
     sid = c["id"]
     t = w.terms.get(sid) or {}
@@ -311,6 +328,7 @@ def _print_meta(w: _World, c: dict) -> None:
         ("category", c.get("category_name") or "Uncategorized"),
         ("branch", c.get("branch") or "-"),
         ("agent", c.get("agent") or "-"),
+        ("model", _model_line(_settings(sid))),
         ("worktree", c.get("cwd") or "-"),
         ("task", c.get("task") or "-"),
         ("archived", "yes" if c.get("archived") else "no"),
@@ -339,7 +357,8 @@ def chats_show(
         for it in items:
             it.pop("images", None)
             it.pop("thinking", None)
-        _out_json({**_row_json(w, c), "transcript_tail": items})
+        s = _settings(c["id"])
+        _out_json({**_row_json(w, c), "model": s.get("model"), "effort": s.get("effort"), "transcript_tail": items})
         return
     _print_meta(w, c)
     if tail:
@@ -540,14 +559,18 @@ def chats_spawn(
     project: str = typer.Option(None, "--project", "-p", help="project (default: this chat's / the cwd's)"),
     base: str = typer.Option(None, "--base", help="base branch (default: the project's)"),
     agent: str = typer.Option(None, "--agent", "-a", help="claude | grok | codex (default: this chat's, else claude)"),
+    model: str = typer.Option(None, "--model", "-m", help="e.g. opus, sonnet, fable (default: this chat's, else the CLI's)"),
+    effort: str = typer.Option(None, "--effort", "-e", help="low | medium | high | xhigh | max (default: this chat's, else xhigh)"),
     open_browser: bool = typer.Option(False, "--open", help="open the new chat in the browser"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Spin up a new chat: fresh worktree on --branch, agent already working on --prompt.
 
     It shows up in loom's sidebar immediately (recording which chat spawned it). Follow up with
-    `loom chats send`. If Claude has never trusted the repo, the agent waits on its folder-trust
-    prompt until you answer it in the browser — spawn says so."""
+    `loom chats send`. It runs the same agent, model and effort as the chat spawning it unless
+    told otherwise (outside a chat: claude, the CLI's default model, xhigh); the choice is pinned,
+    so the chat relaunches on the same settings. If Claude has never trusted the repo, the agent
+    waits on its folder-trust prompt until you answer it in the browser — spawn says so."""
     text = _read_text(prompt, prompt_file, "prompt")
     w = _World()
     proj = project or w.default_project()
@@ -556,7 +579,7 @@ def chats_spawn(
         _die(f"which project? pass --project (one of: {names})")
     body = {
         "repo": proj, "branch": branch, "base_branch": base, "prompt": text, "category": category, "name": name,
-        "agent": agent or os.environ.get("LOOM_AGENT") or None,
+        "agent": agent or os.environ.get("LOOM_AGENT") or None, "model": model, "effort": effort,
     }
     r = _api("POST", "/spawn", body=body, timeout=180)
     url = f"{_base()}/?chat={r['chat_id']}"
@@ -564,13 +587,16 @@ def chats_spawn(
         _out_json({**r, "url": url})
     else:
         cat = (r.get("category") or {}).get("name")
-        print(f"spawned {r['chat_id']}  ({r['agent']}, project {r['repo']}" + (f", category {cat}" if cat else "") + ")")
+        how = r["agent"] if "effort" not in r else f"{r['agent']} · {r.get('model') or 'default model'} · effort {r['effort']}"
+        print(f"spawned {r['chat_id']}  ({how}, project {r['repo']}" + (f", category {cat}" if cat else "") + ")")
         print(f"  branch    {r['branch']}")
         print(f"  worktree  {r['worktree']}")
         print(f"  open      {url}")
         if r.get("waiting_on"):
             print(f"  ! the agent is waiting on its {r['waiting_on']} — the first message runs once someone")
             print("    answers it in the browser (`loom chats open <id>`); loom never answers it for you")
+        elif r.get("error"):
+            print(f"  ! {r['error']} — check the model name; switch it in the chat with /model")
         else:
             print("  first message sent" if text else "  idle — no first message (send one with `loom chats send`)")
     if open_browser:
@@ -619,7 +645,8 @@ def whoami(as_json: bool = typer.Option(False, "--json")) -> None:
     w = _World()
     c = w.get(sid) or {"id": sid, "display_title": "(no transcript yet)"}
     if as_json:
-        _out_json(_row_json(w, c))
+        s = _settings(sid)
+        _out_json({**_row_json(w, c), "model": s.get("model"), "effort": s.get("effort")})
         return
     _print_meta(w, c)
 

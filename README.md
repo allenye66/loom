@@ -62,7 +62,8 @@ loom chats show <id> --tail 10               # details + the end of its conversa
 loom chats brief <id>                        # loom's status brief (goal, status, needs-you)
 loom chats archive <id...>                   # archive (also stops its agent) · close = just stop
 loom chats categorize <id...> Payments --create
-loom chats spawn --branch fix-x --prompt "…handoff…" --category Payments
+loom chats spawn --branch fix-x --prompt "…handoff…" --category Payments   # same model/effort as this chat
+loom chats spawn --branch spike --prompt "…" --model sonnet --effort high    # or pick them
 loom chats send <id> "also cover the refund path"
 loom categories ls · loom whoami · loom projects
 ```

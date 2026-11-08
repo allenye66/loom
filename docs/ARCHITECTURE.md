@@ -102,7 +102,8 @@ Every chat's agent knows it's in loom (`<loom-harness>` system-prompt note, `LOO
 REST API: `GET /api/chats` (rows carry `category`/`category_name`), `GET /api/categories`,
 `GET /api/terminals?detached=1` (status: working / needs-you / idle / blocked / running / stopped).
 `spawn` → `POST /api/spawn` (`create_task` + category + `terminals.start_chat` with the first
-message as the CLI's startup prompt; records `spawned_by`). `send` → `POST /api/chats/{id}/send`
+message as the CLI's startup prompt; records `spawned_by`; pins model + effort — the caller's
+unless named, read live from its transcript by `agents.live_settings`). `send` → `POST /api/chats/{id}/send`
 (resume if stopped, bracketed paste + Enter, 409 over a draft or a blocking prompt). `close` →
 `POST /api/chats/{id}/close`; `archive` = `PATCH archived:true`, which now also closes the agent
 (unless the caller is that chat — `X-Loom-Chat`).
@@ -114,9 +115,12 @@ locked per chat), so every slash command / permission prompt / feature works wit
 zero reimplementation. A claude chat runs
 
 ```
-claude --effort xhigh --permission-mode bypassPermissions --settings '{...theme,hooks[,tui]}'
-       [--append-system-prompt <loom-runtime note>] (--resume|--session-id <chat_id>)
+claude --effort <xhigh|pinned> --permission-mode bypassPermissions --settings '{...theme,hooks[,tui]}'
+       [--model <pinned>] [--append-system-prompt <loom-runtime note>] (--resume|--session-id <chat_id>)
 ```
+
+(model / effort: a chat's overlay pin — `loom chats spawn` sets one — else the CLI's default
+model and xhigh; grok gets `--effort`/`--model`, codex `-c model_reasoning_effort=`/`-c model=`.)
 
 (grok: `--effort xhigh --permission-mode acceptEdits [--no-alt-screen --minimal]`;
 codex: `[resume <bound id>] -c model_reasoning_effort="xhigh"
@@ -176,6 +180,7 @@ GET  /api/tasks/{id}/logs?kind=  (efficient tail: backend|frontend|test|…)
 GET  /api/tasks/{id}/logs/kinds · /logs/since · SSE /logs/stream ;  DELETE /logs?kind=
 GET  /api/chats ;  GET/PATCH/DELETE /api/chats/{id} ;  POST /api/chats/{id}/restore   (PATCH archived:true also stops the agent)
 POST /api/chats/{id}/{start,send,close} ;  POST /api/spawn                            (headless control — the harness, D20)
+GET  /api/chats/{id}/settings                                                       (agent + the model / effort it runs on, and its pin)
 GET/POST /api/categories ;  PATCH/DELETE /api/categories/{id} ;  PUT /api/categories-{order,assign} ;  POST /api/categories-import
 GET  /api/chats-trash ;  POST /api/chats/reindex ;  GET /api/chats/{id}/{transcript,prs}
 GET  /api/chats/{id}/brief[?auto=1] ;  POST /api/chats/{id}/brief   (status brief; auto = regenerate if due)

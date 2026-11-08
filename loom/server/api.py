@@ -558,6 +558,13 @@ def _known_chat(sid: str) -> None:
         raise HTTPException(404, f"unknown chat '{sid}'")
 
 
+@router.get("/chats/{sid}/settings")
+def chat_settings(sid: str) -> dict:
+    """The chat's agent + the model / effort it runs on (see terminals.chat_settings)."""
+    _known_chat(sid)
+    return terminals.chat_settings(sid, _chat_cwd(sid))
+
+
 @router.post("/chats/{sid}/start")
 async def start_chat(sid: str, body: ChatStartIn) -> dict:
     """Run a chat's agent with no browser attached (the `loom` CLI's spawn/resume). The chat
@@ -610,6 +617,28 @@ class SpawnIn(BaseModel):
     prompt: str | None = None  # the new chat's first message (e.g. a handoff)
     category: str | None = None  # id or name in the project; created if it doesn't exist
     name: str | None = None  # sidebar name (default: the branch, then claude's ai-title)
+    model: str | None = None  # default: the spawning chat's (same agent), else the CLI's default
+    effort: str | None = None  # default: the spawning chat's, else xhigh
+
+
+def _spawn_settings(body: SpawnIn, parent: str | None) -> tuple[str, str | None, str]:
+    """(agent, model, effort) for a spawned chat. Whatever the caller names wins; the rest match
+    the chat doing the spawning — its agent; its model only when the new chat runs the same CLI
+    (model names don't carry across CLIs); its effort when the new CLI has that level — and
+    otherwise fall back to claude, the CLI's default model, and xhigh."""
+    p = None
+    if parent:
+        with contextlib.suppress(Exception):  # a stale/unknown caller id just means no defaults
+            p = terminals.chat_settings(parent, _chat_cwd(parent))
+    agent = agents.normalize_agent(body.agent or (p and p["agent"]))
+    if body.effort:
+        effort = agents.normalize_effort(agent, body.effort)
+        if not effort:
+            raise HTTPException(400, f"{agent} has no effort '{body.effort}' (one of: {', '.join(agents.EFFORTS[agent])})")
+    else:
+        effort = (agents.normalize_effort(agent, p["effort"]) if p else None) or agents.DEFAULT_EFFORT
+    model = (body.model or "").strip() or (p["model"] if p and p["agent"] == agent else None)
+    return agent, model, effort
 
 
 @router.post("/spawn")
@@ -623,21 +652,23 @@ async def spawn_chat(body: SpawnIn, x_loom_chat: str | None = Header(None)) -> d
             raise HTTPException(404, f"unknown project '{body.repo}'")
     if not root:
         raise HTTPException(400, "pass `repo` (a project name) or `repo_root`")
+    agent, model, effort = await run_in_threadpool(_spawn_settings, body, x_loom_chat)
     try:
         cfg = await run_in_threadpool(load_repo_config, root)
-        task = await run_in_threadpool(manager.create_task, cfg, body.branch, body.base_branch, None, body.agent)
+        task = await run_in_threadpool(manager.create_task, cfg, body.branch, body.base_branch, None, agent)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, str(e)) from e
     if task.state.value == "error" or not task.chat_id:
         raise HTTPException(400, f"couldn't create the worktree: {task.note or 'unknown error'}")
     chat_id = task.chat_id
-    ov: dict = {}
+    ov: dict = {"effort": effort}  # pinned: the chat relaunches on the same model / effort
+    if model:
+        ov["model"] = model
     if body.name:
         ov["name"] = body.name
     if x_loom_chat:
         ov["spawned_by"] = x_loom_chat  # lineage: which chat handed this work off
-    if ov:
-        sessions.set_overlay(chat_id, ov)
+    sessions.set_overlay(chat_id, ov)
     cat = None
     if body.category:
         cat = categories.find_or_add(body.category, cfg.name)
@@ -650,6 +681,9 @@ async def spawn_chat(body: SpawnIn, x_loom_chat: str | None = Header(None)) -> d
     blocked = await terminals.settle_after_launch(ts)
     return {
         "waiting_on": blocked,
+        "error": None if blocked else terminals.launch_error(ts),
+        "model": model,
+        "effort": effort,
         "chat_id": chat_id,
         "task": task.id,
         "repo": task.repo,

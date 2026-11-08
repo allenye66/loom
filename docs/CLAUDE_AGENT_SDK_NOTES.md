@@ -103,6 +103,22 @@ Record `type`s (empirical): `user`, `assistant`, `system`, `ai-title`(`aiTitle`)
 - `user`/`assistant` records also carry `cwd`, `gitBranch`, `timestamp`.
 loom parses these in `sessions.py` (index = metadata only; `get_transcript` =
 full reconstruction). The decorative live "thinking" spinner is **never** persisted.
+- Main-thread `assistant` records carry top-level `requestedModel` (the model setting as
+  given, e.g. `claude-opus-5-5[1m]` — valid for `--model`; absent on older CLIs, fall back to
+  `message.model`; skip `<synthetic>`) and `effort` (`perTurnEffort` too). Both follow a
+  mid-chat `/model` / `/effort`. Verified 2.1.296–2.1.319 (loom reads them in
+  `agents.live_settings`).
+
+## Model / effort flags (verified, claude 2.1.319)
+
+- `--model <alias|id>` (`opus`, `sonnet`, `fable`, full ids, `[1m]` suffix). An unknown model
+  is **not** rejected at launch: the TUI starts, then the first request fails with "There's an
+  issue with the selected model (X). It may not exist or you may not have access to it."
+- `--effort low|medium|high|xhigh|max`. An unknown value is ignored with a warning ("Unknown
+  --effort value … using the default effort"), not an error.
+- In the TUI, `/model <x>` asks "Switch model?" (Enter = yes) and then **saves x as the global
+  default** in `~/.claude/settings.json` ("saved as your default for new sessions"). Never send
+  `/model` to a chat from a test.
 
 ## Remote Control — ruled out
 

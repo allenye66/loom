@@ -27,6 +27,17 @@ AgentId = Literal["claude", "grok", "codex"]
 AGENTS: tuple[AgentId, ...] = ("claude", "grok", "codex")
 DEFAULT_AGENT: AgentId = "claude"
 
+# Effort levels each CLI takes. claude: `claude --help` (2.1.319 — an unknown value is ignored
+# with a warning, not an error); grok: its --effort/--reasoning-effort levels; codex: the
+# model_reasoning_effort config values (xhigh verified in 0.160). loom launches at DEFAULT_EFFORT
+# unless a chat pins another one (overlay `effort`, set by `loom chats spawn`).
+EFFORTS: dict[AgentId, tuple[str, ...]] = {
+    "claude": ("low", "medium", "high", "xhigh", "max"),
+    "grok": ("low", "medium", "high", "xhigh"),
+    "codex": ("minimal", "low", "medium", "high", "xhigh"),
+}
+DEFAULT_EFFORT = "xhigh"
+
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 GROK_SESSIONS = Path.home() / ".grok" / "sessions"
 # Codex rollout transcripts: ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl,
@@ -43,6 +54,12 @@ def normalize_agent(value: str | None) -> AgentId:
     if value and value.strip().lower() in AGENTS:
         return value.strip().lower()  # type: ignore[return-value]
     return DEFAULT_AGENT
+
+
+def normalize_effort(agent: AgentId, value: str | None) -> str | None:
+    """`value` as an effort level this agent's CLI accepts, or None if it has no such level."""
+    v = (value or "").strip().lower()
+    return v if v in EFFORTS.get(agent, ()) else None
 
 
 def binary(agent: AgentId) -> str:
@@ -301,6 +318,95 @@ def session_exists(agent: AgentId, chat_id: str, cwd: str | None = None) -> bool
     return find_claude_transcript(chat_id) is not None
 
 
+def _tail_lines(path: Path, size: int) -> list[str]:
+    """The complete lines in the last `size` bytes of a file, newest first."""
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        end = f.tell()
+        f.seek(max(0, end - size))
+        data = f.read()
+    lines = data.decode("utf-8", "replace").splitlines()
+    if end > size:
+        lines = lines[1:]  # the first one is cut off mid-record
+    return lines[::-1]
+
+
+def _claude_live(path: Path | None) -> dict:
+    # Every main-thread assistant record carries `requestedModel` (the model setting as given,
+    # e.g. "claude-opus-5-5[1m]" — valid for --model) and `effort`; both follow a mid-chat
+    # /model or /effort. Verified on claude 2.1.296–2.1.319; older records lack requestedModel,
+    # so fall back to the API model on the message.
+    if not path:
+        return {}
+    for size in (256 * 1024, 4 * 1024 * 1024):  # tool results can push the last turn far back
+        for line in _tail_lines(path, size):
+            if '"assistant"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("type") != "assistant" or rec.get("isSidechain"):
+                continue
+            msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+            model = rec.get("requestedModel") or msg.get("model")
+            if not isinstance(model, str) or model.startswith("<"):  # "<synthetic>" = no API call
+                continue
+            effort = rec.get("effort")
+            return {"model": model, "effort": effort if isinstance(effort, str) else None}
+        if path.stat().st_size <= size:
+            break
+    return {}
+
+
+def _grok_live(sess: Path | None) -> dict:
+    # summary.json carries the session's current_model_id + reasoning_effort (grok, verified
+    # 2026-11 against ~/.grok/sessions).
+    if not sess:
+        return {}
+    s = json.loads((sess / "summary.json").read_text())
+    return {"model": s.get("current_model_id"), "effort": s.get("reasoning_effort")}
+
+
+def _codex_live(rollout: Path | None) -> dict:
+    # Codex logs a `turn_context` record per turn whose payload names the model + effort.
+    # UNVERIFIED here (codex isn't installed on the dev machine) — best-effort; a miss just
+    # means callers fall back to the chat's pinned / default settings.
+    if not rollout:
+        return {}
+    for line in _tail_lines(rollout, 1024 * 1024):
+        if '"turn_context"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        p = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+        if rec.get("type") == "turn_context" and p.get("model"):
+            return {"model": p.get("model"), "effort": p.get("effort")}
+    return {}
+
+
+def live_settings(agent: AgentId, chat_id: str, cwd: str | None = None, agent_session_id: str | None = None) -> dict:
+    """The model + effort a session is actually running, read from the agent's own session files
+    (so a mid-chat /model or /effort counts): {"model": str | None, "effort": str | None}. Both
+    None when there's nothing to read yet (no turn taken) or the format isn't recognized."""
+    try:
+        if agent == "grok":
+            got = _grok_live(find_grok_session(chat_id, cwd))
+        elif agent == "codex":
+            got = _codex_live(find_codex_rollout(agent_session_id or chat_id))
+        else:
+            got = _claude_live(find_claude_transcript(chat_id))
+    except (OSError, ValueError):
+        got = {}
+    model, effort = got.get("model"), got.get("effort")
+    return {
+        "model": model if isinstance(model, str) and model else None,
+        "effort": effort.lower() if isinstance(effort, str) and effort else None,
+    }
+
+
 def build_argv(
     agent: AgentId,
     chat_id: str,
@@ -309,6 +415,8 @@ def build_argv(
     fullscreen: bool,
     agent_session_id: str | None = None,
     initial_prompt: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     """CLI argv for a new or resumed session under the given agent.
 
@@ -319,8 +427,13 @@ def build_argv(
     `initial_prompt` = the first message of a brand-new session (headless `loom chats
     spawn`): all three CLIs take a trailing positional prompt that starts the interactive
     session already working on it. Ignored on resume (a resumed chat gets the message typed
-    in instead — terminals.send_text)."""
+    in instead — terminals.send_text).
+
+    `model` / `effort` = the chat's pinned model and effort (overlay, set by spawn). No model →
+    the CLI's own default; no (or an unknown) effort → DEFAULT_EFFORT. Passed on resume too, so a
+    pinned chat comes back on the same settings."""
     note = agent_note(cwd)
+    eff = normalize_effort(agent, effort) or DEFAULT_EFFORT
     exists = session_exists(agent, agent_session_id or chat_id, cwd)
     # Trailing positional; a leading "-" would parse as a flag, so pad it.
     tail: list[str] = []
@@ -335,14 +448,17 @@ def build_argv(
             # sessions — codex picks the uuid; loom discovers + binds it after launch.
             argv += ["resume", sid]
         argv += [
-            # Same level as claude's `--effort xhigh` (config key verified in 0.160).
-            "-c", "model_reasoning_effort=\"xhigh\"",
+            # Same knob as claude's `--effort` (config key verified in 0.160). The value part
+            # of -c is TOML, and json.dumps of a str is a valid TOML basic string.
+            "-c", f"model_reasoning_effort={json.dumps(eff)}",
             # Parity with claude's bypassPermissions (loom chats live in disposable
             # worktrees). Soften to ["-s", "workspace-write", "-a", "on-request"]
             # if codex should sandbox + ask instead.
             "--dangerously-bypass-approvals-and-sandbox",
             "--search",
         ]
+        if model:
+            argv += ["-c", f"model={json.dumps(model)}"]
         script = ensure_codex_notify_script()
         if script:
             # json.dumps output is valid TOML here (basic string array) — the value
@@ -362,9 +478,11 @@ def build_argv(
         ensure_grok_needs_hook()
         argv = [
             binary("grok"),
-            "--effort", "xhigh",  # grok's top level (its levels: low/medium/high/xhigh)
+            "--effort", eff,
             "--permission-mode", "acceptEdits",
         ]
+        if model:
+            argv += ["--model", model]
         # pty host wants native scrollback (no alt-screen); tmux keeps default fullscreen.
         if not fullscreen:
             argv += ["--no-alt-screen", "--minimal"]
@@ -380,10 +498,12 @@ def build_argv(
     settings = _claude_settings(chat_id, fullscreen=fullscreen)
     argv = [
         binary("claude"),
-        "--effort", "xhigh",
+        "--effort", eff,
         "--permission-mode", "bypassPermissions",
         "--settings", json.dumps(settings),
     ]
+    if model:
+        argv += ["--model", model]
     if note:
         argv += ["--append-system-prompt", note]
     if exists:
