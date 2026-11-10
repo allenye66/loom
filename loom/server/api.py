@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -17,11 +18,27 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+import anyio
+from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from loom import __version__
-from loom.core import agents, briefs, claude_session, doctor, github, manager, monitor, perf, registry, repos, sessions, terminals
+from loom.core import (
+    agents,
+    briefs,
+    categories,
+    claude_session,
+    doctor,
+    github,
+    manager,
+    monitor,
+    perf,
+    registry,
+    repos,
+    sessions,
+    terminals,
+)
 from loom.core.config import LOGS_DIR, LOOM_HOME, load_repo_config
 from loom.core.tests import build_test_run, serialize_lock
 
@@ -455,11 +472,19 @@ def list_chats(
     branch: str | None = None,
     starred: bool | None = None,
 ) -> dict:
-    return {"chats": sessions.list_chats(repo=repo, scope=scope, tab=tab, q=q, branch=branch, starred=starred)}
+    rows = sessions.list_chats(repo=repo, scope=scope, tab=tab, q=q, branch=branch, starred=starred)
+    cats = categories.get_state()
+    for r in rows:  # the sidebar group each chat is filed under (None = Uncategorized)
+        cat = categories.category_of(r["id"], cats)
+        r["category"] = cat["id"] if cat else None
+        r["category_name"] = cat["name"] if cat else None
+    return {"chats": rows}
 
 
 @router.patch("/chats/{sid}")
-def patch_chat(sid: str, body: ChatPatch) -> dict:
+def patch_chat(sid: str, body: ChatPatch, x_loom_chat: str | None = Header(None)) -> dict:
+    """`X-Loom-Chat` = the chat making the request (the `loom` CLI sends $LOOM_CHAT_ID), so an
+    agent archiving ITSELF doesn't kill its own turn."""
     patch = body.model_dump(exclude_none=True)
     # Agent is sticky once locked — ignore attempts to flip after first set.
     if "agent" in patch:
@@ -483,6 +508,12 @@ def patch_chat(sid: str, body: ChatPatch) -> dict:
         with contextlib.suppress(Exception):
             task = manager.task_for_chat(sid)
         if body.archived:
+            # Archiving also stops the chat's agent (D20): an archived chat already loses its dev
+            # stack and ports, and an idle agent left running behind it is just a stray process.
+            # The transcript stays — reopening resumes it. Never the caller's own agent.
+            if x_loom_chat != sid:
+                with contextlib.suppress(Exception):
+                    anyio.from_thread.run(terminals.close_chat, sid)
             # An archived chat's task shouldn't keep a dev stack running (see monitor.py reaper).
             with contextlib.suppress(Exception):
                 tid = monitor.stop_for_archived_chat(sid)
@@ -507,6 +538,237 @@ def delete_chat(sid: str) -> dict:
 def restore_chat(sid: str) -> dict:
     sessions.restore_chat(sid)
     return {"ok": True}
+
+
+class ChatStartIn(BaseModel):
+    prompt: str | None = None  # first message — only for a brand-new session (else use /send)
+
+
+def _chat_cwd(sid: str) -> str | None:
+    """Where a chat's agent runs: its task's worktree, else the transcript's cwd."""
+    task = manager.task_for_chat(sid)
+    if task and task.worktree_path:
+        return task.worktree_path
+    chat = sessions.get_chat(sid)
+    return chat.get("cwd") if chat else None
+
+
+def _known_chat(sid: str) -> None:
+    if not (sessions.get_overlay(sid) or sessions.get_chat(sid) or manager.task_for_chat(sid)):
+        raise HTTPException(404, f"unknown chat '{sid}'")
+
+
+@router.get("/chats/{sid}/settings")
+def chat_settings(sid: str) -> dict:
+    """The chat's agent + the model / effort it runs on (see terminals.chat_settings)."""
+    _known_chat(sid)
+    return terminals.chat_settings(sid, _chat_cwd(sid))
+
+
+@router.post("/chats/{sid}/start")
+async def start_chat(sid: str, body: ChatStartIn) -> dict:
+    """Run a chat's agent with no browser attached (the `loom` CLI's spawn/resume). The chat
+    shows in the sidebar like any other; opening it attaches to this same process."""
+    await run_in_threadpool(_known_chat, sid)
+    cwd = await run_in_threadpool(_chat_cwd, sid)
+    try:
+        ts, launched = await terminals.start_chat(sid, cwd, initial_prompt=body.prompt)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"could not start the agent: {e}") from e
+    blocked = await terminals.settle_after_launch(ts) if launched else terminals.waiting_on(ts)
+    return {"chat_id": sid, "launched": launched, "waiting_on": blocked}
+
+
+class ChatSendIn(BaseModel):
+    text: str
+    submit: bool = True  # press Enter after typing it
+    force: bool = False  # type it even if the input box holds an unsent draft
+
+
+@router.post("/chats/{sid}/send")
+async def send_to_chat(sid: str, body: ChatSendIn) -> dict:
+    """Type a message into a chat's agent (resuming it first if it isn't running)."""
+    if not body.text.strip():
+        raise HTTPException(400, "empty message")
+    await run_in_threadpool(_known_chat, sid)
+    cwd = await run_in_threadpool(_chat_cwd, sid)
+    try:
+        out = await terminals.send_text(sid, cwd, body.text, submit=body.submit, force=body.force)
+    except terminals.ComposerBusy as e:
+        raise HTTPException(409, str(e)) from e
+    return {"chat_id": sid, **out}
+
+
+@router.post("/chats/{sid}/close")
+async def close_chat(sid: str, force: bool = False, x_loom_chat: str | None = Header(None)) -> dict:
+    """Stop a chat's agent process. The transcript stays; reopening the chat resumes it. A chat
+    can't close itself (it would kill the very turn asking) unless `force`."""
+    if x_loom_chat == sid and not force:
+        raise HTTPException(409, "refusing to close the calling chat itself (it would kill this turn)")
+    return {"chat_id": sid, "closed": await terminals.close_chat(sid)}
+
+
+class SpawnIn(BaseModel):
+    branch: str
+    repo: str | None = None  # registered project name …
+    repo_root: str | None = None  # … or a repo path
+    base_branch: str | None = None
+    agent: Literal["claude", "grok", "codex"] | None = None
+    prompt: str | None = None  # the new chat's first message (e.g. a handoff)
+    category: str | None = None  # id or name in the project; created if it doesn't exist
+    name: str | None = None  # sidebar name (default: the branch, then claude's ai-title)
+    model: str | None = None  # default: the spawning chat's (same agent), else the CLI's default
+    effort: str | None = None  # default: the spawning chat's, else xhigh
+
+
+def _spawn_settings(body: SpawnIn, parent: str | None) -> tuple[str, str | None, str]:
+    """(agent, model, effort) for a spawned chat. Whatever the caller names wins; the rest match
+    the chat doing the spawning — its agent; its model only when the new chat runs the same CLI
+    (model names don't carry across CLIs); its effort when the new CLI has that level — and
+    otherwise fall back to claude, the CLI's default model, and xhigh."""
+    p = None
+    if parent:
+        with contextlib.suppress(Exception):  # a stale/unknown caller id just means no defaults
+            p = terminals.chat_settings(parent, _chat_cwd(parent))
+    agent = agents.normalize_agent(body.agent or (p and p["agent"]))
+    if body.effort:
+        effort = agents.normalize_effort(agent, body.effort)
+        if not effort:
+            raise HTTPException(400, f"{agent} has no effort '{body.effort}' (one of: {', '.join(agents.EFFORTS[agent])})")
+    else:
+        effort = (agents.normalize_effort(agent, p["effort"]) if p else None) or agents.DEFAULT_EFFORT
+    model = (body.model or "").strip() or (p["model"] if p and p["agent"] == agent else None)
+    return agent, model, effort
+
+
+@router.post("/spawn")
+async def spawn_chat(body: SpawnIn, x_loom_chat: str | None = Header(None)) -> dict:
+    """New worktree task + its chat, launched headless with `prompt` as the first message — what
+    `loom chats spawn` runs. The chat appears in the sidebar already working."""
+    root = body.repo_root
+    if not root and body.repo:
+        root = next((r["root"] for r in repos.list_repos() if r["name"] == body.repo), None)
+        if not root:
+            raise HTTPException(404, f"unknown project '{body.repo}'")
+    if not root:
+        raise HTTPException(400, "pass `repo` (a project name) or `repo_root`")
+    agent, model, effort = await run_in_threadpool(_spawn_settings, body, x_loom_chat)
+    try:
+        cfg = await run_in_threadpool(load_repo_config, root)
+        task = await run_in_threadpool(manager.create_task, cfg, body.branch, body.base_branch, None, agent)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, str(e)) from e
+    if task.state.value == "error" or not task.chat_id:
+        raise HTTPException(400, f"couldn't create the worktree: {task.note or 'unknown error'}")
+    chat_id = task.chat_id
+    ov: dict = {"effort": effort}  # pinned: the chat relaunches on the same model / effort
+    if model:
+        ov["model"] = model
+    if body.name:
+        ov["name"] = body.name
+    if x_loom_chat:
+        ov["spawned_by"] = x_loom_chat  # lineage: which chat handed this work off
+    sessions.set_overlay(chat_id, ov)
+    cat = None
+    if body.category:
+        cat = categories.find_or_add(body.category, cfg.name)
+        categories.assign([chat_id], cat["id"])
+    try:
+        ts, _ = await terminals.start_chat(chat_id, task.worktree_path, initial_prompt=body.prompt)
+    except Exception as e:  # noqa: BLE001 — the task exists; report the launch failure
+        raise HTTPException(500, f"created task '{task.id}' but could not start its agent: {e}") from e
+    # e.g. Claude's folder-trust prompt for a repo it's never trusted — the first message waits.
+    blocked = await terminals.settle_after_launch(ts)
+    return {
+        "waiting_on": blocked,
+        "error": None if blocked else terminals.launch_error(ts),
+        "model": model,
+        "effort": effort,
+        "chat_id": chat_id,
+        "task": task.id,
+        "repo": task.repo,
+        "branch": task.branch,
+        "worktree": task.worktree_path,
+        "agent": agents.normalize_agent(sessions.get_overlay(chat_id).get("agent")),
+        "category": cat,
+        "url": f"/?chat={chat_id}",
+    }
+
+
+# --- categories (sidebar groups; server-side so agents see them — core/categories.py) --------
+class CategoryIn(BaseModel):
+    name: str
+    repo: str | None = None
+    id: str | None = None  # the dashboard mints ids itself so it can update optimistically
+
+
+class CategoryPatch(BaseModel):
+    name: str | None = None
+    repo: str | None = None
+
+
+class CategoryOrderIn(BaseModel):
+    ids: list[str]
+
+
+class CategoryAssignIn(BaseModel):
+    chat_ids: list[str]
+    category_id: str | None = None  # None → Uncategorized
+
+
+class CategoryImportIn(BaseModel):
+    categories: list[dict] = []
+    assign: dict[str, str] = {}
+
+
+@router.get("/categories")
+def get_categories() -> dict:
+    return categories.get_state()
+
+
+@router.post("/categories")
+def add_category(body: CategoryIn) -> dict:
+    try:
+        categories.add(body.name, body.repo, body.id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return categories.get_state()
+
+
+@router.patch("/categories/{cat_id}")
+def patch_category(cat_id: str, body: CategoryPatch) -> dict:
+    try:
+        categories.update(cat_id, name=body.name, repo=body.repo)
+    except KeyError as e:
+        raise HTTPException(404, f"unknown category '{cat_id}'") from e
+    return categories.get_state()
+
+
+@router.delete("/categories/{cat_id}")
+def delete_category(cat_id: str) -> dict:
+    categories.remove(cat_id)
+    return categories.get_state()
+
+
+@router.put("/categories-order")
+def order_categories(body: CategoryOrderIn) -> dict:
+    categories.set_order(body.ids)
+    return categories.get_state()
+
+
+@router.put("/categories-assign")
+def assign_categories(body: CategoryAssignIn) -> dict:
+    try:
+        categories.assign(body.chat_ids, body.category_id)
+    except KeyError as e:
+        raise HTTPException(404, f"unknown category '{body.category_id}'") from e
+    return categories.get_state()
+
+
+@router.post("/categories-import")
+def import_categories(body: CategoryImportIn) -> dict:
+    """One-time merge of a browser's legacy localStorage categories (idempotent)."""
+    return categories.import_state(body.categories, body.assign)
 
 
 @router.get("/chats-trash")
@@ -731,10 +993,11 @@ def open_shell(body: ShellIn) -> dict:
 
 
 @router.get("/terminals")
-def list_terminals() -> dict:
+def list_terminals(detached: bool = False) -> dict:
     """Live terminal sessions + how long each has been idle — drives the sidebar's
-    working-pulse / 'needs you' indicators."""
-    return {"terminals": terminals.list_active()}
+    working-pulse / 'needs you' indicators. `detached` also lists running agents loom hasn't
+    re-attached since a restart (the `loom` CLI's status column)."""
+    return {"terminals": terminals.list_active(detached=detached)}
 
 
 class UploadIn(BaseModel):
@@ -785,6 +1048,19 @@ async def term_ws(websocket: WebSocket) -> None:
             await websocket.close()
         return
     cwd = start.get("cwd")
+    # A tab left open on an archived chat (its agent stopped by the archive) auto-reconnects after
+    # a loom restart / network blip — that must not quietly relaunch the agent the archive stopped.
+    # Explicit opens (first attach) still resume it. Keep the socket open but idle (answering pings)
+    # so the client shows "exited" instead of looping on reconnects.
+    if start.get("reconnect") and sessions.get_overlay(chat_id).get("archived"):
+        loop = asyncio.get_running_loop()
+        if not await loop.run_in_executor(None, terminals.process_alive, chat_id):
+            with contextlib.suppress(Exception):
+                await websocket.send_json({"type": "exit"})
+                while True:
+                    if (await websocket.receive_json()).get("type") == "ping":
+                        await websocket.send_json({"type": "pong"})
+            return
     # Floor the initial session size: a first frame from a zero-size / collapsed pane would create
     # the session (and launch the agent) at a few columns and permanently mis-wrap the TUI.
     cols = max(int(start.get("cols") or 120), 20)

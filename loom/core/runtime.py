@@ -10,10 +10,12 @@ the repo's `.loom.yaml`, never here.
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 from loom.core import registry
-from loom.core.config import LOGS_DIR
+from loom.core.config import LOGS_DIR, LOOM_API_HOST, LOOM_API_PORT
 
 # --- resilience ---------------------------------------------------------------
 # Merged into every session's env. Turns on Claude Code's *native* recovery that
@@ -74,3 +76,52 @@ def _loom_runtime(cwd: str | None) -> tuple[dict[str, str], str | None]:
         return env, note
     except Exception:  # noqa: BLE001 — never let runtime lookup break a session
         return {}, None
+
+
+# --- harness (loom self-awareness) ---------------------------------------------
+# Every loom chat is told it lives in loom and can drive loom's chats through the `loom` CLI
+# (docs/DECISIONS.md D20). Kept short — it rides in every chat's system prompt; the CLI's own
+# --help carries the detail, and `loom whoami` the current facts (category etc. change after
+# launch, so they aren't baked in here).
+HARNESS_NOTE = """<loom-harness>
+You are running inside loom, a local orchestrator that runs many agent chats in parallel (each \
+usually in its own git worktree, grouped into categories in loom's sidebar). This chat's loom id \
+is $LOOM_CHAT_ID. When the user asks you to look at or manage their loom chats, use the `loom` CLI:
+  loom whoami                                   this chat: project, category, branch, worktree
+  loom chats ls [--category NAME | --uncategorized] [--tab archived|all] [--json]
+  loom projects                                 the user's projects (repos) + chat counts
+  loom chats show <id> [--tail N]  ·  loom chats brief <id>     read a chat / its status brief
+  loom chats archive|unarchive|close <id...>    archive also stops the agent; close only stops it
+  loom chats categorize <id...> <category>  ·  loom chats rename <id> <name>
+  loom chats spawn --branch <b> --prompt <text> [--category C] [--model M] [--effort E]
+                                                new worktree + chat, already working
+  loom chats send <id> <text>                   type a message into another chat
+  loom categories ls|add|rm|rename
+The user has several projects (repos); `ls`, `spawn`, and `categories` default to THIS chat's \
+project — pass `--project NAME`, or `-A` (all projects) to `ls` / `categories ls`, when the user \
+means another project or "all my chats". Categories belong to a project. A spawned chat runs \
+this chat's agent, model and effort unless the user asks for others (`--agent`, `--model` e.g. \
+opus/sonnet/fable, `--effort` low|medium|high|xhigh|max). \
+<id> is an id, unique id prefix, name, branch, or `self` (ids work across projects). Run \
+`loom chats --help` for more. \
+Only act on other chats when the user asks you to.
+</loom-harness>"""
+
+
+def harness_env() -> dict[str, str]:
+    """Env that lets a chat reach its loom: the API URL (the server sets LOOM_API_URL at
+    `serve`; fall back to the configured host/port) and loom's own bin dir on PATH so the
+    `loom` console script resolves even when it isn't installed globally."""
+    bin_dir = str(Path(sys.executable).parent)
+    path = os.environ.get("PATH", "")
+    return {
+        "LOOM_API_URL": os.environ.get("LOOM_API_URL") or f"http://{LOOM_API_HOST}:{LOOM_API_PORT}",
+        "PATH": path if bin_dir in path.split(os.pathsep) else f"{bin_dir}{os.pathsep}{path}",
+    }
+
+
+def agent_note(cwd: str | None) -> str:
+    """The full system-prompt note for a loom chat: the worktree runtime note (if any) + the
+    harness note."""
+    _, runtime_note = _loom_runtime(cwd)
+    return "\n\n".join(n for n in (runtime_note, HARNESS_NOTE) if n)

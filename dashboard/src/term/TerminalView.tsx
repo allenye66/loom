@@ -462,6 +462,7 @@ export function TerminalView({
     let disposed = false;
     let pingTimer: number | undefined;
     let retry = 0;
+    let connectedOnce = false; // a later attach is a RECONNECT (see the server's archived-chat rule)
     let lastSentDims = ''; // last "COLSxROWS" sent — dedup redundant resizes (each is a SIGWINCH → full re-render)
     // Which host backs this session — the server says in its `backend` control frame.
     // Branches the wheel path: tmux owns the screen (forward SGR wheel events), pty gives
@@ -552,7 +553,10 @@ export function TerminalView({
         retry = 0;
         // First frame carries the chat id + cwd + initial size + agent; the server
         // (re)attaches the session and replays its recent output.
-        send({ chat_id: resume, cwd, cols: term.cols, rows: term.rows, agent });
+        // `reconnect`: the server won't relaunch an archived chat's stopped agent for a reconnect
+        // (e.g. after a loom restart) — only for an explicit open.
+        send({ chat_id: resume, cwd, cols: term.cols, rows: term.rows, agent, reconnect: connectedOnce });
+        connectedOnce = true;
         lastSentDims = `${term.cols}x${term.rows}`; // session is (re)attached at this size — seed the dedup
         pingTimer = window.setInterval(() => send({ type: 'ping' }), 25000);
       };

@@ -62,10 +62,11 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   tmux** host only drives a still-live old session. Both scrub `CLAUDECODE`/`CLAUDE_CODE_*`
   from the child so the nested `claude` doesn't inherit auto-approve (see
   `docs/CLAUDE_AGENT_SDK_NOTES.md`).
-- Terminal sessions launch with xhigh effort (and agent-specific flags from
-  `core/agents.py`). Agent is chosen when creating a task (`agent:
-  claude|grok|codex`) and stored sticky in the chat overlay — never switch
-  mid-session.
+- Terminal sessions launch with xhigh effort and the CLI's default model (plus
+  agent-specific flags from `core/agents.py`), unless the chat pins its own
+  (overlay `model` / `effort`, set by `loom chats spawn` — default: the spawning
+  chat's). Agent is chosen when creating a task (`agent: claude|grok|codex`) and
+  stored sticky in the chat overlay — never switch mid-session.
 - The chat manager treats agent transcripts as **read-only** truth
   (`~/.claude/projects/**/*.jsonl`, `~/.grok/sessions/**`,
   `~/.codex/sessions/**`) and keeps user state (star/archive/tags/name/agent)
@@ -74,6 +75,11 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   binds the discovered native id as `agent_session_id` post-launch (notify hook
   → rollout cwd-scan) and resume goes through `codex resume <that id>`. See
   `docs/DECISIONS.md` D17 before touching that flow.
+- **loom is self-aware (D20)**: every chat's agent is told (system-prompt `<loom-harness>` note)
+  it can drive loom with `loom chats …` / `loom categories …` / `loom whoami` / `loom projects`
+  (`loom/harness.py`, a thin client of the running server), scoped to the chat's own project
+  unless told `--project` / `-A`. Categories are server-side (`~/.loom/categories.json`).
+  Archiving a chat also stops its agent.
 - Match the existing code style; keep Python imports at top of file.
 
 ## Docs
@@ -97,6 +103,9 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 - **Sidebar-first shell** — the chat rail *is* the app (no separate Tasks/Chats pages):
   loom's task chats with active/archived tabs, search, drag-to-reorder, collapsible
   categories, per-chat needs-you / working status, and notes.
+- **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
+  categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
+  working on a handoff prompt).
 - **In-chat tools** — dev-stack start/stop + FE/BE/test logs, transcript search,
   copy-text panel, ⌘↑/⌘↓ message jumps, image drop, PR badges, Claude usage chip,
   `⧉ terminal` (plain shell in the worktree), open-in-editor.
