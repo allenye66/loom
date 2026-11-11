@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useOpenChat } from './openChat';
+import { useChatShell, useOpenChat } from './openChat';
+import { InlineRename, useRenameChat } from './InlineRename';
 import { NotesButton } from '../notes/NotesButton';
 import {
   addCategory,
@@ -368,7 +369,10 @@ function ProjectMenu({
  *  history (no page lists that anymore). Every chat opens into the terminal surface. */
 export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const openChat = useOpenChat();
+  const { active, open: setActiveChat } = useChatShell();
   const { patch } = useChatActions();
+  const renameChat = useRenameChat();
+  const [renamingChat, setRenamingChat] = useState<string | null>(null); // chat id being renamed in place
   const { create, remove } = useTaskActions();
   const { data: repos } = useRepos();
   const { data: doctor } = useDoctor();
@@ -461,6 +465,15 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     mode: c.mode,
     agent: c.agent,
   }));
+
+  // The open chat's header title follows its sidebar row — so a rename (here, in the header, or
+  // via `loom chats rename`) shows up there, and a ?chat= deep link (which starts out titled
+  // with the bare id) picks up the real name.
+  const activeTitle = rows.find((r) => r.id === activeSid)?.title;
+  useEffect(() => {
+    if (active && active.resume === activeSid && activeTitle && active.title !== activeTitle)
+      setActiveChat({ ...active, title: activeTitle });
+  }, [activeSid, activeTitle, active?.title]);
 
   // Stable, user-controlled order: each chat keeps its saved slot; brand-new chats sit at the
   // top until persisted. While searching, show matches in the query's order instead.
@@ -636,7 +649,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     return (
       <div
         key={r.id}
-        draggable={!q}
+        draggable={!q && renamingChat !== r.id}
         onDragStart={(e) => {
           dragId.current = r.id;
           e.dataTransfer.effectAllowed = 'move';
@@ -683,7 +696,22 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           <span className="pointer-events-none absolute inset-x-1 -top-px h-0.5 rounded-full bg-accent shadow-[0_0_4px_var(--color-accent)] z-10" />
         )}
         <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${working ? 'bg-accent animate-pulse' : needs ? 'bg-ok' : 'bg-muted/40'}`} />
-        <span className="text-xs text-ink truncate flex-1">{r.title}</span>
+        {renamingChat === r.id ? (
+          <InlineRename
+            value={r.title}
+            onCommit={(name) => { renameChat(r.id, name); setRenamingChat(null); }}
+            onCancel={() => setRenamingChat(null)}
+            className="flex-1 text-xs text-ink"
+          />
+        ) : (
+          <span
+            onDoubleClick={() => setRenamingChat(r.id)}
+            title="double-click to rename"
+            className="text-xs text-ink truncate flex-1"
+          >
+            {r.title}
+          </span>
+        )}
         {r.agent && (
           <span title={`${r.agent} session`} className="text-muted shrink-0 opacity-80 inline-flex items-center">
             <AgentIcon agent={r.agent} />

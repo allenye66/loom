@@ -102,7 +102,8 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   branch = git's default). Categories are per project.
 - **Sidebar-first shell** — the chat rail *is* the app (no separate Tasks/Chats pages):
   loom's task chats with active/archived tabs, search, drag-to-reorder, collapsible
-  categories, per-chat needs-you / working status, and notes.
+  categories, per-chat needs-you / working status, notes, and double-click-to-rename (sidebar row
+  or the open chat's header title).
 - **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
   categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
   working on a handoff prompt).

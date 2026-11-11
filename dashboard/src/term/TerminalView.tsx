@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { DevStackBar, OpenInIde } from '../chat/ChatSidebar';
+import { InlineRename, useRenameChat } from '../chat/InlineRename';
 import { PrBadges } from '../components/PrBadges';
 import { ServiceLogsPanel, useLogsPanel } from '../components/ServiceLogsPanel';
 import { NotesPanel } from '../notes/NotesPanel';
@@ -397,6 +398,8 @@ export function TerminalView({
   onClose: () => void;
 }) {
   const holderRef = useRef<HTMLDivElement>(null);
+  const renameChat = useRenameChat();
+  const [renaming, setRenaming] = useState(false); // header title is being edited in place
   // Which host backs this session — reported by the server on WS open (always pty, except a
   // still-live legacy tmux session). Gates the header's message-jump controls; the live
   // wheel/snapshot branching uses the effect-local mirror below.
@@ -848,7 +851,22 @@ export function TerminalView({
             <span className="text-[10.5px] mono px-2 py-0.5 rounded-full border border-accent-dim text-accent shrink-0">
               ❯ terminal
             </span>
-            <span className="mono text-sm text-ink truncate">{title ?? liveAgent ?? 'session'}</span>
+            {renaming && resume ? (
+              <InlineRename
+                value={title ?? ''}
+                onCommit={(name) => { renameChat(resume, name); setRenaming(false); }}
+                onCancel={() => setRenaming(false)}
+                className="mono text-sm text-ink w-64 max-w-full"
+              />
+            ) : (
+              <span
+                onDoubleClick={resume ? () => setRenaming(true) : undefined}
+                title={resume ? 'double-click to rename' : undefined}
+                className="mono text-sm text-ink truncate"
+              >
+                {title ?? liveAgent ?? 'session'}
+              </span>
+            )}
             {liveAgent && (
               <span className="text-[10px] mono px-1.5 py-0.5 rounded border border-edge text-muted shrink-0">
                 {liveAgent}
