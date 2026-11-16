@@ -3,6 +3,7 @@ import { useDoctor, useRepos, useTasks, useTaskActions, type Repo } from './api'
 import { ChatProvider } from './chat/ChatContext';
 import { useChatShell } from './chat/openChat';
 import { ChatSidebar } from './chat/ChatSidebar';
+import { CommandPalette } from './chat/CommandPalette';
 import { TerminalView } from './term/TerminalView';
 
 /** The loom mark: one thread weaving over and under three warp dots (parallel tasks).
@@ -211,6 +212,7 @@ function Shell() {
   const { active, close } = useChatShell();
   return (
     <div className="flex h-screen min-h-0 bg-canvas">
+      <CommandPalette />
       <ChatSidebar activeSid={active?.resume} />
       {active ? (
         <TerminalView

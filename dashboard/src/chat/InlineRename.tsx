@@ -1,22 +1,26 @@
 import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useChatActions, type Chat } from '../api';
+import { useChatShell } from './openChat';
 
 /**
- * Rename a chat's sidebar name: optimistically patch every cached chat list (so the new name
- * shows at once; the open chat's header follows via the sidebar's title sync), then persist it
- * via `PATCH /chats/{id}` (the same overlay `name` that `loom chats rename` writes).
+ * Rename a chat's sidebar name: optimistically patch every cached chat list and, if it's the
+ * open chat, its header title (the sidebar also keeps the header in sync, but only while the
+ * chat's row is in the — possibly search-filtered — list), then persist it via
+ * `PATCH /chats/{id}` (the same overlay `name` that `loom chats rename` writes).
  * Empty / unchanged names are ignored — a blank never wipes a chat's name.
  */
 export function useRenameChat() {
   const qc = useQueryClient();
   const { patch } = useChatActions();
+  const { active, open } = useChatShell();
   return (id: string, name: string) => {
     const next = name.trim();
     if (!next) return;
     qc.setQueriesData<Chat[]>({ queryKey: ['chats'] }, (list) =>
       Array.isArray(list) ? list.map((c) => (c.id === id ? { ...c, name: next } : c)) : list,
     );
+    if (active?.resume === id) open({ ...active, title: next });
     patch.mutate({ id, patch: { name: next } });
   };
 }

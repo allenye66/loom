@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useChatShell, useOpenChat } from './openChat';
 import { InlineRename, useRenameChat } from './InlineRename';
+import { PALETTE_KEY_LABEL, WORKING_WITHIN_S } from './shortcuts';
 import { NotesButton } from '../notes/NotesButton';
 import {
   addCategory,
@@ -83,9 +84,6 @@ const saveProject = (name: string) => {
 };
 // Live branch-name sanitizer: keep only chars git allows in a ref (spaces/anything else → '-').
 const sanitizeBranch = (s: string) => s.replace(/[^A-Za-z0-9._/-]+/g, '-');
-// A terminal that produced output within this many seconds is "working" (claude's TUI
-// animates ~1/sec while busy); quieter than that and it's likely waiting on you.
-const WORKING_WITHIN_S = 6;
 
 /** Open this worktree in Cursor so an admin can hand-edit the code (the chat keeps
  *  running — no handoff). */
@@ -370,6 +368,7 @@ function ProjectMenu({
 export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const openChat = useOpenChat();
   const { active, open: setActiveChat } = useChatShell();
+  const qc = useQueryClient();
   const { patch } = useChatActions();
   const renameChat = useRenameChat();
   const [renamingChat, setRenamingChat] = useState<string | null>(null); // chat id being renamed in place
@@ -441,8 +440,10 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const syncedSid = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (!activeSid || syncedSid.current === activeSid || !chatList) return;
-    const repo = chatList.find((c) => c.id === activeSid)?.repo;
-    if (!repo) return; // not in this list (yet) — retry when it refreshes
+    const known = chatList.find((c) => c.id === activeSid)
+      ?? qc.getQueriesData<Chat[]>({ queryKey: ['chats'] }).flatMap(([, l]) => (Array.isArray(l) ? l : [])).find((c) => c.id === activeSid);
+    const repo = known?.repo;
+    if (!repo) return; // not in any list we have (yet) — retry when it refreshes
     syncedSid.current = activeSid;
     if (repo !== project?.name && repos?.some((r) => r.name === repo)) pickProject(repo);
   }, [activeSid, chatList, project?.name, repos]);
@@ -935,13 +936,19 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         <span className="text-[10px] text-muted mono">{rows.length}</span>
       </div>
 
-      <div className="px-3 pb-2">
+      <div className="px-3 pb-2 relative">
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="search title, branch, PR #, tag…"
-          className="w-full mono text-[11px] px-2 py-1 rounded bg-surface border border-edge outline-none focus:border-accent"
+          placeholder="search chats…"
+          title={`filter this list by title, branch, PR #, tag — or ${PALETTE_KEY_LABEL} to jump to any chat, in any project`}
+          className="w-full mono text-[11px] pl-2 pr-9 py-1 rounded bg-surface border border-edge outline-none focus:border-accent"
         />
+        {!q && (
+          <kbd className="pointer-events-none absolute right-[18px] top-[6px] text-[9px] mono leading-none px-1 py-[3px] rounded border border-edge text-muted/70">
+            {PALETTE_KEY_LABEL}
+          </kbd>
+        )}
       </div>
 
       {rows.length === 0 && (
