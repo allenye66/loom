@@ -798,7 +798,9 @@ def get_one_chat(sid: str) -> dict:
     chat = sessions.get_chat(sid)
     if chat is not None:
         chat = {**chat, "mode": mode, "agent": agent}
-    return {"chat": chat, "mode": mode, "agent": agent}
+    # `cwd` top-level too: a chat with no transcript yet has no `chat` row, but its task worktree
+    # is still where it must open.
+    return {"chat": chat, "mode": mode, "agent": agent, "cwd": _chat_cwd(sid)}
 
 
 def _chat_default_repo(chat: dict) -> str | None:
@@ -1047,7 +1049,10 @@ async def term_ws(websocket: WebSocket) -> None:
         with contextlib.suppress(Exception):
             await websocket.close()
         return
-    cwd = start.get("cwd")
+    # The browser's cwd, else where the chat's task lives. A `?chat=` deep link to a chat with no
+    # transcript yet (a fresh task) has no cwd to send — without this fallback the agent would
+    # launch in $HOME, sit at claude's folder-trust prompt, and never reach the worktree.
+    cwd = start.get("cwd") or _chat_cwd(chat_id)
     # A tab left open on an archived chat (its agent stopped by the archive) auto-reconnects after
     # a loom restart / network blip — that must not quietly relaunch the agent the archive stopped.
     # Explicit opens (first attach) still resume it. Keep the socket open but idle (answering pings)

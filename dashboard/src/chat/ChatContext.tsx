@@ -27,7 +27,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           resume: sid,
           title: sid.slice(0, 8),
           mode: d.mode ?? undefined,
-          cwd: d.chat?.cwd ?? undefined,
+          cwd: d.cwd ?? d.chat?.cwd ?? undefined, // d.cwd: the task worktree, even before any transcript
           agent: d.agent ?? d.chat?.agent ?? undefined,
         }),
       )
