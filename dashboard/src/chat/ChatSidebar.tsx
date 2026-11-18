@@ -25,6 +25,7 @@ import {
   type Task,
 } from '../api';
 import { AgentIcon } from '../components/AgentIcon';
+import { Spinner } from '../components/Spinner';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
 // opening a chat triggers (otherwise clicking a chat would snap the tab back to 'active').
@@ -367,11 +368,18 @@ function ProjectMenu({
  *  history (no page lists that anymore). Every chat opens into the terminal surface. */
 export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const openChat = useOpenChat();
-  const { active, open: setActiveChat } = useChatShell();
+  const { active, open: setActiveChat, close, pending, viewingPending, beginPending, readyPending, dropPending } = useChatShell();
   const qc = useQueryClient();
   const { patch } = useChatActions();
   const renameChat = useRenameChat();
   const [renamingChat, setRenamingChat] = useState<string | null>(null); // chat id being renamed in place
+  // A non-blocking error line at the top of the sidebar (a failed create / archive / delete).
+  const [notice, setNotice] = useState<string | null>(null);
+  useEffect(() => {
+    if (!notice) return;
+    const t = window.setTimeout(() => setNotice(null), 12000);
+    return () => window.clearTimeout(t);
+  }, [notice]);
   const { create, remove } = useTaskActions();
   const { data: repos } = useRepos();
   const { data: doctor } = useDoctor();
@@ -569,8 +577,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const [dragOverRow, setDragOverRow] = useState<string | null>(null); // row the drop would land just before
   const [creatingCat, setCreatingCat] = useState(false);
   const [catName, setCatName] = useState('');
-  const [renamingCat, setRenamingCat] = useState<string | null>(null);
-  const [renameDraft, setRenameDraft] = useState('');
+  const [renamingCat, setRenamingCat] = useState<string | null>(null); // category id being renamed in place
   const toggleCollapse = (key: string) =>
     setCollapsed((prev) => {
       const next = new Set(prev);
@@ -579,10 +586,6 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       saveCollapsed(next);
       return next;
     });
-  const commitRename = () => {
-    if (renamingCat) renameCategory(renamingCat, renameDraft);
-    setRenamingCat(null);
-  };
   const createCat = () => {
     if (!catName.trim()) return;
     addCategory(catName, project?.name);
@@ -596,7 +599,16 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     setDragOverRow(null);
   };
 
-  const archiveToggle = (id: string) => patch.mutate({ id, patch: { archived: tab !== 'archived' } });
+  // Optimistic (see useChatActions): the row leaves the list at once; the server stops the agent
+  // and dev stack in the background. Archiving the chat that's open closes its pane.
+  const archiveToggle = (id: string) => {
+    const archived = tab !== 'archived';
+    if (archived && active?.resume === id) close();
+    patch.mutate(
+      { id, patch: { archived } },
+      { onError: (e) => setNotice(`Couldn’t ${archived ? 'archive' : 'unarchive'} the chat: ${e.message}`) },
+    );
+  };
   // Fully delete an archived chat's worktree (git worktree + files). Warns first; the branch and
   // the chat transcript are kept. Also trims the worktree count, which keeps loom snappy.
   const deleteWorktree = (r: Row) => {
@@ -613,22 +625,33 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       )
     )
       return;
-    remove.mutate({ id: task.id, force: true });
+    if (active?.resume === r.id) close();
+    remove.mutate(
+      { id: task.id, force: true },
+      { onError: (e) => setNotice(`Couldn’t delete the worktree for ${task.branch}: ${e.message}`) },
+    );
   };
   const createTask = async () => {
     const b = branch.trim().replace(/^-+/, ''); // input is sanitized live; also drop any leading "-"
     if (!b || !repoRoot) return;
     setBranch('');
     setCreating(false);
+    // Feedback from the first instant: a placeholder row here + a loading state in the content pane
+    // (the worktree can take a while to make); the terminal pane then shows "starting <agent>…".
+    const pid = beginPending({ branch: b, agent, repo: project?.name });
+    const fail = (why: string) => {
+      dropPending(pid);
+      setNotice(`Couldn’t create ${b}: ${why}`);
+    };
     try {
       const task = await create.mutateAsync({ repo_root: repoRoot, branch: b, agent });
       // Only open a chat for a healthy task — a worktree that failed to create would just
       // produce repeated "working directory does not exist" errors.
-      if (task?.state === 'error') {
-        alert(`Couldn’t create the worktree:\n\n${task.note ?? 'unknown error'}`);
-        return;
-      }
-      if (task?.worktree_path)
+      if (task?.state === 'error') return fail(task.note ?? 'unknown error');
+      if (!task?.worktree_path) return dropPending(pid);
+      const stillHere = readyPending(pid, task.chat_id ?? undefined);
+      if (!task.chat_id) dropPending(pid);
+      if (stillHere)
         openChat({
           cwd: task.worktree_path,
           resume: task.chat_id ?? undefined,
@@ -636,10 +659,31 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           mode: 'terminal',
           agent: task.chat_agent ?? agent,
         });
+      else if (task.chat_id)
+        // They clicked elsewhere while it was being made: don't yank the pane away, but a chat only
+        // gets its sidebar row once an agent is attached — so start it headless.
+        fetch(`/api/chats/${task.chat_id}/start`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: '{}',
+        })
+          .catch(() => {})
+          .finally(() => qc.invalidateQueries({ queryKey: ['chats'] }));
     } catch (e: any) {
-      alert(`Couldn’t create the task:\n\n${e?.message ?? e}`);
+      fail(e?.message ?? String(e));
     }
   };
+
+  // A placeholder row stands in for a task being created until its real chat row shows up in the
+  // list (it appears once the agent attaches); whatever never does is dropped after a while.
+  const pendingHere = tab === 'active' && !q ? pending.filter((p) => !p.repo || p.repo === project?.name) : [];
+  useEffect(() => {
+    for (const p of pending) if (p.chatId && (chatList ?? []).some((c) => c.id === p.chatId)) dropPending(p.id);
+  }, [pending, chatList]);
+  useEffect(() => {
+    const timers = pending.filter((p) => p.chatId).map((p) => window.setTimeout(() => dropPending(p.id), 45000));
+    return () => timers.forEach((t) => window.clearTimeout(t));
+  }, [pending.map((p) => `${p.id}:${p.chatId ?? ''}`).join()]);
 
   // One chat row. `catId` is the group it's rendered in (undefined in the ungrouped list):
   // dropping another chat on it reorders AND files the dragged chat into this row's group.
@@ -779,22 +823,21 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         }`}
       >
         {renaming ? (
-          <input
-            autoFocus
-            value={renameDraft}
-            onChange={(e) => setRenameDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') commitRename();
-              if (e.key === 'Escape') setRenamingCat(null);
-            }}
-            onBlur={commitRename}
-            className="flex-1 min-w-0 mono text-[10px] px-1 py-0.5 rounded bg-canvas border border-edge outline-none focus:border-accent"
+          <InlineRename
+            value={g.name}
+            label="category name"
+            onCommit={(name) => { renameCategory(g.id!, name); setRenamingCat(null); }}
+            onCancel={() => setRenamingCat(null)}
+            className="flex-1 mono text-[10px]"
           />
         ) : (
           <button
-            onClick={() => toggleCollapse(g.key)}
+            // Click toggles. A custom category's double-click renames it instead: its second click
+            // is ignored and the double-click puts the first one back, so the group ends as it was.
+            onClick={(e) => { if (e.detail < 2 || g.id === null) toggleCollapse(g.key); }}
+            onDoubleClick={g.id !== null ? () => { toggleCollapse(g.key); setRenamingCat(g.id); } : undefined}
             aria-expanded={!isColl}
-            title={`${isColl ? 'expand' : 'collapse'}${movable ? ' · drag to move' : ''}`}
+            title={`${isColl ? 'expand' : 'collapse'}${movable ? ' · drag to move · double-click to rename' : ''}`}
             className="flex-1 min-w-0 flex items-center gap-1.5 text-left text-muted hover:text-ink"
           >
             <span className="w-3 shrink-0 text-[11px] leading-none">{isColl ? '▸' : '▾'}</span>
@@ -805,7 +848,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         {g.id !== null && (
           <>
             <button
-              onClick={() => { setRenamingCat(g.id); setRenameDraft(g.name); }}
+              onClick={() => setRenamingCat(g.id)}
               title="rename category"
               className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-ink shrink-0 leading-none"
             >
@@ -921,6 +964,18 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         </div>
       )}
 
+      {notice && (
+        <div
+          role="alert"
+          className="mx-3 mb-2 px-2 py-1.5 rounded border border-bad/40 bg-bad/10 text-[11px] text-bad flex items-start gap-2"
+        >
+          <span className="flex-1 min-w-0 break-words">{notice}</span>
+          <button onClick={() => setNotice(null)} title="dismiss" className="shrink-0 leading-none hover:text-ink">
+            ✕
+          </button>
+        </div>
+      )}
+
       <div className="px-3 pb-2 flex items-center gap-2">
         <div className="flex rounded-md border border-edge overflow-hidden text-[11px]">
           {(['active', 'archived'] as const).map((t) => (
@@ -951,7 +1006,22 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         )}
       </div>
 
-      {rows.length === 0 && (
+      {/* Tasks still being created: a placeholder row each, until the real chat row replaces it. */}
+      {pendingHere.map((p) => (
+        <div
+          key={`pending-${p.id}`}
+          title={p.chatId ? `starting ${p.agent} in ${p.branch}…` : `creating the worktree for ${p.branch}…`}
+          className={`px-3 py-2 flex items-center gap-2 border-l-2 ${
+            viewingPending?.id === p.id ? 'bg-surface-2 border-accent' : 'border-transparent'
+          }`}
+        >
+          <Spinner size={10} />
+          <span className="text-xs text-muted truncate flex-1">{p.branch}</span>
+          <span className="text-[9px] mono text-accent shrink-0 animate-pulse">{p.chatId ? 'starting…' : 'creating…'}</span>
+        </div>
+      ))}
+
+      {rows.length === 0 && pendingHere.length === 0 && (
         <div className="px-3 text-[11px] text-muted/70">{q ? `no matches for "${q}"` : `no ${tab} chats`}</div>
       )}
 

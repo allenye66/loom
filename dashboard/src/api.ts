@@ -1,4 +1,4 @@
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 
 const BASE = '/api';
 
@@ -98,10 +98,29 @@ export function useTaskActions() {
         jsend<Task>('/tasks', 'POST', b),
       onSuccess: invTasks,
     }),
+    // Optimistic: the task and its chat vanish from the cached lists at once (a forced removal is
+    // also backgrounded server-side), and come back if the request fails.
     remove: useMutation({
       mutationFn: (v: { id: string; force?: boolean }) =>
         jsend(`/tasks/${v.id}${v.force ? '?force=true' : ''}`, 'DELETE'),
-      onSuccess: invTasks,
+      onMutate: async (v) => {
+        await Promise.all([qc.cancelQueries({ queryKey: ['tasks'] }), qc.cancelQueries({ queryKey: ['chats'] })]);
+        const chats = qc.getQueriesData<Chat[]>({ queryKey: ['chats'] });
+        const tasks = qc.getQueryData<Task[]>(['tasks']);
+        for (const [key, list] of chats)
+          if (Array.isArray(list)) qc.setQueryData(key, list.filter((c) => c.task !== v.id));
+        if (tasks) qc.setQueryData(['tasks'], tasks.filter((t) => t.id !== v.id));
+        return { chats, tasks };
+      },
+      onError: (_e, _v, ctx) => {
+        if (!ctx) return;
+        for (const [key, list] of ctx.chats) qc.setQueryData(key, list);
+        if (ctx.tasks) qc.setQueryData(['tasks'], ctx.tasks);
+      },
+      onSettled: () => {
+        invTasks();
+        qc.invalidateQueries({ queryKey: ['chats'] });
+      },
     }),
     test: useMutation({
       mutationFn: (v: { id: string; pytest_args?: string }) =>
@@ -231,13 +250,41 @@ export function useRefreshBrief(chatId: string | null | undefined) {
 
 type ChatPatch = Partial<Pick<Chat,'starred' | 'archived' | 'hidden' | 'name' | 'tags' | 'description' | 'mode'>>;
 
+/** Move a chat between the cached active / archived lists right away (the sidebar's rows
+ *  disappear the instant you click, not when the server answers). Returns what it overwrote. */
+function moveChatInCache(qc: QueryClient, id: string, archived: boolean) {
+  const lists = qc.getQueriesData<Chat[]>({ queryKey: ['chats'] });
+  const chat = lists.flatMap(([, l]) => (Array.isArray(l) ? l : [])).find((c) => c.id === id);
+  for (const [key, list] of lists) {
+    if (!Array.isArray(list)) continue;
+    const f = (key[1] ?? {}) as Partial<ChatQuery>;
+    let next = list;
+    if (f.tab === (archived ? 'active' : 'archived')) next = list.filter((c) => c.id !== id); // leaves this tab
+    else if (f.tab === (archived ? 'archived' : 'active') && chat && !list.some((c) => c.id === id)) {
+      // arrives in this tab — unless the list is a filtered view it wouldn't belong in
+      if (!f.q && !f.starred && (!f.repo || f.repo === chat.repo)) next = [{ ...chat, archived }, ...list];
+    } else if (list.some((c) => c.id === id)) next = list.map((c) => (c.id === id ? { ...c, archived } : c));
+    if (next !== list) qc.setQueryData(key, next);
+  }
+  return lists;
+}
+
 export function useChatActions() {
   const qc = useQueryClient();
   const inv = () => qc.invalidateQueries({ queryKey: ['chats'] });
   return {
+    // Archive / unarchive is optimistic: the lists update at once and roll back if the request fails.
     patch: useMutation({
       mutationFn: (v: { id: string; patch: ChatPatch }) => jsend(`/chats/${v.id}`, 'PATCH', v.patch),
-      onSuccess: inv,
+      onMutate: async (v) => {
+        if (v.patch.archived === undefined) return undefined;
+        await qc.cancelQueries({ queryKey: ['chats'] }); // an in-flight refetch would undo the move
+        return { before: moveChatInCache(qc, v.id, v.patch.archived) };
+      },
+      onError: (_e, _v, ctx) => {
+        for (const [key, list] of ctx?.before ?? []) qc.setQueryData(key, list);
+      },
+      onSettled: inv,
     }),
     remove: useMutation({ mutationFn: (id: string) => jsend(`/chats/${id}`, 'DELETE'), onSuccess: inv }),
     restore: useMutation({
