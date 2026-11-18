@@ -80,12 +80,21 @@ def _claude_settings(chat_id: str, *, fullscreen: bool) -> dict:
     """Per-session Claude settings (via --settings): theme, needs-you hooks, optional fullscreen."""
     NEEDS_DIR.mkdir(parents=True, exist_ok=True)
     mark = shlex.quote(str(_marker_path(chat_id)))
+    # Per-message workspace context (core/workspace.py): the hook POSTs claude's hook JSON (the
+    # prompt + session id) to loom, and loom answers with text to attach — or nothing. A tiny curl
+    # (not the `loom` CLI: a Python startup on every message would add latency) that never fails
+    # the turn: short timeout, errors swallowed.
+    ctx_url = shlex.quote(f"{harness_env()['LOOM_API_URL'].rstrip('/')}/api/chats/{chat_id}/prompt-context")
+    ctx_cmd = f"curl -s -m 3 -X POST --data-binary @- {ctx_url} || true"
     settings: dict = {
         "theme": "dark",
         "hooks": {
             "Stop": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
             "Notification": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"rm -f {mark}"}]}],
+            "UserPromptSubmit": [{"hooks": [
+                {"type": "command", "command": f"rm -f {mark}"},
+                {"type": "command", "command": ctx_cmd},
+            ]}],
         },
     }
     if fullscreen:

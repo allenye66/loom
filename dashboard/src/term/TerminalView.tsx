@@ -11,6 +11,8 @@ import { NotesPanel } from '../notes/NotesPanel';
 import { useNote } from '../notes/notesStore';
 import { STATUS_TONE, StatusPanel } from '../status/StatusPanel';
 import { UsageChip } from '../usage/UsageChip';
+import { MentionPicker } from './MentionPicker';
+import { BoardChip } from '../board/BoardButtons';
 import { useBrief, type Task } from '../api';
 import { createMessageNav, type JumpResult } from './messageNav';
 import { captureReadingPosition, restoreReadingPosition } from './readingPosition';
@@ -398,6 +400,9 @@ export function TerminalView({
   onClose: () => void;
 }) {
   const holderRef = useRef<HTMLDivElement>(null);
+  // `@@` chat-mention picker (MentionPicker): it sees every keystroke via mentionRef and types back via inputSendRef.
+  const mentionRef = useRef<((d: string) => boolean) | null>(null);
+  const inputSendRef = useRef<((data: string) => void) | null>(null);
   const renameChat = useRenameChat();
   const [renaming, setRenaming] = useState(false); // header title is being edited in place
   // Which host backs this session — reported by the server on WS open (always pty, except a
@@ -712,6 +717,7 @@ export function TerminalView({
       return true; // trackpad, inline → native xterm scroll (OS momentum)
     });
 
+    inputSendRef.current = (data) => send({ type: 'input', data });
     const onData = term.onData((d) => {
       // A keystroke/paste returns a scrolled-up user to live content (what a native terminal does)
       // — xterm does that itself (scrollOnUserInput), and ONLY for real user input. onData also
@@ -723,6 +729,7 @@ export function TerminalView({
       // Debug aid for paste truncation: log large inputs (likely pastes) so it's easy to see
       // the full byte count actually leaving the browser. Filter the console by "loom-term".
       if (d.length > 64) console.debug(`[loom-term] input ${d.length} bytes:`, JSON.stringify(d.slice(0, 60)) + (d.length > 60 ? '…' : ''));
+      if (mentionRef.current?.(d)) return; // consumed by the @@ picker
       send({ type: 'input', data: d });
     });
     const onResize = term.onResize(({ cols, rows }) => sendResize(cols, rows));
@@ -967,6 +974,7 @@ export function TerminalView({
           <div className="border-b border-edge bg-surface-2/30 px-5 py-1.5 flex flex-wrap items-center gap-2 text-[11px] mono shrink-0">
             {chatMeta.branch && <span className="px-2 py-0.5 rounded border border-edge text-muted">⎇ {chatMeta.branch}</span>}
             <PrBadges sid={resume} prs={chatMeta.prs ?? []} repo={chatMeta.pr_repo} />
+            <BoardChip chatId={resume} />
           </div>
         )}
 
@@ -1027,6 +1035,7 @@ export function TerminalView({
 
         {showText && resume && <CopyTextPanel chatId={resume} onClose={() => setShowText(false)} />}
         {showSearch && resume && <SearchPanel chatId={resume} onClose={() => setShowSearch(false)} />}
+        <MentionPicker handleRef={mentionRef} sendRef={inputSendRef} chatId={resume} />
     </div>
   );
 }

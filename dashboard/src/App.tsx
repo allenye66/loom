@@ -4,6 +4,7 @@ import { ChatProvider } from './chat/ChatContext';
 import { useChatShell } from './chat/openChat';
 import { ChatSidebar } from './chat/ChatSidebar';
 import { CommandPalette } from './chat/CommandPalette';
+import { BoardModal } from './board/BoardModal';
 import { TerminalView } from './term/TerminalView';
 
 /** The loom mark: one thread weaving over and under three warp dots (parallel tasks).
@@ -213,6 +214,7 @@ function Shell() {
   return (
     <div className="flex h-screen min-h-0 bg-canvas">
       <CommandPalette />
+      <BoardModal />
       <ChatSidebar activeSid={active?.resume} />
       {active ? (
         <TerminalView

@@ -33,7 +33,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 |---|---|
 | `models.py` | Pydantic models: `Task`, `TaskState`, `Ports`, `ServiceProc`. |
 | `cli.py` | Typer CLI: `doctor, serve, repo-add, new, ls, rm, test, start, stop, claude` + the harness groups (`chats`, `categories`, `whoami`). `serve` runs uvicorn and exports `LOOM_API_URL` for the chats it launches. |
-| `harness.py` | **The agent-facing harness** (D20): `loom chats ls/show/brief/archive/unarchive/close/star/rename/categorize/spawn/send/open`, `loom categories ls/add/rm/rename`, `loom whoami`, `loom projects`. Project-scoped: commands default to the caller chat's project (else the repo containing the cwd); `--project` / `-A` widen it; chat refs resolve across projects. A thin HTTP client of the running server (`LOOM_API_URL`); `self` = `$LOOM_CHAT_ID`; plain-text output, `--json` everywhere, `ls --ids` for piping. |
+| `harness.py` | **The agent-facing harness** (D20): `loom chats ls/show/brief/archive/unarchive/close/star/rename/categorize/spawn/send/open`, `loom categories ls/add/rm/rename`, `loom board read/post/wait/ls` (D21), `loom whoami`, `loom projects`. Project-scoped: commands default to the caller chat's project (else the repo containing the cwd); `--project` / `-A` widen it; chat refs resolve across projects. A thin HTTP client of the running server (`LOOM_API_URL`); `self` = `$LOOM_CHAT_ID`; plain-text output, `--json` everywhere, `ls --ids` for piping. |
 | `server/app.py` | `create_app()`: FastAPI, permissive CORS (localhost tool), mounts the router under `/api`, serves `dashboard/dist` at `/`. |
 | `server/api.py` | All REST endpoints + the `/api/ws/term` WebSocket route. |
 | `core/config.py` | `~/.loom` paths, `LOOM_API_PORT` (8787), and the per-repo **`.loom.yaml`** loader (`RepoConfig`). The file is optional: without one a repo is a plain project (no services/setup/ports) and `base_branch` defaults to git's default branch (`default_branch`: origin/HEAD, else local `main`/`master`, else the checked-out branch). |
@@ -49,6 +49,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `core/sessions.py` | **Chat manager**: index `~/.claude/projects/**/*.jsonl` + `~/.grok/sessions/**` + `~/.codex/sessions/**` rollouts (mtime-cached), merge a local overlay, search, soft-trash, and `get_transcript()` (reconstruct a session into render items; claude + codex formats). Codex rows claimed by an `agent_session_id` binding are re-keyed to their loom chat id. Chat→task resolution: the `task.chat_id` link wins (homes adopted chats in their task's worktree), then worktree/repo cwd-prefix inference. |
 | `core/runtime.py` | Per-worktree runtime context: if a session's cwd is inside a worktree, build its `LOOM_*` env (ports/log dir) + the `<loom-runtime>` system-prompt note. Project-agnostic. Also the `<loom-harness>` note every chat gets (`HARNESS_NOTE`, via `agent_note`) and `harness_env` (`LOOM_API_URL` + loom's bin on PATH). |
 | `core/categories.py` | **Chat categories** (the sidebar groups), server-side in `categories.json` so agents see them: add/rename/remove/order/assign, `find` by id or name within a project, and `import_state` (idempotent merge of a browser's legacy localStorage categories). |
+| `core/db.py` · `core/board.py` · `core/workspace.py` · `core/mentions.py` | **Category message boards + workspace context** (D21). `db.py`: loom's SQLite file `loom.db` (WAL; one short-lived connection per call). `board.py`: append-only per-category posts + per-reader read cursors (seq assigned in a `BEGIN IMMEDIATE` transaction; `unread`, `summary`). `workspace.py`: what a chat is told about its loom workspace per message — a roster block (category + who else is in it; re-sent only when it changes), the unread board digest, and resolved `@mentions` — returned as `<loom-context>` text, or nothing. `mentions.py`: `@slug` parsing/resolution (exact slug → id prefix → unique slug prefix; only real chats match, so claude's `@file` is left alone). |
 | `core/claude_session.py` | Native launcher (`open_session`/`resume_session` via tmux/Terminal.app). Powers the `loom claude` CLI and the `⧉ terminal` (plain shell in the worktree) button. |
 | `core/terminals.py` | **The chat surface** (+ the harness's headless control: `start_chat` launches an agent with no browser — a brand-new session takes a startup prompt; `send_text` types a message through the input funnel, refusing over a draft; `close_chat`; `waiting_on` spots a startup prompt like Claude's folder trust). The surface: the *real* agent TUI (claude/grok/codex via `core/agents.py`) in the browser, bridged to WebSocket subscribers as raw bytes (xterm.js renders them). Host: `PtyTerminalSession` ("smooth scroll" — a detached `pty_server` daemon, inline renderer, xterm owns scrollback) is the only one loom starts; `TmuxTerminalSession` ("classic", legacy — fullscreen `claude` in `loomx-<chat_id>`) only drives a still-live old tmux session until it exits. Both survive loom restarts + browser disconnects. Uses `core/runtime.py` for the worktree env + system-prompt note. |
 | `core/pty_server.py` | The pty backend's **persistence daemon**: runs one command under a PTY on an AF_UNIX socket, detached (`start_new_session`) so it outlives loom. Escape-protocol relay (`\x1c` framing: resize / snapshot / literal), 1 MB replay ring (alt-screen-filtered on replay), DA1/DA2 interception (answers device-attribute queries itself so xterm's auto-reply can't echo as garbage), and settle-aware snapshots (waits for the TUI to go quiescent before capturing). Stdlib-only; runnable standalone as `python -m loom.core.pty_server`. |
@@ -67,6 +68,9 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `api.ts` | REST types + TanStack Query hooks (`useTasks`, `useRepos`, `useDoctor`, `useChats`, `useTrash`, `useUsage`, `useBrief`, `useTaskActions`, `useChatActions`). |
 | `chat/ChatContext.tsx` · `chat/openChat.ts` | `ChatProvider`: the active chat (`open`/`close`), `?chat=<id>` sync (restored on load via `GET /api/chats/{id}`), and the global `NotesModal`. `openChat.ts` holds the contexts + `useOpenChat` / `useChatShell`. |
 | `chat/ChatSidebar.tsx` | The chat rail, scoped to one **project**: the header's `ProjectMenu` switches projects (each with its chat count; remembered in localStorage `loom.activeProject`; opening a chat from another project switches to it) and adds any git repo. Lists that project's task chats (task link or a task-worktree cwd — not your whole history), active/archived tabs, search, drag-to-reorder, categories (Uncategorized pinned first, new categories just below it; click a header to collapse, drag it to move the category; ✎ rename, ✕ delete; drag a chat onto a group to file it), per-row needs-you / working status (`GET /api/terminals`), archive, `+ new` task + chat. Also exports the in-chat `DevStackBar` (dev-stack start/stop) and `OpenInIde`. |
+| `board/*` | The category message board UI (D21): `boardApi.ts` (queries + post/seen + the open-board store), `BoardModal.tsx` (posts, post as you, "nudge" chips), `BoardButtons.tsx` (`BoardButton` on a category header with an unread badge; `BoardChip` in an open chat's header). |
+| `term/MentionPicker.tsx` | `@@` chat mentions (D21): watches the terminal's keystrokes for a doubled `@` at a word start, takes the first `@` back out of claude's input box, shows a picker (same-category chats first), and pastes `@chat-slug ` on Enter. |
+| `chat/CommandPalette.tsx` · `chat/shortcuts.ts` | ⌘K: jump to any task chat in any project (live + archived), multi-term search, ↑↓/Enter/Esc; the shortcut + shared constants. |
 | `categories/categoriesStore.ts` | Sidebar categories + chat→category assignments, server-side (`/api/categories`, D20): optimistic updates that adopt the server's state, a 4 s poll so agents' edits appear, a one-time import of the legacy localStorage `loom.chatCategories`. Each category belongs to one project (`repo`; pre-project ones are filed under the project most of their chats are in). Collapsed groups stay in localStorage (`loom.sidebarCollapsedCats`). |
 | `status/StatusPanel.tsx` | The chat's status brief drawer (`GET/POST /api/chats/{id}/brief`): status pill, goal, working vs idle time, phase timeline, decisions tagged you/agent, unasked work, needs-you; cost footer. Docked above the notes drawer in the same right-hand column. |
 | `notes/*` | Per-chat notes in localStorage (`notesStore`): `NotesPanel` (drawer beside the terminal), `NotesModal` (all notes; reopen a chat from one), `NotesButton`. |
@@ -171,6 +175,18 @@ Claude subscription usage (5 h / 7 d) comes from the statusLine hook
 (`~/.loom/statusline-usage.sh` → `~/.loom/usage.json` → `GET /api/usage`). Per-turn
 cost/token readouts are not surfaced.
 
+### Category boards + per-message context (D21)
+A chat filed in a category shares that category's **message board**: `loom board post/read/wait`
+(CLI) or the dashboard's board modal. Posts live in SQLite (`core/board.py`); a post may *nudge*
+chats (`to`): if the target is running, `board_api._nudge` types a one-line heads-up into it
+(never launches a stopped chat; ≤5 nudges per author→target per minute). Context reaches Claude
+chats through a `UserPromptSubmit` hook (`agents._claude_settings`): a tiny `curl` POSTs claude's
+hook JSON to `POST /api/chats/{id}/prompt-context`, and `workspace.prompt_context` answers with
+`<loom-context>` text (roster block, unread board posts — marked read, resolved `@mentions`) or an
+empty body, which adds nothing. A chat with nothing new costs no tokens; nothing stale is baked
+into the system prompt. grok/codex have no such hook: they get the harness note and resolve
+`@name` themselves (`loom chats show @name`).
+
 ## REST + WS endpoints (`server/api.py`)
 ```
 GET  /api/health, /api/doctor, /api/usage
@@ -181,6 +197,8 @@ GET  /api/tasks/{id}/logs/kinds · /logs/since · SSE /logs/stream ;  DELETE /lo
 GET  /api/chats ;  GET/PATCH/DELETE /api/chats/{id} ;  POST /api/chats/{id}/restore   (PATCH archived:true also stops the agent)
 POST /api/chats/{id}/{start,send,close} ;  POST /api/spawn                            (headless control — the harness, D20)
 GET  /api/chats/{id}/settings                                                       (agent + the model / effort it runs on, and its pin)
+GET /api/boards ;  GET/POST /api/boards/{category_id} ;  GET /api/boards/{id}/wait ;  POST /api/boards/{id}/seen   (D21, `server/board_api.py`)
+GET  /api/chats/{id}/workspace ;  POST /api/chats/{id}/prompt-context                  (category roster / the UserPromptSubmit hook, D21)
 GET/POST /api/categories ;  PATCH/DELETE /api/categories/{id} ;  PUT /api/categories-{order,assign} ;  POST /api/categories-import
 GET  /api/chats-trash ;  POST /api/chats/reindex ;  GET /api/chats/{id}/{transcript,prs}
 GET  /api/chats/{id}/brief[?auto=1] ;  POST /api/chats/{id}/brief   (status brief; auto = regenerate if due)
@@ -189,7 +207,7 @@ WS   /api/ws/term      (terminal mode — raw PTY bytes; core/terminals.py)
 ```
 
 ## State files (`~/.loom/`, gitignored)
-`registry.json` (tasks) · `chats.json` (chat overlay) · `categories.json` (sidebar categories) ·
+`registry.json` (tasks) · `chats.json` (chat overlay) · `categories.json` (sidebar categories) · `loom.db` (SQLite: message boards, read cursors, per-chat context state; D21) ·
 `sessions_index.json` (index cache) · `pr_created.json` (PR createdAt cache, D19) · `repos.json` · `usage.json` (statusLine usage) ·
 `needs/` (needs-you markers) · `briefs/` (status briefs + cost) · `trash/` (legacy: transcripts the old hard delete moved) ·
 `logs/` (`<task>-<service>.log`, `<task>-test.log`, `loomx-<chat>-pty.log`) ·

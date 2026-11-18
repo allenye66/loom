@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from loom import __version__
 from loom.core import manager, monitor, perf, registry, terminals
 from loom.server.api import router
+from loom.server.board_api import router as board_router
 
 DASHBOARD_DIST = Path(__file__).resolve().parents[2] / "dashboard" / "dist"
 
@@ -79,6 +80,7 @@ def create_app() -> FastAPI:
             return resp
 
     app.include_router(router, prefix="/api")
+    app.include_router(board_router, prefix="/api")
 
     if DASHBOARD_DIST.exists():
         app.mount("/", StaticFiles(directory=str(DASHBOARD_DIST), html=True), name="dashboard")

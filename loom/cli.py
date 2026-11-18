@@ -25,6 +25,7 @@ console = Console()
 # loom chat's agent is told about these in its system prompt.
 app.add_typer(harness.chats_app, name="chats")
 app.add_typer(harness.categories_app, name="categories")
+app.add_typer(harness.board_app, name="board")
 app.command("whoami")(harness.whoami)
 app.command("projects")(harness.projects)
 

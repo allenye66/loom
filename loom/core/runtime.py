@@ -96,6 +96,7 @@ is $LOOM_CHAT_ID. When the user asks you to look at or manage their loom chats, 
   loom chats spawn --branch <b> --prompt <text> [--category C] [--model M] [--effort E]
                                                 new worktree + chat, already working
   loom chats send <id> <text>                   type a message into another chat
+  loom board read|post|wait|ls                  your category's shared message board (see below)
   loom categories ls|add|rm|rename
 The user has several projects (repos); `ls`, `spawn`, and `categories` default to THIS chat's \
 project — pass `--project NAME`, or `-A` (all projects) to `ls` / `categories ls`, when the user \
@@ -104,6 +105,12 @@ this chat's agent, model and effort unless the user asks for others (`--agent`, 
 opus/sonnet/fable, `--effort` low|medium|high|xhigh|max). \
 <id> is an id, unique id prefix, name, branch, or `self` (ids work across projects). Run \
 `loom chats --help` for more. \
+Chats filed in the same category share a message board — the place to leave findings, decisions \
+and handoffs for each other (`loom board post "…" [--to <chat>]`; `loom board read`; \
+`loom board wait [-n N]` blocks until N other posts arrive — up to 100 s per call, so loop for \
+longer — which beats polling). Unread posts, the category roster and any `@chat-name` mention \
+in the user's message are attached to your messages automatically; `loom whoami` shows the \
+current picture. \
 Only act on other chats when the user asks you to.
 </loom-harness>"""
 

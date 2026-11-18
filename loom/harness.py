@@ -24,6 +24,7 @@ import httpx
 import typer
 
 from loom.core.config import LOOM_API_HOST, LOOM_API_PORT
+from loom.core.mentions import slugify
 
 chats_app = typer.Typer(
     no_args_is_help=True,
@@ -31,6 +32,11 @@ chats_app = typer.Typer(
     help="See and manage loom's chats: list, read, brief, archive/close, categorize, spawn, send.",
 )
 categories_app = typer.Typer(no_args_is_help=True, add_completion=False, help="loom's sidebar categories.")
+board_app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="The shared message board of a category: post findings/handoffs, read what you missed, wait for others.",
+)
 
 WORKING_WITHIN_S = 6  # output within this many seconds = "working" (the sidebar's pulse window)
 _NONE_CATEGORY = {"none", "uncategorized", "-", ""}
@@ -134,6 +140,7 @@ class _World:
         if ref in self._by_id:
             return self._by_id[ref]
         pool = self.loom_chats
+        ref = ref.lstrip("@")  # an `@mention` token works as a ref
         hits = [c for c in pool if len(ref) >= 4 and c["id"].startswith(ref)]
         if not hits:
             low = ref.lower()
@@ -142,6 +149,9 @@ class _World:
                 if low in ((c.get("name") or "").lower(), (c.get("display_title") or "").lower())
                 or ref in (c.get("branch"), c.get("task"))
             ]
+        if not hits and slugify(ref):  # `@some-chat-name`: the slug the dashboard's @@ picker types
+            slug = slugify(ref)
+            hits = [c for c in pool if slug in (slugify(c.get("name") or ""), slugify(c.get("display_title") or ""))]
         if len(hits) == 1:
             return hits[0]
         if not hits:
@@ -649,6 +659,18 @@ def whoami(as_json: bool = typer.Option(False, "--json")) -> None:
         _out_json({**_row_json(w, c), "model": s.get("model"), "effort": s.get("effort")})
         return
     _print_meta(w, c)
+    _print_workspace(sid)
+
+
+def _print_workspace(sid: str) -> None:
+    ws = _api("GET", f"/chats/{sid}/workspace").get("workspace")
+    if not ws:
+        print(f"{'board':<11} none — this chat isn't in a category (`loom chats categorize self <category>`)")
+        return
+    b = ws["board"]
+    print(f"{'board':<11} {b['posts']} post{'s' if b['posts'] != 1 else ''}, {b['unread']} unread — `loom board read`")
+    others = ", ".join(f"{s['name']} ({s['id'][:8]})" for s in ws["siblings"][:12]) or "no one else yet"
+    print(f"{'others':<11} {others}" + (f" (+{len(ws['siblings']) - 12} more)" if len(ws["siblings"]) > 12 else ""))
 
 
 def projects(as_json: bool = typer.Option(False, "--json")) -> None:
@@ -745,3 +767,130 @@ def categories_rename(
     cat = _find_cat(w, name, project)
     _api("PATCH", f"/categories/{cat['id']}", body={"name": new_name})
     print(f"renamed category {cat['name']} → {new_name}")
+
+
+# --- board ----------------------------------------------------------------------------------
+def _board_key(category: str | None) -> tuple[str, str]:
+    """(board key, category name): the named category's, else the calling chat's own."""
+    cats = _api("GET", "/categories")
+    if category:
+        low = category.lower()
+        hit = next((c for c in cats["categories"] if c["id"] == category or c["name"].lower() == low), None)
+        return (hit["id"], hit["name"]) if hit else _die(f"no category '{category}' (`loom categories ls`)")
+    sid = _self_id()
+    if not sid:
+        _die("not inside a loom chat — name a board with --category")
+    cid = cats["assign"].get(sid)
+    if not cid:
+        _die("this chat isn't in a category, so it has no board — ask the user to file it in one "
+             "(or `loom chats categorize self <category>` if they asked you to)")
+    name = next((c["name"] for c in cats["categories"] if c["id"] == cid), cid)
+    return cid, name
+
+
+def _fmt_post(p: dict, me: str | None, names: dict[str, str]) -> str:
+    to = p.get("to") or []
+    direct = " → you" if me and me in to else (" → " + ", ".join(names.get(t, t[:8]) for t in to) if to else "")
+    reply = f" (re #{p['reply_to']})" if p.get("reply_to") else ""
+    body = (p.get("text") or "").rstrip().replace("\n", "\n      ")
+    return f"#{p['seq']} {p.get('from_name') or p.get('from')}{direct}{reply} · {_ago(p['ts'])}\n      {body}"
+
+
+def _print_posts(posts: list[dict], me: str | None) -> None:
+    names: dict[str, str] = {}
+    if any(p.get("to") for p in posts):
+        names = {c["id"]: _title(c) for c in _World().loom_chats}
+    for p in posts:
+        print(_fmt_post(p, me, names))
+
+
+@board_app.command("read")
+def board_read(
+    category: str = typer.Option(None, "--category", "-c", help="a category (default: this chat's)"),
+    all_: bool = typer.Option(False, "--all", "-a", help="the recent history, not just what's new"),
+    limit: int = typer.Option(30, "--limit", "-n", help="with --all: how many of the newest posts"),
+    seq: int = typer.Option(None, "--seq", help="just this post, in full"),
+    peek: bool = typer.Option(False, "--peek", help="don't mark what you read as read"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Read your category's board. By default: only the posts you haven't seen (and mark them seen)."""
+    key, cname = _board_key(category)
+    me = _self_id() or "user"
+    params: dict = {"reader": me, "mark": not peek}
+    if seq is not None:
+        params["since"] = max(0, seq - 1)  # then keep only that post below
+    elif all_:
+        params["limit"] = limit
+    else:
+        params["unread_only"] = True
+    r = _api("GET", f"/boards/{key}", params=params)
+    posts = [p for p in r["posts"] if seq is None or p["seq"] == seq]
+    if as_json:
+        _out_json({"category": cname, "posts": posts, "last_seq": r["last_seq"]})
+        return
+    if not posts:
+        print(f'no new posts on "{cname}" ({r["last_seq"]} total — `loom board read --all` for the history)')
+        return
+    print(f'Board "{cname}" — {len(posts)} post{"s" if len(posts) != 1 else ""}:')
+    _print_posts(posts, me)
+
+
+@board_app.command("post")
+def board_post(
+    text: str = typer.Argument(None, help="the message (`-` = stdin)"),
+    to: list[str] = typer.Option([], "--to", "-t", help="nudge these chats (id / name / @name) — repeatable; everyone in the category can still read it"),
+    reply: int = typer.Option(None, "--reply", "-r", help="the post number you're answering"),
+    category: str = typer.Option(None, "--category", "-c"),
+    file: str = typer.Option(None, "--file", "-f", help="read the post from a file"),
+) -> None:
+    """Post to your category's board — findings, decisions, handoffs, questions."""
+    msg = _read_text(text, file, "post")
+    if not msg or not msg.strip():
+        _die("nothing to post (pass the text, `-` for stdin, or --file)")
+    key, cname = _board_key(category)
+    ids = [_World().resolve(t)["id"] for t in to] if to else []
+    r = _api("POST", f"/boards/{key}", body={"text": msg, "to": ids, "reply_to": reply})
+    print(f'posted #{r["post"]["seq"]} to "{cname}"')
+    for tid, how in (r.get("nudged") or {}).items():
+        print(f"  → {tid[:8]}: {how}")
+
+
+@board_app.command("wait")
+def board_wait(
+    timeout: float = typer.Option(100.0, "--timeout", "-t", help="give up after this many seconds (keep under your shell's limit)"),
+    count: int = typer.Option(1, "--count", "-n", help="wait until this many posts from others have arrived"),
+    category: str = typer.Option(None, "--category", "-c"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Block until someone else posts (e.g. an orchestrator waiting for its workers' reports), then print it."""
+    key, cname = _board_key(category)
+    me = _self_id() or "user"
+    deadline = time.monotonic() + max(1.0, timeout)
+    got: list[dict] = []
+    while len(got) < max(1, count):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        r = _api("GET", f"/boards/{key}/wait", params={"reader": me, "timeout": min(left, 60.0)}, timeout=min(left, 60.0) + 20)
+        got += r["posts"]
+    if as_json:
+        _out_json({"category": cname, "posts": got, "timed_out": len(got) < max(1, count)})
+        return
+    if not got:
+        print(f'no new posts on "{cname}" after {timeout:.0f}s')
+        return
+    note = "" if len(got) >= count else f" (timed out waiting for {count})"
+    print(f'Board "{cname}" — {len(got)} new post{"s" if len(got) != 1 else ""}{note}:')
+    _print_posts(got, me)
+
+
+@board_app.command("ls")
+def board_ls(as_json: bool = typer.Option(False, "--json")) -> None:
+    """Every category's board: posts, unread for you, members."""
+    me = _self_id() or "user"
+    boards = _api("GET", "/boards", params={"reader": me})["boards"]
+    if as_json:
+        _out_json(boards)
+        return
+    rows = [[b["name"], str(b["members"]), str(b["count"]), str(b.get("unread", 0)), _ago(b.get("last_ts"))] for b in boards]
+    _table(["category", "chats", "posts", "unread", "last post"], rows) if rows else print("no categories yet")

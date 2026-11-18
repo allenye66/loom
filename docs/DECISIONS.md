@@ -287,6 +287,52 @@ only a UI around them. Decisions:
   `--dry-run`; the note says "only act on other chats when the user asks"; spawned chats record
   `spawned_by` (shown by `show`).
 
+## D21 — Category message boards, per-message context injection, `@@` mentions (2026-11-17)
+Goal: let the chats in one category work *together* — try three designs then reconvene; an
+orchestrator spawns QA chats and collects their reports — without the user pasting chat URLs
+between them. Decisions:
+- **A board per category, in SQLite.** `loom board post|read|wait|ls` + a dashboard modal. Posts are
+  an append-only log with per-reader read cursors (`core/board.py`, `loom.db`, WAL). SQLite rather
+  than another JSON file because `seq` assignment and cursor moves are single transactions (verified
+  with 8 threads / 6 processes posting at once: no lost or duplicate seq), "posts since N" is an
+  index lookup, and it is the natural home for shared state that agents and the dashboard both
+  write. Existing JSON state (`chats.json`, `categories.json`, `registry.json`) is *not* migrated:
+  it has one writer (the server) and works. Chats outside any category have no board — every
+  existing workflow is unchanged. The user's notes/chat order still live in the browser's
+  localStorage; moving them server-side (so agents can read them) is a separate job.
+- **Context arrives per message, not in the system prompt.** A `UserPromptSubmit` hook (a tiny
+  `curl`, not the Python CLI — startup would add ~250 ms to every message) POSTs claude's hook
+  JSON to `/api/chats/{id}/prompt-context`; the answer is attached to that turn, or nothing.
+  Returned only when there is something to say: the category roster (first message of a Claude
+  session, again only if the roster changes), unread board posts (then marked read), and resolved
+  `@mentions`. A chat with nothing new — and every uncategorised chat — adds **zero tokens**.
+  Baking the category and siblings into the system prompt was rejected: it goes stale the moment
+  the user drags a chat to another category. Only claude has this hook; grok/codex get the harness
+  note and resolve `@name` through the CLI (`loom chats show @name`).
+- **`@@` triggers the mention picker** (claude's own `@` is its file picker). The first `@` has
+  reached the TUI before the second arrives, so the picker sends a Backspace to take it back out,
+  swallows keystrokes while open, and pastes `@chat-slug ` (bracketed, so claude's picker doesn't
+  open on it). The visible text stays a plain `@name`; the hook resolves it server-side — slug of
+  the chat's name, then id prefix, then a unique slug prefix, same-category first, and only chats
+  that exist (so `@README.md` is left alone). Escape hatches: Esc cancels, Backspace on an empty
+  query leaves one `@`, Space on an empty query types a literal `@@ `. Mid-word `@@` never triggers.
+- **Nudges push, the hook delivers.** `loom board post --to <chat>` types a one-line heads-up into
+  a *running* target (never launches a stopped chat; refuses over an unsent draft; ≤5 per
+  author→target per minute so two agents can't ping-pong forever). The content isn't repeated in
+  the nudge: the target's hook attaches the unread posts to that very message.
+- **Measured** (real agents in an isolated loom; 3 workers + a coordinator implementing `slugify`
+  three ways; board vs `loom chats send`; n=2 per arm, so *indicative, not significant*): both
+  mechanisms delivered 3/3 reports with verbatim-correct tables and picked the true winner every
+  time; wall clock ≈ equal (96 s vs 91 s); the coordinator made 4.0 vs 7.5 API calls and re-read about
+  half the cached tokens (178k vs 364k, means) in the board arm (it blocks on `wait -n 3` instead of
+  taking a new turn per message). The overhead the board adds: ~150 tokens of static harness note per chat, one
+  ~110–180-token roster block per chat session, ~13 ms (`curl`) + 5–35 ms (server) per message.
+  The board's real advantages here are structural (a durable, human-readable record; broadcast;
+  late joiners; no input-box collisions), not raw speed on a one-shot task.
+- **Trust boundary:** a board post is text from a peer agent, injected into another agent's
+  context — the same boundary `loom chats send` already crosses. Posts are labelled by author and
+  nothing in the digest is phrased as an instruction; treat the board like any other tool output.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

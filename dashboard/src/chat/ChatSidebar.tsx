@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useChatShell, useOpenChat } from './openChat';
 import { InlineRename, useRenameChat } from './InlineRename';
 import { PALETTE_KEY_LABEL, WORKING_WITHIN_S } from './shortcuts';
+import { BoardButton } from '../board/BoardButtons';
 import { NotesButton } from '../notes/NotesButton';
 import {
   addCategory,
@@ -804,6 +805,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         )}
         {g.id !== null && (
           <>
+            <BoardButton catId={g.id} name={g.name} />
             <button
               onClick={() => { setRenamingCat(g.id); setRenameDraft(g.name); }}
               title="rename category"

@@ -140,6 +140,8 @@ export type Chat = {
   repo?: string | null;
   task?: string | null;
   name?: string | null;
+  category?: string | null; // the sidebar group (a category id) — set by GET /chats
+  category_name?: string | null;
   tags: string[];
   description?: string | null;
   starred: boolean;

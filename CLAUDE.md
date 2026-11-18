@@ -104,6 +104,10 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   loom's task chats with active/archived tabs, search, drag-to-reorder, collapsible
   categories, per-chat needs-you / working status, notes, double-click-to-rename (sidebar row
   or the open chat's header title), and a ⌘K palette to jump to any chat in any project.
+- **Category message boards + `@@` mentions** (D21) — chats in one category share a board
+  (`loom board post|read|wait`, a dashboard modal with unread badges); each Claude message gets only
+  the context that matters via a `UserPromptSubmit` hook (roster, unread posts, resolved `@chat`
+  mentions — nothing when there's nothing new); `@@` in the terminal opens a chat picker.
 - **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
   categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
   working on a handoff prompt).
