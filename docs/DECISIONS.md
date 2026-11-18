@@ -287,6 +287,32 @@ only a UI around them. Decisions:
   `--dry-run`; the note says "only act on other chats when the user asks"; spawned chats record
   `spawned_by` (shown by `show`).
 
+## D21 — Archive / delete answer at once; the slow part runs after the reply (2026-11-17)
+
+Archiving a chat with a live agent took ~5 s (measured 5.2 s ×3): `PATCH /chats` waited for
+`terminals.close_chat` — the pty daemon SIGTERMs its child and waits for it to exit, and on macOS
+a `claude` can sit in the exit state for a long time — then the dev-stack stop and port release.
+Deleting a 30k-file worktree took ~1.9 s (real ones with `node_modules` far more). Now:
+- **Server.** `PATCH /chats` replies right after the overlay write (~2 ms); stop-agent / stop-dev-stack /
+  release-ports (and, on unarchive, re-allocate-ports) run in `_archive_followup`, one chat's
+  follow-ups strictly in request order, each acting on the chat's *current* archived flag — so
+  archive→unarchive in quick succession ends unarchived with ports, however they interleave.
+  Failures are logged (`[loom archive] …`), never raised. `terminals.close_chat` is now joinable
+  (`_closing`) and `open_terminal` / `start_chat` wait out an in-flight close: the dying daemon's
+  last act is unlinking its socket files, which would otherwise delete a re-opened chat's new ones.
+  `DELETE /tasks/{id}?force=true` is split (`manager.detach_task` — registry, instant — then
+  `finish_removal` — stop stack, rm caches + worktree — in the background; a force removal never
+  failed anyway); re-creating the same branch meanwhile is refused until it finishes. A plain
+  (non-force) delete stays synchronous, since it can be refused. A crash between the two halves
+  leaves an orphan worktree directory, not a half-registered task.
+- **Client.** Archive / unarchive / delete-worktree update the cached lists optimistically and roll
+  back with an inline error if the request fails (`useChatActions().patch`, `useTaskActions().remove`).
+- **Creating a chat** shows a placeholder sidebar row + a "creating…" pane from submit, then the
+  terminal pane's own "starting <agent>…" until the first output. The real row only appears once an
+  agent attaches (`opened_at`), so the placeholder stays until then.
+- D20's semantics are unchanged: archiving still stops the agent (never the caller's own) and the
+  dev stack — just not on the request path.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

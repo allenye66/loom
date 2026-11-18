@@ -59,6 +59,8 @@ def create_task(
     slug = wt.slugify(branch)
     if registry.get_task(slug):
         raise ValueError(f"Task '{slug}' already exists")
+    if slug in _removing:
+        raise ValueError(f"Task '{slug}' is still being removed — try again in a few seconds")
     base = base_branch or cfg.base_branch
     wt_base = Path(cfg.worktree_base).expanduser() if cfg.worktree_base else (DEFAULT_WORKTREE_BASE / cfg.name)
     wt_path = str(wt_base / slug)
@@ -144,16 +146,47 @@ def remove_task(task_id: str, force: bool = False) -> None:
     if not task:
         return
     stop_task(task_id)
+    _remove_files(task, force)
+    registry.delete(task_id)
+
+
+def _remove_files(task: Task, force: bool) -> None:
     # Per-task scratch caches live under ~/.loom/cache/<task_id>/ (a repo's .loom.yaml points
     # tools there via {slug}, e.g. the per-worktree vite dep cache) — they die with the task,
     # so caches can't outlive their worktrees and quietly pile up.
-    shutil.rmtree(LOOM_HOME / "cache" / task_id, ignore_errors=True)
+    shutil.rmtree(LOOM_HOME / "cache" / task.id, ignore_errors=True)
     try:
         wt.remove_worktree(task.repo_root, task.worktree_path, force=force)
     except Exception:
         if not force:
             raise
+
+
+# A forced removal is slow on a big worktree (node_modules: seconds to minutes), so the server
+# answers after `detach_task` — the instant half — and runs `finish_removal` in the background.
+# A force removal never fails (see _remove_files), so splitting it changes nothing but timing.
+_removing: set[str] = set()
+
+
+def detach_task(task_id: str) -> Task | None:
+    """Phase 1 of a forced removal: forget the task (every task / chat list drops it at once).
+    Returns it for `finish_removal`, or None if there was no such task."""
+    task = registry.get_task(task_id)
+    if not task:
+        return None
+    _removing.add(task_id)  # until finish_removal: the branch can't be re-created on top of it
     registry.delete(task_id)
+    return task
+
+
+def finish_removal(task: Task) -> None:
+    """Phase 2 (slow, blocking): stop the task's dev stack and delete its worktree + caches."""
+    try:
+        for svc in task.services:
+            _teardown(svc)
+        _remove_files(task, force=True)
+    finally:
+        _removing.discard(task.id)
 
 
 # --- start / stop services (Phase 2) -----------------------------------------
