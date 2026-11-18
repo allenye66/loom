@@ -105,12 +105,12 @@ this chat's agent, model and effort unless the user asks for others (`--agent`, 
 opus/sonnet/fable, `--effort` low|medium|high|xhigh|max). \
 <id> is an id, unique id prefix, name, branch, or `self` (ids work across projects). Run \
 `loom chats --help` for more. \
-Chats filed in the same category share a message board — the place to leave findings, decisions \
-and handoffs for each other (`loom board post "…" [--to <chat>]`; `loom board read`; \
-`loom board wait [-n N]` blocks until N other posts arrive — up to 100 s per call, so loop for \
-longer — which beats polling). Unread posts, the category roster and any `@chat-name` mention \
-in the user's message are attached to your messages automatically; `loom whoami` shows the \
-current picture. \
+A category can have a shared message board — but only if the USER has enabled it (you can't); \
+`loom whoami` shows `board: on|off`. When it's on, it's the place to leave findings, decisions and \
+handoffs for the others (`loom board post "…" [--to <chat>]`; `loom board read`; `loom board wait \
+[-n N]` blocks until N other posts arrive — up to 100 s per call, so loop for longer — which beats \
+polling). The category roster, unread posts and any `@chat-name` mention in the user's message are \
+attached to your messages automatically. \
 Only act on other chats when the user asks you to.
 </loom-harness>"""
 

@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS board_cursors (
     seq    INTEGER NOT NULL,
     PRIMARY KEY (reader, board)
 );
+CREATE TABLE IF NOT EXISTS board_settings (
+    board      TEXT PRIMARY KEY,
+    enabled    INTEGER NOT NULL DEFAULT 0,
+    enabled_at REAL
+);
 CREATE TABLE IF NOT EXISTS ctx_state (
     key     TEXT PRIMARY KEY,
     ws_hash TEXT NOT NULL,

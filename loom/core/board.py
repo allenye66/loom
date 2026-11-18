@@ -7,6 +7,9 @@ into each other's input box". A post looks like:
     {"seq": 7, "ts": 1794…, "from": "<chat id>" | "user", "from_name": "…",
      "to": ["<chat id>", …], "text": "…", "reply_to": 3 | null}
 
+A board is **off by default** and the user turns it on, per category (`enable`; there is no way
+back for now). Until then agents can't post or read it and are told so.
+
 `seq` counts up from 1 per board (a board is a category id). Reading is cursor-based per reader
 (a chat id, or "user" for the dashboard): `unread` = posts after the reader's cursor that they
 didn't write. Chats that aren't in a category have no board — a board is a *group* tool, and this
@@ -49,6 +52,29 @@ def _key(key: str) -> str:
     if not key or not all(ch.isalnum() or ch in "_-" for ch in key):
         raise BoardError(f"bad board key {key!r}")
     return key
+
+
+# --- opt-in: a board exists for a category only once the user has enabled it ----------------
+def is_enabled(key: str) -> bool:
+    with db.connect() as con:
+        r = con.execute("SELECT enabled FROM board_settings WHERE board = ?", (_key(key),)).fetchone()
+        return bool(r and r["enabled"])
+
+
+def enable(key: str) -> dict:
+    """Turn a category's board on (idempotent). Deliberately one-way for now."""
+    with db.connect() as con:
+        con.execute(
+            "INSERT INTO board_settings (board, enabled, enabled_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(board) DO UPDATE SET enabled = 1, enabled_at = COALESCE(enabled_at, excluded.enabled_at)",
+            (_key(key), time.time()),
+        )
+    return {"key": key, "enabled": True}
+
+
+def enabled_keys() -> set[str]:
+    with db.connect() as con:
+        return {r["board"] for r in con.execute("SELECT board FROM board_settings WHERE enabled = 1")}
 
 
 def last_seq(key: str) -> int:
@@ -118,7 +144,8 @@ def addressed_to(post: dict, reader: str) -> bool:
 def summary(key: str, reader: str | None = None) -> dict:
     with db.connect() as con:
         r = con.execute("SELECT COUNT(*) AS n, COALESCE(MAX(seq),0) AS s, MAX(ts) AS t FROM board_posts WHERE board = ?", (_key(key),)).fetchone()
-        out = {"key": key, "count": int(r["n"]), "last_seq": int(r["s"]), "last_ts": r["t"]}
+        on = con.execute("SELECT enabled FROM board_settings WHERE board = ?", (key,)).fetchone()
+        out = {"key": key, "enabled": bool(on and on["enabled"]), "count": int(r["n"]), "last_seq": int(r["s"]), "last_ts": r["t"]}
         if reader:
             c = con.execute("SELECT seq FROM board_cursors WHERE reader = ? AND board = ?", (reader, key)).fetchone()
             cur = int(c["seq"]) if c else 0

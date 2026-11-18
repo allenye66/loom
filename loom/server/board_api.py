@@ -1,14 +1,17 @@
 """Message-board + workspace-context endpoints (see core/board.py, core/workspace.py).
 
-    GET  /api/boards                       every category's board: counts, last post, unread for ?reader=
+    GET  /api/boards                       every category's board: enabled?, counts, last post, unread for ?reader=
     GET  /api/boards/{key}                 posts (?since, ?limit, ?reader + ?unread_only, ?mark)
     POST /api/boards/{key}                 post (author = X-Loom-Chat, else "user"); `to` nudges those chats
     GET  /api/boards/{key}/wait            long-poll: returns as soon as someone else posts (or times out)
     POST /api/boards/{key}/seen            move a reader's cursor
+    POST /api/boards/{key}/enable          turn a category's board on — the USER only (see below)
     GET  /api/chats/{sid}/workspace        the chat's category, siblings, board state (`loom whoami`)
     POST /api/chats/{sid}/prompt-context   the UserPromptSubmit hook: text to attach to this message
 
-A board key is a category id. Chats outside any category have no board.
+A board key is a category id. Chats outside any category have no board, and a category's board is
+off until the user enables it (post / wait answer 409 with what to do; reads show `enabled: false`).
+There is no way to turn it off again for now.
 """
 
 from __future__ import annotations
@@ -41,6 +44,15 @@ def _category(key: str) -> dict:
     if not cat:
         raise HTTPException(404, f"no board '{key}' (a board is a category id)")
     return cat
+
+
+def _require_enabled(key: str, cat: dict) -> None:
+    if not board.is_enabled(key):
+        raise HTTPException(
+            409,
+            f'the message board for category "{cat["name"]}" isn\'t enabled — only the user can turn it on '
+            "(dashboard → the ▤ on the category's header). Until then, message chats directly with `loom chats send`.",
+        )
 
 
 def _rate_limited(author: str, target: str) -> bool:
@@ -77,6 +89,9 @@ def get_board(
     mark: bool = False,
 ) -> dict:
     cat = _category(key)
+    if not board.is_enabled(key):
+        return {"board": {"key": key, "name": cat["name"], "repo": cat.get("repo"), "enabled": False},
+                "posts": [], "last_seq": 0, "cursor": None}
     if unread_only:
         if not reader:
             raise HTTPException(400, "unread_only needs ?reader=")
@@ -88,7 +103,7 @@ def get_board(
     if mark and reader and posts:
         board.mark_seen(reader, key, max(p["seq"] for p in posts))
     return {
-        "board": {"key": key, "name": cat["name"], "repo": cat.get("repo")},
+        "board": {"key": key, "name": cat["name"], "repo": cat.get("repo"), "enabled": True},
         "posts": posts,
         "last_seq": board.last_seq(key),
         "cursor": board.cursor(reader, key) if reader else None,
@@ -132,6 +147,7 @@ async def _nudge(entry: dict, cat_name: str, targets: list[str]) -> dict:
 @router.post("/boards/{key}")
 async def post_to_board(key: str, body: PostIn, x_loom_chat: str | None = Header(None)) -> dict:
     cat = _category(key)
+    _require_enabled(key, cat)
     author = x_loom_chat or "user"
     # Stored as "user" (the human), not "you": agents read these names, and to an agent "you" is itself.
     # The dashboard renders author "user" as "you" on its own.
@@ -153,7 +169,7 @@ async def wait_for_posts(
     """Block until a post from someone other than `reader` lands after `since` (default: after the
     reader's cursor), or `timeout` seconds pass. Lets an orchestrator wait for its workers in one
     tool call instead of polling."""
-    _category(key)
+    _require_enabled(key, _category(key))
     timeout = max(0.0, min(timeout, 600.0))
     start = since if since is not None else (board.cursor(reader, key) if reader else board.last_seq(key))
     deadline = time.monotonic() + timeout
@@ -164,6 +180,18 @@ async def wait_for_posts(
                 board.mark_seen(reader, key, max(p["seq"] for p in posts))
             return {"posts": posts, "timed_out": not posts, "last_seq": board.last_seq(key)}
         await asyncio.sleep(0.4)
+
+
+@router.post("/boards/{key}/enable")
+def enable_board(key: str, x_loom_chat: str | None = Header(None)) -> dict:
+    """Turn a category's board on. Only the user does this (dashboard, or `loom board enable` in a
+    plain shell): a request that carries an agent's `X-Loom-Chat` is refused — whether a group of
+    chats shares a channel is the user's call, not theirs. Idempotent; no off switch for now."""
+    cat = _category(key)
+    if x_loom_chat:
+        raise HTTPException(403, "only the user can enable a message board (it's the ▤ on the category in the dashboard)")
+    out = board.enable(key)
+    return {**out, "name": cat["name"]}
 
 
 class SeenIn(BaseModel):

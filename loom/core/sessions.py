@@ -29,6 +29,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from loom.core import agents
+from loom.core import categories as categories_mod
 from loom.core import registry
 from loom.core import repos as repos_mod
 from loom.core.config import LOOM_HOME, ensure_dirs
@@ -563,16 +564,145 @@ def _codex_thread_names() -> dict:
     return names
 
 
-def _codex_claims() -> dict:
-    """{native codex session uuid → loom chat id} from overlay `agent_session_id`
-    bindings (written by terminals.py post-launch — codex can't be handed a session
-    id at launch the way claude/grok can)."""
+def _session_claims() -> dict:
+    """{agent-native session id → loom chat id} from overlay `agent_session_id` bindings.
+
+    The loom chat id is what everything loom owns is keyed by (terminal socket, hooks, categories,
+    board, `$LOOM_CHAT_ID`); the native id names the transcript. They're the same for claude/grok
+    chats — loom passes `--session-id` — except when they aren't: codex mints its own id (bound
+    after launch), and claude's background daemon can hand a chat a pre-warmed session with another
+    id (`bind_session`). A bound transcript's row is re-keyed to the loom chat id in build_index, so
+    every consumer sees one chat."""
     out: dict = {}
     for cid, ov in overlay_all().items():
         asid = ov.get("agent_session_id")
         if asid and asid != cid:
             out[str(asid)] = cid
     return out
+
+
+_codex_claims = _session_claims  # (older name)
+
+
+def canonical_id(sid: str) -> str:
+    """The loom chat id for an id that may be a bound native session id (an old link or note)."""
+    return _session_claims().get(sid, sid)
+
+
+def claude_project_dir(cwd: str) -> Path:
+    """Where claude keeps transcripts for sessions run in `cwd`: the path with every non-alphanumeric
+    char (so `/` and `.` too) replaced by `-`."""
+    return CLAUDE_PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def _file_contains(path: Path, needle: bytes, limit: int = 300 * 1024 * 1024) -> bool:
+    keep = max(0, len(needle) - 1)
+    tail = b""
+    try:
+        if path.stat().st_size > limit:
+            return False
+        with path.open("rb") as f:
+            while chunk := f.read(1 << 20):
+                buf = tail + chunk
+                if needle in buf:
+                    return True
+                tail = buf[-keep:] if keep else b""
+    except OSError:
+        return False
+    return False
+
+
+_NO_FINGERPRINT: set[tuple] = set()  # (path, mtime_ns, size, chat id) already scanned and found not to match
+
+
+def find_bound_session(chat_id: str, cwd: str | None) -> str | None:
+    """The claude session that IS this chat under another id: a transcript in the chat's worktree
+    whose records carry loom's own hook command for this chat (`touch …/needs/<chat id>` — loom
+    bakes it into every session it launches). That's an exact fingerprint, not a guess: a session
+    the user ran by hand in the worktree never has it. Newest match wins; sessions already bound to
+    another chat are skipped."""
+    if not cwd:
+        return None
+    needle = f"needs/{chat_id}".encode()
+    claimed = set(_session_claims())
+    seen: set[str] = set()
+    for c in (cwd, os.path.realpath(cwd)):
+        d = claude_project_dir(c)
+        if str(d) in seen or not d.is_dir():
+            continue
+        seen.add(str(d))
+        cands = [p for p in d.glob("*.jsonl") if p.stem != chat_id and p.stem not in claimed]
+        for p in sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            memo = (str(p), st.st_mtime_ns, st.st_size, chat_id)
+            if memo in _NO_FINGERPRINT:
+                continue  # unchanged since we last looked and it wasn't this chat's
+            if _file_contains(p, needle):
+                return p.stem
+            _NO_FINGERPRINT.add(memo)
+    return None
+
+
+def bind_session(chat_id: str, session_id: str) -> bool:
+    """Record that loom chat `chat_id` is really claude session `session_id` (`agent_session_id`).
+
+    Only for a claude chat that has no transcript under its own id (otherwise the session is a
+    continuation, e.g. after /clear, and stays its own row), and never for a session another chat
+    already owns. On the first bind, whatever you'd already set on the session's own row (name,
+    star, archive state, tags…) and its category are adopted by the loom chat id, since that's the
+    row the sidebar shows from now on. Returns True if the binding changed."""
+    if not session_id or session_id == chat_id:
+        return False
+    ov = get_overlay(chat_id)
+    if agents.normalize_agent(ov.get("agent")) != "claude" or ov.get("agent_session_id") == session_id:
+        return False
+    if _session_claims().get(session_id, chat_id) != chat_id:
+        return False
+    if not ov.get("agent_session_id") and agents.find_claude_transcript(chat_id) is not None:
+        return False
+    patch = {"agent_session_id": session_id}
+    if not ov.get("agent_session_id"):
+        src = get_overlay(session_id)
+        patch.update({k: v for k, v in src.items() if k not in ov and k != "agent_session_id"})
+        state = categories_mod.get_state()
+        cat = state["assign"].get(session_id)
+        if cat and chat_id not in state["assign"]:
+            with contextlib.suppress(KeyError):
+                categories_mod.assign([chat_id], cat)
+    set_overlay(chat_id, patch)
+    return True
+
+
+def repair_binding(chat_id: str) -> str | None:
+    """For a chat with no transcript under its own id and no binding yet, look for its conversation
+    under another session id (find_bound_session) and bind it. Cheap on the common path (one
+    stat); returns the bound session id if there is one now."""
+    ov = get_overlay(chat_id)
+    if ov.get("agent_session_id"):
+        return str(ov["agent_session_id"])
+    task = next((t for t in registry.list_tasks() if t.chat_id == chat_id), None)
+    cwd = task.worktree_path if task else None
+    if not cwd:
+        return None
+    for c in (cwd, os.path.realpath(cwd)):
+        if (claude_project_dir(c) / f"{chat_id}.jsonl").exists():
+            return None
+    sid = find_bound_session(chat_id, cwd)
+    return sid if sid and bind_session(chat_id, sid) else None
+
+
+def repair_all() -> int:
+    """repair_binding for every task chat (server start): fixes chats that diverged before the
+    binding existed. Returns how many were bound."""
+    n = 0
+    for t in registry.list_tasks():
+        if t.chat_id and t.worktree_path:
+            with contextlib.suppress(Exception):
+                n += bool(repair_binding(t.chat_id))
+    return n
 
 
 def build_index(force: bool = False) -> list[dict]:
@@ -666,16 +796,17 @@ def build_index(force: bool = False) -> list[dict]:
     # Codex post-pass (on copies — never mutate cached rows): titles from codex's own
     # thread names (generated server-side after the first turns, so they can't be baked
     # into the parse-time cache), and claim re-keying (native uuid → loom chat id).
-    claims = _codex_claims()
+    claims = _session_claims()
     names = _codex_thread_names()
     if claims or names:
         for i, r in enumerate(rows):
-            if r.get("agent") != "codex":
-                continue
-            new_id = claims.get(r["id"])
-            title = r.get("title") or names.get(r["id"])
-            if new_id or title != r.get("title"):
-                rows[i] = {**r, "id": new_id or r["id"], "title": title}
+            if r.get("agent") == "codex":
+                new_id = claims.get(r["id"])
+                title = r.get("title") or names.get(r["id"])
+                if new_id or title != r.get("title"):
+                    rows[i] = {**r, "id": new_id or r["id"], "title": title}
+            elif r["id"] in claims:  # claude (or grok) session bound to a loom chat under another id
+                rows[i] = {**r, "id": claims[r["id"]]}
     return rows
 
 
@@ -1052,10 +1183,8 @@ def _find_transcript(sid: str) -> Path | None:
     Grok sessions are directories, not single jsonl files; get_transcript only
     reconstructs Claude's format today. Prefer agents.find_* for existence checks.
     """
-    found = agents.find_claude_transcript(sid)
-    if found:
-        return found
-    return None
+    asid = get_overlay(sid).get("agent_session_id") or sid
+    return agents.find_claude_transcript(str(asid)) or (agents.find_claude_transcript(sid) if asid != sid else None)
 
 
 def trash_chat(sid: str) -> None:

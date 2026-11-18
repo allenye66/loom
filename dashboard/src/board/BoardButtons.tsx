@@ -2,8 +2,8 @@ import { useQuery } from '@tanstack/react-query';
 import type { Chat } from '../api';
 import { openBoard, useBoards } from './boardApi';
 
-/** The sidebar category header's board button: always visible when there's something unread,
- *  otherwise it appears on hover with the rest of the header's actions. */
+/** The sidebar category header's board button. Off (the default): a hover-only ▤ that opens the
+ *  "enable" prompt. On: always visible, with an unread badge when there's something new. */
 export function BoardButton({ catId, name }: { catId: string; name: string }) {
   const { data } = useBoards();
   const b = data?.find((x) => x.key === catId);
@@ -14,9 +14,17 @@ export function BoardButton({ catId, name }: { catId: string; name: string }) {
         e.stopPropagation();
         openBoard(catId);
       }}
-      title={`message board for "${name}"${b ? ` — ${b.count} post${b.count === 1 ? '' : 's'}` : ''}${unread ? `, ${unread} unread` : ''}`}
+      title={
+        b?.enabled
+          ? `message board for "${name}" — ${b.count} post${b.count === 1 ? '' : 's'}${unread ? `, ${unread} unread` : ''}`
+          : `enable a message board for "${name}" (off)`
+      }
       className={`text-[10px] leading-none shrink-0 inline-flex items-center gap-0.5 ${
-        unread ? 'text-accent' : 'opacity-0 group-hover/gh:opacity-100 text-muted hover:text-ink'
+        unread
+          ? 'text-accent'
+          : b?.enabled
+            ? 'text-muted/80 hover:text-ink'
+            : 'opacity-0 group-hover/gh:opacity-100 text-muted/60 hover:text-ink'
       }`}
     >
       ▤{unread > 0 && <span className="mono text-[9px] px-1 py-px rounded-full bg-accent/20">{unread}</span>}
@@ -38,6 +46,7 @@ export function BoardChip({ chatId }: { chatId?: string }) {
   const me = chats?.find((c) => c.id === chatId);
   if (!me?.category) return null;
   const b = boards?.find((x) => x.key === me.category);
+  if (!b?.enabled) return null; // boards are opt-in per category; the sidebar's ▤ is where you turn one on
   const unread = b?.unread ?? 0;
   return (
     <button

@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import shlex
 import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
@@ -327,6 +329,56 @@ def session_exists(agent: AgentId, chat_id: str, cwd: str | None = None) -> bool
     return find_claude_transcript(chat_id) is not None
 
 
+class SessionBusy(RuntimeError):
+    """A claude session the daemon is hosting in the background, and it isn't idle."""
+
+
+def _claude_daemon_hosts(session_id: str) -> bool:
+    """Is claude's background daemon hosting this session? (Its roster is a small json file.)"""
+    try:
+        workers = json.loads((Path.home() / ".claude" / "daemon" / "roster.json").read_text()).get("workers") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    return any(
+        isinstance(w, dict) and (w.get("sessionId") == session_id or session_id.startswith(str(k)))
+        for k, w in workers.items()
+    )
+
+
+def ensure_not_in_background(session_id: str, cwd: str | None, *, timeout: float = 20.0) -> bool:
+    """`claude --resume <id>` refuses a session the daemon is hosting in the background ("That
+    session is running in the background … `claude attach` it, or `claude stop` it first"), which
+    leaves a loom chat as a dead pane. Claude 2.1.x can host a chat's session there (see
+    sessions.bind_session). If it is, and it's idle with its turn done, stop it — the conversation
+    is kept and resumes right here; if it's busy, raise SessionBusy rather than interrupt work.
+    Cheap when the daemon isn't involved (one small file read). Blocking. True if it stopped one."""
+    if not _claude_daemon_hosts(session_id):
+        return False
+    claude = binary("claude")
+    try:
+        out = subprocess.run(
+            [claude, "agents", "--json", *(["--cwd", cwd] if cwd else [])], capture_output=True, text=True, timeout=timeout,
+        ).stdout
+        rows = json.loads(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False  # can't tell — let claude print its own error
+    me = next((r for r in rows if isinstance(r, dict) and r.get("sessionId") == session_id and r.get("kind") == "background"), None)
+    if not me:
+        return False
+    short = str(me.get("id") or session_id[:8])
+    if not (me.get("status") == "idle" and me.get("state") == "done"):
+        raise SessionBusy(
+            f"this chat's session ({short}) is running in the background and is busy — let it finish, "
+            f"or `claude attach {short}` to watch it / `claude stop {short}` to stop it, then reopen"
+        )
+    subprocess.run([claude, "stop", short], capture_output=True, text=True, timeout=timeout)
+    for _ in range(20):  # the roster drops it once it's really stopped
+        if not _claude_daemon_hosts(session_id):
+            return True
+        time.sleep(0.25)
+    return True
+
+
 def _tail_lines(path: Path, size: int) -> list[str]:
     """The complete lines in the last `size` bytes of a file, newest first."""
     with path.open("rb") as f:
@@ -406,7 +458,7 @@ def live_settings(agent: AgentId, chat_id: str, cwd: str | None = None, agent_se
         elif agent == "codex":
             got = _codex_live(find_codex_rollout(agent_session_id or chat_id))
         else:
-            got = _claude_live(find_claude_transcript(chat_id))
+            got = _claude_live(find_claude_transcript(agent_session_id or chat_id))
     except (OSError, ValueError):
         got = {}
     model, effort = got.get("model"), got.get("effort")
@@ -430,8 +482,8 @@ def build_argv(
     """CLI argv for a new or resumed session under the given agent.
 
     `agent_session_id` is the agent-native session id when it differs from the loom
-    chat id — only codex today (codex mints its own id; terminals.py binds it into
-    the overlay post-launch and passes it here for resume).
+    chat id: codex (it mints its own id; terminals.py binds it into the overlay post-launch) and a
+    claude chat whose session came out under another id (sessions.bind_session). Resume uses it.
 
     `initial_prompt` = the first message of a brand-new session (headless `loom chats
     spawn`): all three CLIs take a trailing positional prompt that starts the interactive
@@ -516,7 +568,7 @@ def build_argv(
     if note:
         argv += ["--append-system-prompt", note]
     if exists:
-        argv += ["--resume", chat_id]
+        argv += ["--resume", agent_session_id or chat_id]
     else:
         argv += ["--session-id", chat_id]
     return argv + tail

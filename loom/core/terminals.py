@@ -138,11 +138,27 @@ def _agent_argv(chat_id: str, cwd: str | None, *, fullscreen: bool, initial_prom
     `initial_prompt` = the first message for a brand-new session (headless spawn)."""
     agent = _agent_for(chat_id)
     ov = sessions_mod.get_overlay(chat_id)
-    asid = _codex_session_id(chat_id, cwd) if agent == "codex" else None
+    asid = _codex_session_id(chat_id, cwd) if agent == "codex" else (
+        ov.get("agent_session_id") if agent == "claude" else None  # a claude chat whose session has another id
+    )
     return agents.build_argv(
         agent, chat_id, cwd, fullscreen=fullscreen, agent_session_id=asid, initial_prompt=initial_prompt,
         model=ov.get("model"), effort=ov.get("effort"),
     )
+
+
+def _prepare_claude_launch(chat_id: str, cwd: str | None) -> None:
+    """Before starting a claude chat that isn't already running: (1) if it has no transcript under
+    its own id, look for its conversation under another session id and bind it, so it RESUMES
+    instead of starting blank (sessions.repair_binding); (2) if claude's daemon is hosting that
+    session in the background, stop it when idle (agents.ensure_not_in_background — raises
+    SessionBusy when it's busy). Blocking."""
+    if process_alive(chat_id):
+        return
+    sessions_mod.repair_binding(chat_id)
+    asid = sessions_mod.get_overlay(chat_id).get("agent_session_id") or chat_id
+    if agents.find_claude_transcript(asid) is not None:
+        agents.ensure_not_in_background(asid, cwd)
 
 
 def chat_settings(chat_id: str, cwd: str | None) -> dict:
@@ -151,7 +167,7 @@ def chat_settings(chat_id: str, cwd: str | None) -> dict:
     else the CLI's default model (None) and loom's default effort. `pinned_*` = the pin alone."""
     agent = _agent_for(chat_id)
     ov = sessions_mod.get_overlay(chat_id)
-    live = agents.live_settings(agent, chat_id, cwd, ov.get("agent_session_id") if agent == "codex" else None)
+    live = agents.live_settings(agent, chat_id, cwd, ov.get("agent_session_id") if agent in ("codex", "claude") else None)
     return {
         "agent": agent,
         "model": live["model"] or ov.get("model"),
@@ -1083,6 +1099,12 @@ async def open_terminal(
     ts.clear_needs_on_typing = agent == "codex"  # codex has no prompt-submit hook (see write())
     if initial_prompt and not ts.attached:
         ts.initial_prompt = initial_prompt
+    if agent == "claude" and not ts.attached:
+        try:
+            await loop.run_in_executor(None, _prepare_claude_launch, chat_id, cwd)
+        except Exception:
+            _registry.pop(chat_id, None)  # don't leave a half-registered session behind
+            raise
     await ts.open()
     if agent == "codex":
         live = _codex_watchers.get(chat_id)

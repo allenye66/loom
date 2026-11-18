@@ -552,6 +552,7 @@ async def patch_chat(sid: str, body: ChatPatch, x_loom_chat: str | None = Header
     """`X-Loom-Chat` = the chat making the request (the `loom` CLI sends $LOOM_CHAT_ID), so an
     agent archiving ITSELF doesn't kill its own turn. Replies once the overlay is written;
     archive / unarchive side effects (stop the agent + dev stack, ports) finish in the background."""
+    sid = sessions.canonical_id(sid)  # an old link may carry the session id of a chat bound to a loom chat id
     patch = body.model_dump(exclude_none=True)
     # Agent is sticky once locked — ignore attempts to flip after first set.
     if "agent" in patch:
@@ -615,6 +616,7 @@ def chat_settings(sid: str) -> dict:
 async def start_chat(sid: str, body: ChatStartIn) -> dict:
     """Run a chat's agent with no browser attached (the `loom` CLI's spawn/resume). The chat
     shows in the sidebar like any other; opening it attaches to this same process."""
+    sid = sessions.canonical_id(sid)
     await run_in_threadpool(_known_chat, sid)
     cwd = await run_in_threadpool(_chat_cwd, sid)
     try:
@@ -636,6 +638,7 @@ async def send_to_chat(sid: str, body: ChatSendIn) -> dict:
     """Type a message into a chat's agent (resuming it first if it isn't running)."""
     if not body.text.strip():
         raise HTTPException(400, "empty message")
+    sid = sessions.canonical_id(sid)
     await run_in_threadpool(_known_chat, sid)
     cwd = await run_in_threadpool(_chat_cwd, sid)
     try:
@@ -649,6 +652,7 @@ async def send_to_chat(sid: str, body: ChatSendIn) -> dict:
 async def close_chat(sid: str, force: bool = False, x_loom_chat: str | None = Header(None)) -> dict:
     """Stop a chat's agent process. The transcript stays; reopening the chat resumes it. A chat
     can't close itself (it would kill the very turn asking) unless `force`."""
+    sid = sessions.canonical_id(sid)
     if x_loom_chat == sid and not force:
         raise HTTPException(409, "refusing to close the calling chat itself (it would kill this turn)")
     return {"chat_id": sid, "closed": await terminals.close_chat(sid)}
@@ -829,7 +833,7 @@ def reindex_chats() -> dict:
 
 @router.get("/chats/{sid}/transcript")
 def chat_transcript(sid: str) -> dict:
-    return {"items": sessions.get_transcript(sid)}
+    return {"items": sessions.get_transcript(sessions.canonical_id(sid))}
 
 
 @router.get("/chats/{sid}")
@@ -837,16 +841,24 @@ def get_one_chat(sid: str) -> dict:
     """The chat's index entry + overlay (name/starred/archived), or null if it has no
     transcript yet. Powers the in-overlay rename/star/archive actions. `mode` is the
     locked surface (chat/terminal), surfaced top-level too so a ?chat= deep link can
-    restore the right one even before any transcript exists. `agent` is claude|grok|codex."""
+    restore the right one even before any transcript exists. `agent` is claude|grok|codex.
+
+    `id` is the loom chat id the sidebar knows this chat by: a link may carry the native session id
+    of a chat whose conversation came out under another id (sessions.bind_session), and a chat with
+    no transcript under its own id is searched for one (sessions.repair_binding) — so an old link
+    lands in the real conversation instead of an empty chat."""
+    sid = sessions.canonical_id(sid)
+    chat = sessions.get_chat(sid)
+    if chat is None and sessions.repair_binding(sid):
+        chat = sessions.get_chat(sid)
     ov = sessions.get_overlay(sid)
     mode = ov.get("mode")
     agent = agents.normalize_agent(ov.get("agent"))
-    chat = sessions.get_chat(sid)
     if chat is not None:
         chat = {**chat, "mode": mode, "agent": agent}
     # `cwd` top-level too: a chat with no transcript yet has no `chat` row, but its task worktree
     # is still where it must open.
-    return {"chat": chat, "mode": mode, "agent": agent, "cwd": _chat_cwd(sid)}
+    return {"id": sid, "chat": chat, "mode": mode, "agent": agent, "cwd": _chat_cwd(sid)}
 
 
 def _chat_default_repo(chat: dict) -> str | None:
@@ -1095,6 +1107,7 @@ async def term_ws(websocket: WebSocket) -> None:
         with contextlib.suppress(Exception):
             await websocket.close()
         return
+    chat_id = sessions.canonical_id(chat_id)  # an old link's session id → the loom chat id that owns the terminal
     # The browser's cwd, else where the chat's task lives. A `?chat=` deep link to a chat with no
     # transcript yet (a fresh task) has no cwd to send — without this fallback the agent would
     # launch in $HOME, sit at claude's folder-trust prompt, and never reach the worktree.

@@ -15,6 +15,7 @@ export type BoardPost = {
 export type BoardSummary = {
   key: string;
   name: string;
+  enabled: boolean; // boards are off until the user turns one on, per category
   repo?: string | null;
   members: number;
   count: number;
@@ -44,7 +45,12 @@ export const useBoardPosts = (key: string | null) =>
     queryFn: () =>
       fetch(`/api/boards/${key}?reader=user`)
         .then(json)
-        .then((d) => ({ name: d.board.name as string, posts: d.posts as BoardPost[], last_seq: d.last_seq as number })),
+        .then((d) => ({
+          name: d.board.name as string,
+          enabled: !!d.board.enabled,
+          posts: d.posts as BoardPost[],
+          last_seq: d.last_seq as number,
+        })),
     refetchInterval: 3000,
   });
 
@@ -64,6 +70,12 @@ export function useBoardActions() {
       if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.detail ?? `${r.status}`);
       refresh();
       return (await r.json()) as { post: BoardPost; nudged: Record<string, string> };
+    },
+    /** Turn a category's board on (there's no off switch for now). */
+    enable: async (key: string) => {
+      const r = await fetch(`/api/boards/${key}/enable`, { method: 'POST' });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.detail ?? `${r.status}`);
+      refresh();
     },
     markSeen: async (key: string, seq?: number) => {
       await fetch(`/api/boards/${key}/seen`, {

@@ -25,7 +25,7 @@ export function BoardModal() {
 
 function Board({ boardKey }: { boardKey: string }) {
   const { data } = useBoardPosts(boardKey);
-  const { post, markSeen } = useBoardActions();
+  const { post, markSeen, enable } = useBoardActions();
   const [text, setText] = useState('');
   const [nudge, setNudge] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
@@ -78,6 +78,66 @@ function Board({ boardKey }: { boardKey: string }) {
       setBusy(false);
     }
   };
+
+  if (data && !data.enabled) {
+    return (
+      <div
+        className="fixed inset-0 z-[65] flex items-start justify-center bg-black/50 backdrop-blur-sm p-4 sm:p-10"
+        onMouseDown={(e) => e.target === e.currentTarget && closeBoard()}
+      >
+        <div
+          role="dialog"
+          aria-label="Enable the category message board"
+          className="w-full max-w-lg flex flex-col rounded-xl border border-edge bg-surface shadow-2xl overflow-hidden"
+        >
+          <div className="px-4 py-3 flex items-center gap-2.5 border-b border-edge">
+            <span className="text-sm font-semibold">▤ {data.name}</span>
+            <span className="text-[11px] mono text-muted">message board · off</span>
+            <div className="flex-1" />
+            <button onClick={closeBoard} className="text-muted hover:text-ink text-lg leading-none px-1" aria-label="close">
+              ✕
+            </button>
+          </div>
+          <div className="px-5 py-4 text-xs leading-relaxed text-ink/90 flex flex-col gap-3">
+            <p>
+              A message board gives the {members.length} chat{members.length === 1 ? '' : 's'} in this category one shared place to
+              leave findings, decisions and handoffs for each other — for example agents trying different designs that reconvene, or an
+              orchestrator collecting its workers’ reports. You can read and post here too.
+            </p>
+            <p className="text-muted">
+              Once it’s on, every chat in the category is told on its next message (and can check with{' '}
+              <span className="mono">loom whoami</span>); chats can post, read and wait on it. Only you can turn it on, and for now it
+              can’t be turned off again.
+            </p>
+            {note && <p className="mono text-[11px] text-bad">{note}</p>}
+          </div>
+          <div className="px-5 py-3 border-t border-edge flex items-center justify-end gap-2">
+            <button onClick={closeBoard} className="text-xs px-3 py-1.5 rounded border border-edge text-muted hover:text-ink">
+              not now
+            </button>
+            <button
+              autoFocus
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                setNote(null);
+                try {
+                  await enable(boardKey);
+                } catch (e: any) {
+                  setNote(`couldn’t enable — ${e?.message ?? e}`);
+                } finally {
+                  setBusy(false);
+                }
+              }}
+              className="text-xs px-3 py-1.5 rounded border border-accent-dim text-accent hover:bg-accent/10 disabled:opacity-40"
+            >
+              enable message board
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const posts: BoardPost[] = data?.posts ?? [];
   return (

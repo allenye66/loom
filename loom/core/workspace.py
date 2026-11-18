@@ -17,6 +17,7 @@ Chats outside any category get (1) and (2) never; they only get (3) if they use 
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import time
 
@@ -84,21 +85,29 @@ def workspace_info(chat_id: str) -> dict | None:
     return {
         "category": {"id": cat["id"], "name": cat["name"], "repo": cat.get("repo")},
         "siblings": [{"id": c["id"], "name": title_of(c), "branch": c.get("branch"), "agent": c.get("agent")} for c in sibs],
-        "board": {"posts": s["count"], "unread": s.get("unread", 0), "last_seq": s["last_seq"]},
+        "board": {"enabled": s["enabled"], "posts": s["count"], "unread": s.get("unread", 0), "last_seq": s["last_seq"]},
     }
 
 
 # --- the three pieces of prompt context ------------------------------------------------------
-def _workspace_block(me_name: str, chat_id: str, cat: dict, sibs: list[dict]) -> str:
+def _workspace_block(me_name: str, chat_id: str, cat: dict, sibs: list[dict], board_on: bool, newly: bool) -> str:
     shown = sibs[:MAX_SIBLINGS]
     roster = "; ".join(f"{title_of(c)} ({c['id'][:8]})" for c in shown) or "no one else yet"
     more = f" (+{len(sibs) - len(shown)} more)" if len(sibs) > len(shown) else ""
-    return (
+    head = (
         f'You are "{me_name}" (chat {chat_id[:8]}) in loom category "{cat["name"]}"'
         f'{" · project " + cat["repo"] if cat.get("repo") else ""}. Others here: {roster}{more}.\n'
-        f"This category has a shared message board — `loom board read|post|wait` (post findings, decisions and handoffs "
-        f"there; unread posts are attached to your next user message). Message one chat directly with "
-        f'`loom chats send <id> "…"`. The user may @mention chats in a message; resolved mentions are listed with it.'
+    )
+    mentions = "The user may @mention chats in a message; resolved mentions are listed with it."
+    if board_on:
+        return head + (
+            ("The user just ENABLED this category's shared message board. " if newly else "This category has a shared message board. ")
+            + "`loom board read|post|wait` — post findings, decisions and handoffs there; unread posts are attached to your next "
+            "user message. Message one chat directly with " + '`loom chats send <id> "…"`. ' + mentions
+        )
+    return head + (
+        "This category has no message board — the user hasn't enabled one (they can, from the dashboard). To hand something to "
+        'another chat, use `loom chats send <id> "…"`. ' + mentions
     )
 
 
@@ -118,7 +127,7 @@ def _digest(cat: dict, posts: list[dict], me: str) -> str:
     return "\n".join(lines)
 
 
-def _mentions_block(tokens: list[str], chats: list[dict], me: str, prefer_cat: str | None, cats: dict[str, str]) -> str:
+def _mentions_block(tokens: list[str], chats: list[dict], me: str, prefer_cat: str | None, cats: dict[str, str], board_on: bool = False) -> str:
     lines = []
     for tok in tokens:
         c = resolve_token(tok, [x for x in chats if x["id"] != me], prefer_category=prefer_cat)
@@ -131,26 +140,44 @@ def _mentions_block(tokens: list[str], chats: list[dict], me: str, prefer_cat: s
         return ""
     return (
         "Mentioned loom chats:\n" + "\n".join(lines) +
-        "\n  (reach one with `loom chats send <id> \"…\"`, read it with `loom chats show <id>`, or post to the board with `--to <id>`)"
+        "\n  (reach one with `loom chats send <id> \"…\"`, read it with `loom chats show <id>`"
+        + (", or post to the board with `--to <id>`)" if board_on else ")")
     )
 
 
-def _ws_changed(key: str, sig: str) -> bool:
+def _state_get(con, key: str) -> str | None:
+    r = con.execute("SELECT ws_hash FROM ctx_state WHERE key = ?", (key,)).fetchone()
+    return r["ws_hash"] if r else None
+
+
+def _state_set(con, key: str, val: str) -> None:
+    con.execute(
+        "INSERT INTO ctx_state (key, ws_hash, updated) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET ws_hash = excluded.ws_hash, updated = excluded.updated",
+        (key, val, time.time()),
+    )
+
+
+def _ws_changed(key: str, sig: str, board_on: bool) -> tuple[bool, bool]:
+    """(has what we last told this chat changed?, did its board just get switched on?). The board
+    flag is tracked on its own so the re-sent block can say "the user just enabled…"."""
     h = hashlib.sha1(sig.encode()).hexdigest()[:16]
     with db.connect() as con:
-        r = con.execute("SELECT ws_hash FROM ctx_state WHERE key = ?", (key,)).fetchone()
-        if r and r["ws_hash"] == h:
-            return False
-        con.execute(
-            "INSERT INTO ctx_state (key, ws_hash, updated) VALUES (?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET ws_hash = excluded.ws_hash, updated = excluded.updated",
-            (key, h, time.time()),
-        )
-        return True
+        prev, prev_flag = _state_get(con, key), _state_get(con, key + ":b")
+        _state_set(con, key + ":b", "1" if board_on else "0")
+        if prev == h:
+            return False, False
+        _state_set(con, key, h)
+        return True, bool(board_on and prev_flag == "0")
 
 
 def prompt_context(chat_id: str, prompt: str, *, session_id: str | None = None) -> str:
     """The context to attach to one user message for `chat_id` ("" = attach nothing)."""
+    # claude tells us its real session id: if it isn't the one loom launched the chat with (its
+    # daemon can hand a chat a pre-warmed session), bind it so the chat follows its conversation.
+    if session_id and session_id != chat_id:
+        with contextlib.suppress(Exception):
+            sessions.bind_session(chat_id, session_id)
     state = categories.get_state()
     cat = categories.category_of(chat_id, state)
     tokens = mention_tokens(prompt)
@@ -162,19 +189,22 @@ def prompt_context(chat_id: str, prompt: str, *, session_id: str | None = None) 
     me_name = title_of(me_row) if me_row else chat_label(chat_id)
     parts: list[str] = []
 
+    board_on = bool(cat) and board.is_enabled(cat["id"])
     if cat:
         sibs = siblings_of(chat_id, cat["id"], chats if not tokens else [c for c in chats if not c.get("archived")])
-        sig = "|".join([cat["id"], cat["name"], me_name, *sorted(f"{c['id']}:{title_of(c)}" for c in sibs)])
-        if _ws_changed(f"{chat_id}:{session_id or '-'}", sig):
-            parts.append(_workspace_block(me_name, chat_id, cat, sibs))
-        posts = board.unread(cat["id"], chat_id)
-        if posts:
-            parts.append(_digest(cat, posts, chat_id))
-            board.mark_seen(chat_id, cat["id"], posts[-1]["seq"])
+        sig = "|".join([cat["id"], cat["name"], me_name, f"board={int(board_on)}", *sorted(f"{c['id']}:{title_of(c)}" for c in sibs)])
+        changed, newly = _ws_changed(f"{chat_id}:{session_id or '-'}", sig, board_on)
+        if changed:
+            parts.append(_workspace_block(me_name, chat_id, cat, sibs, board_on, newly))
+        if board_on:  # (a disabled board has no posts to deliver)
+            posts = board.unread(cat["id"], chat_id)
+            if posts:
+                parts.append(_digest(cat, posts, chat_id))
+                board.mark_seen(chat_id, cat["id"], posts[-1]["seq"])
 
     if tokens:
         names = {c["id"]: c["name"] for c in state["categories"]}
-        m = _mentions_block(tokens, chats, chat_id, cat["id"] if cat else None, names)
+        m = _mentions_block(tokens, chats, chat_id, cat["id"] if cat else None, names, board_on)
         if m:
             parts.append(m)
 

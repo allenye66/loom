@@ -80,6 +80,9 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   (`loom/harness.py`, a thin client of the running server), scoped to the chat's own project
   unless told `--project` / `-A`. Categories are server-side (`~/.loom/categories.json`).
   Archiving a chat also stops its agent.
+- **A chat's loom id and its claude session id can differ** (claude's background daemon can hand a chat
+  another session — D23). `sessions.bind_session` records the real one (`agent_session_id`), the index
+  re-keys that transcript to the loom id, and resume uses it. Don't assume transcript filename == chat id.
 - Match the existing code style; keep Python imports at top of file.
 
 ## Docs
@@ -109,7 +112,8 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 - **Category message boards + `@@` mentions** (D22) — chats in one category share a board
   (`loom board post|read|wait`, a dashboard modal with unread badges); each Claude message gets only
   the context that matters via a `UserPromptSubmit` hook (roster, unread posts, resolved `@chat`
-  mentions — nothing when there's nothing new); `@@` in the terminal opens a chat picker.
+  mentions — nothing when there's nothing new); `@@` in the terminal opens a chat picker. Boards are
+  **off until the user enables one per category** (the ▤ on the category header); chats are told.
 - **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
   categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
   working on a handoff prompt).

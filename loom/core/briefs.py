@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from loom.core import agents
+from loom.core import agents, sessions
 from loom.core.config import LOOM_HOME
 
 BRIEFS_DIR = LOOM_HOME / "briefs"
@@ -281,7 +281,7 @@ def _write(chat_id: str, data: dict) -> None:
 def get(chat_id: str) -> dict:
     """The cached brief + whether the transcript has grown since (`stale`) and whether a
     refresh is running. Never calls the model."""
-    path = agents.find_claude_transcript(chat_id)
+    path = agents.find_claude_transcript(sessions.get_overlay(chat_id).get("agent_session_id") or chat_id)
     data = _read(chat_id)
     size = path.stat().st_size if path else None
     return {
@@ -319,7 +319,7 @@ def _due(chat_id: str, path: Path) -> bool:
 
 def refresh(chat_id: str, *, force: bool = False) -> bool:
     """Start a background regeneration if one is due (or `force`). True if one started."""
-    path = agents.find_claude_transcript(chat_id)
+    path = agents.find_claude_transcript(sessions.get_overlay(chat_id).get("agent_session_id") or chat_id)
     if path is None:
         return False
     with _lock:

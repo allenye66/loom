@@ -22,15 +22,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     if (!sid) return;
     fetch(`/api/chats/${sid}`)
       .then((r) => r.json())
-      .then((d) =>
+      .then((d) => {
+        // The server's canonical loom chat id: a link may carry the session id of a chat whose
+        // conversation came out under another id (it's bound to the loom chat id). Adopt it and
+        // fix the URL, so the sidebar row, terminal and notes all agree on one id.
+        const id: string = d.id ?? sid;
+        if (id !== sid) setChatParam(id);
         setActive({
-          resume: sid,
-          title: sid.slice(0, 8),
+          resume: id,
+          title: id.slice(0, 8),
           mode: d.mode ?? undefined,
           cwd: d.cwd ?? d.chat?.cwd ?? undefined, // d.cwd: the task worktree, even before any transcript
           agent: d.agent ?? d.chat?.agent ?? undefined,
-        }),
-      )
+        });
+      })
       .catch(() => setActive({ resume: sid, title: sid.slice(0, 8) }));
   }, []);
 

@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from loom import __version__
-from loom.core import manager, monitor, perf, registry, terminals
+from loom.core import manager, monitor, perf, registry, sessions, terminals
 from loom.server.api import router
 from loom.server.board_api import router as board_router
 
@@ -34,9 +34,14 @@ async def _status_sweeper() -> None:
     Runs the blocking probe in an executor thread; git releases the GIL while running, so the loop
     keeps servicing the PTY between spawns."""
     loop = asyncio.get_running_loop()
+    n = 0
     while True:
         with contextlib.suppress(Exception):
             await loop.run_in_executor(None, _sweep_once)
+        n += 1
+        if n % 8 == 0:  # ~once a minute: bind any chat whose conversation turned up under another session id
+            with contextlib.suppress(Exception):
+                await loop.run_in_executor(None, sessions.repair_all)
         await asyncio.sleep(_SWEEP_INTERVAL)
 
 
@@ -45,6 +50,9 @@ async def _lifespan(_app: FastAPI):
     # Dev-stack supervisor: keep active chats' frontend/backend up (see core/monitor.py).
     task = monitor.start()
     sweeper = asyncio.create_task(_status_sweeper())
+    # Chats whose conversation came out under another session id before bindings existed get bound
+    # now (off the request path; a stat per task, a transcript scan only for the rare mismatch).
+    asyncio.get_running_loop().run_in_executor(None, sessions.repair_all)
     lag = asyncio.create_task(perf.loop_lag_monitor()) if perf.enabled() else None
     try:
         yield

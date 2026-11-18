@@ -314,6 +314,15 @@ Deleting a 30k-file worktree took ~1.9 s (real ones with `node_modules` far more
   dev stack — just not on the request path.
 
 ## D22 — Category message boards, per-message context injection, `@@` mentions (2026-11-17)
+**Update (11-18): boards are opt-in.** A category's board is **off by default**; the user turns it on
+(the ▤ on the category header → "enable message board"; or `loom board enable --category X` in their
+own shell). Only the user can: a request carrying an agent's `X-Loom-Chat` gets 403, and `loom board
+enable` refuses inside a chat. There is no off switch for now. While off, `post`/`read`/`wait` answer
+with what to do ("only the user can turn it on… message chats with `loom chats send`"), a categorised
+chat still gets its roster ("this category has no message board — the user can enable one"), and
+`loom whoami` says `board: off`. Switching it on re-sends the roster block ("the user just ENABLED
+this category's board") on each chat's next message, so every chat learns the state without being
+nudged; `whoami` / `board ls` always show it. The flag lives in `loom.db` (`board_settings`).
 Goal: let the chats in one category work *together* — try three designs then reconvene; an
 orchestrator spawns QA chats and collects their reports — without the user pasting chat URLs
 between them. Decisions:
@@ -358,6 +367,35 @@ between them. Decisions:
 - **Trust boundary:** a board post is text from a peer agent, injected into another agent's
   context — the same boundary `loom chats send` already crosses. Posts are labelled by author and
   nothing in the digest is phrased as an instruction; treat the board like any other tool output.
+
+## D23 — A chat follows its conversation when claude gives it a different session id (2026-11-18)
+Problem: loom keys everything it owns by the chat id it launches claude with (`--session-id`): the
+terminal socket, the hooks, `$LOOM_CHAT_ID`, categories, the board. Claude 2.1.x's background daemon can
+hand a chat a pre-warmed session instead (`claimed-spare` in `~/.claude/daemon.log`), so the transcript
+is named by *another* id. Loom then saw "no transcript" for its own id, showed a blank duplicate row,
+launched an empty claude on an old link, lost the chat's category/board, and `--resume <real id>`
+was refused while the daemon still hosted the session. Fix = the pattern codex already used (D17):
+- **Bind, then re-key.** `agent_session_id` (overlay) names the real session; `build_index` presents
+  that transcript's row under the loom chat id, so the sidebar, categories, board, terminal, deep links
+  and `self` agree with no alias handling. On the first bind, the session row's own overlay (name, star,
+  archive, tags) and category are adopted by the loom id. Resume uses `--resume <agent_session_id>`.
+- **Detection (both exact, neither a guess).** (1) The `UserPromptSubmit` hook receives claude's real
+  `session_id` with every message; if it isn't the chat's id, `sessions.bind_session` binds it. (2) For
+  chats that diverged before this (or while the hook was absent), `repair_binding` finds the transcript
+  in the chat's worktree that contains loom's own hook command for it (`needs/<chat id>` — loom bakes
+  it into every session it launches; a session someone ran by hand never has it). Runs at server start,
+  about once a minute, when a diverged chat is opened by id, and just before launching a claude chat
+  that isn't running — so it resumes instead of starting blank. Negative scans are memoised.
+- **Never rebound** when the chat has a transcript under its own id (a `/clear` continuation stays its
+  own row) or the session already belongs to another chat. Old links/notes keyed by the session id
+  still resolve (`canonical_id`; `GET /api/chats/{id}` returns the loom id the dashboard adopts).
+- **Background-hosted sessions.** Before launching, if claude's daemon roster hosts the session,
+  `agents.ensure_not_in_background` runs `claude agents --json`: idle + done → `claude stop` (the
+  conversation is kept) and resume; busy → `SessionBusy` with how to attach/stop, never interrupting work.
+  Cost when the daemon isn't involved: one small file read.
+- Verified with real claude: a conversation run under a different session id, then asked by its loom
+  id — resumed (`--resume <real id>`, the agent remembered a secret word) via both detection paths, and
+  a real `claude --bg` session was stopped and resumed. Your actual affected chat is found in 4 ms.
 
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's

@@ -668,7 +668,10 @@ def _print_workspace(sid: str) -> None:
         print(f"{'board':<11} none — this chat isn't in a category (`loom chats categorize self <category>`)")
         return
     b = ws["board"]
-    print(f"{'board':<11} {b['posts']} post{'s' if b['posts'] != 1 else ''}, {b['unread']} unread — `loom board read`")
+    if not b.get("enabled"):
+        print(f"{'board':<11} off — the user hasn't enabled a message board for this category (only they can; message chats with `loom chats send`)")
+    else:
+        print(f"{'board':<11} on — {b['posts']} post{'s' if b['posts'] != 1 else ''}, {b['unread']} unread — `loom board read`")
     others = ", ".join(f"{s['name']} ({s['id'][:8]})" for s in ws["siblings"][:12]) or "no one else yet"
     print(f"{'others':<11} {others}" + (f" (+{len(ws['siblings']) - 12} more)" if len(ws["siblings"]) > 12 else ""))
 
@@ -824,6 +827,9 @@ def board_read(
     else:
         params["unread_only"] = True
     r = _api("GET", f"/boards/{key}", params=params)
+    if not r["board"].get("enabled"):
+        _die(f'the message board for category "{cname}" isn\'t enabled — only the user can turn it on (dashboard → the ▤ on the category). '
+             "Until then, message chats directly with `loom chats send`.")
     posts = [p for p in r["posts"] if seq is None or p["seq"] == seq]
     if as_json:
         _out_json({"category": cname, "posts": posts, "last_seq": r["last_seq"]})
@@ -892,5 +898,19 @@ def board_ls(as_json: bool = typer.Option(False, "--json")) -> None:
     if as_json:
         _out_json(boards)
         return
-    rows = [[b["name"], str(b["members"]), str(b["count"]), str(b.get("unread", 0)), _ago(b.get("last_ts"))] for b in boards]
-    _table(["category", "chats", "posts", "unread", "last post"], rows) if rows else print("no categories yet")
+    rows = [
+        [b["name"], "on" if b.get("enabled") else "off", str(b["members"]), str(b["count"]), str(b.get("unread", 0)), _ago(b.get("last_ts"))]
+        for b in boards
+    ]
+    _table(["category", "board", "chats", "posts", "unread", "last post"], rows) if rows else print("no categories yet")
+
+
+@board_app.command("enable")
+def board_enable(category: str = typer.Option(None, "--category", "-c", help="the category")) -> None:
+    """Turn a category's message board on (for you, in a plain shell). Chats can't — it's the user's call."""
+    if _self_id():
+        _die("a chat can't enable a message board — that's the user's call (the ▤ on the category in the dashboard, "
+             "or `loom board enable --category NAME` in their own shell)")
+    key, cname = _board_key(category)
+    _api("POST", f"/boards/{key}/enable")
+    print(f'enabled the message board for "{cname}" — its chats are told on their next message')
