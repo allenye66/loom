@@ -18,7 +18,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
-import anyio
 from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -198,9 +197,16 @@ def create_task(body: TaskIn) -> dict:
 
 
 @router.delete("/tasks/{task_id}")
-def delete_task(task_id: str, force: bool = False) -> dict:
-    manager.remove_task(task_id, force=force)
+async def delete_task(task_id: str, force: bool = False) -> dict:
     _test_runs.pop(task_id, None)
+    if not force:  # a plain removal can be refused (dirty worktree …) — the caller needs that error
+        await run_in_threadpool(manager.remove_task, task_id, False)
+        return {"ok": True}
+    # Forced (what the UI's "delete worktree" sends): it can't fail, but on a big worktree the file
+    # deletion takes seconds+. Forget the task now, delete its files in the background.
+    task = await run_in_threadpool(manager.detach_task, task_id)
+    if task:
+        _spawn(f"remove task {task_id}", run_in_threadpool(manager.finish_removal, task))
     return {"ok": True}
 
 
@@ -481,14 +487,75 @@ def list_chats(
     return {"chats": rows}
 
 
+# Background jobs (their strong refs — a bare create_task can be garbage-collected mid-run) and,
+# per chat, the newest archive follow-up (the next one waits for it).
+_bg_jobs: set[asyncio.Task] = set()
+_archive_tail: dict[str, asyncio.Task] = {}
+
+
+def _spawn(label: str, coro) -> asyncio.Task:
+    """Run `coro` in the background; a failure is logged, never raised into a request."""
+
+    async def run() -> None:
+        try:
+            await coro
+        except Exception as e:  # noqa: BLE001
+            print(f"[loom] background job '{label}' failed: {e!r}", flush=True)
+
+    job = asyncio.create_task(run())
+    _bg_jobs.add(job)
+    job.add_done_callback(_bg_jobs.discard)
+    return job
+
+
+async def _step(sid: str, what: str, coro):
+    """One archive follow-up step: best-effort, but a failure is logged instead of swallowed."""
+    try:
+        return await coro
+    except Exception as e:  # noqa: BLE001
+        print(f"[loom archive] {sid[:8]}: {what} failed: {e!r}", flush=True)
+        return None
+
+
+async def _archive_followup(sid: str, caller: str | None, prev: asyncio.Task | None) -> None:
+    """What archiving / unarchiving a chat does beyond flipping the flag — stop its agent and dev
+    stack and free its port offset (the pool is only 1..90, so dead worktrees can't squat one
+    forever); unarchiving hands a fresh offset back. Slow (stopping an agent alone takes ≥5 s), so
+    `patch_chat` runs it after replying. A chat's follow-ups run one at a time, in request order,
+    and each acts on the chat's *current* state — so archive→unarchive in quick succession ends
+    with the chat unarchived and holding ports, however the two interleave."""
+    if prev is not None:
+        await asyncio.wait({prev})
+    archived = bool((await run_in_threadpool(sessions.get_overlay, sid)).get("archived"))
+    task = await _step(sid, "find task", run_in_threadpool(manager.task_for_chat, sid))
+    if archived:
+        # Archiving also stops the chat's agent (D20): an archived chat already loses its dev
+        # stack and ports, and an idle agent left running behind it is just a stray process.
+        # The transcript stays — reopening resumes it. Never the caller's own agent.
+        if caller != sid:
+            await _step(sid, "stop agent", terminals.close_chat(sid))
+        # An archived chat's task shouldn't keep a dev stack running (see monitor.py reaper).
+        tid = await _step(sid, "stop dev stack", run_in_threadpool(monitor.stop_for_archived_chat, sid))
+        if tid:
+            print(f"[loom reaper] {tid}: stopped dev stack (chat archived)", flush=True)
+        if task:
+            await _step(sid, "release ports", run_in_threadpool(manager.release_ports, task.id))
+    elif task and not task.ports:  # explicit unarchive → give it ports again
+        await _step(
+            sid, "reallocate ports",
+            run_in_threadpool(lambda: manager.reallocate_ports(load_repo_config(task.repo_root), task.id)),
+        )
+
+
 @router.patch("/chats/{sid}")
-def patch_chat(sid: str, body: ChatPatch, x_loom_chat: str | None = Header(None)) -> dict:
+async def patch_chat(sid: str, body: ChatPatch, x_loom_chat: str | None = Header(None)) -> dict:
     """`X-Loom-Chat` = the chat making the request (the `loom` CLI sends $LOOM_CHAT_ID), so an
-    agent archiving ITSELF doesn't kill its own turn."""
+    agent archiving ITSELF doesn't kill its own turn. Replies once the overlay is written;
+    archive / unarchive side effects (stop the agent + dev stack, ports) finish in the background."""
     patch = body.model_dump(exclude_none=True)
     # Agent is sticky once locked — ignore attempts to flip after first set.
     if "agent" in patch:
-        existing = sessions.get_overlay(sid).get("agent")
+        existing = (await run_in_threadpool(sessions.get_overlay, sid)).get("agent")
         if existing:
             patch.pop("agent", None)
         else:
@@ -498,33 +565,12 @@ def patch_chat(sid: str, body: ChatPatch, x_loom_chat: str | None = Header(None)
     # overwrites it).
     if body.archived is True:
         patch["archived_at"] = time.time()
-    out = sessions.set_overlay(sid, patch)
+    out = await run_in_threadpool(sessions.set_overlay, sid, patch)
     if body.archived is not None:
-        # Archiving frees the task's port offset (the pool is only 1..90, so dead worktrees can't
-        # squat one forever); unarchiving hands a fresh offset back. Best-effort — never fail the
-        # overlay write because the port bookkeeping did. Sync route → threadpool, so the blocking
-        # stop/allocate stays off the event loop.
-        task = None
-        with contextlib.suppress(Exception):
-            task = manager.task_for_chat(sid)
-        if body.archived:
-            # Archiving also stops the chat's agent (D20): an archived chat already loses its dev
-            # stack and ports, and an idle agent left running behind it is just a stray process.
-            # The transcript stays — reopening resumes it. Never the caller's own agent.
-            if x_loom_chat != sid:
-                with contextlib.suppress(Exception):
-                    anyio.from_thread.run(terminals.close_chat, sid)
-            # An archived chat's task shouldn't keep a dev stack running (see monitor.py reaper).
-            with contextlib.suppress(Exception):
-                tid = monitor.stop_for_archived_chat(sid)
-                if tid:
-                    print(f"[loom reaper] {tid}: stopped dev stack (chat archived)", flush=True)
-            if task:
-                with contextlib.suppress(Exception):
-                    manager.release_ports(task.id)
-        elif task and not task.ports:  # explicit unarchive → give it ports again
-            with contextlib.suppress(Exception):
-                manager.reallocate_ports(load_repo_config(task.repo_root), task.id)
+        prev = _archive_tail.get(sid)
+        job = _spawn(f"archive follow-up {sid[:8]}", _archive_followup(sid, x_loom_chat, prev))
+        _archive_tail[sid] = job
+        job.add_done_callback(lambda j: _archive_tail.pop(sid, None) if _archive_tail.get(sid) is j else None)
     return out
 
 

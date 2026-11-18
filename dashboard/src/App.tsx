@@ -4,6 +4,7 @@ import { ChatProvider } from './chat/ChatContext';
 import { useChatShell } from './chat/openChat';
 import { ChatSidebar } from './chat/ChatSidebar';
 import { CommandPalette } from './chat/CommandPalette';
+import { CreatingPane } from './chat/CreatingPane';
 import { BoardModal } from './board/BoardModal';
 import { TerminalView } from './term/TerminalView';
 
@@ -210,13 +211,15 @@ function EmptyState() {
 /** The whole app: an always-present chat sidebar next to the content pane (the live terminal
  *  for the open chat, or the empty state). No separate home/main page. */
 function Shell() {
-  const { active, close } = useChatShell();
+  const { active, close, viewingPending } = useChatShell();
   return (
     <div className="flex h-screen min-h-0 bg-canvas">
       <CommandPalette />
       <BoardModal />
       <ChatSidebar activeSid={active?.resume} />
-      {active ? (
+      {viewingPending ? (
+        <CreatingPane pending={viewingPending} />
+      ) : active ? (
         <TerminalView
           // remount (fresh xterm + socket) when switching chats
           key={active.resume ?? active.cwd ?? active.title}

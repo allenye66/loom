@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { DevStackBar, OpenInIde } from '../chat/ChatSidebar';
 import { InlineRename, useRenameChat } from '../chat/InlineRename';
 import { PrBadges } from '../components/PrBadges';
+import { Spinner } from '../components/Spinner';
 import { ServiceLogsPanel, useLogsPanel } from '../components/ServiceLogsPanel';
 import { NotesPanel } from '../notes/NotesPanel';
 import { useNote } from '../notes/notesStore';
@@ -410,6 +411,10 @@ export function TerminalView({
   // wheel/snapshot branching uses the effect-local mirror below.
   const [backend, setBackend] = useState<TermBackend | null>(null);
   const [liveAgent, setLiveAgent] = useState<'claude' | 'grok' | 'codex' | null>(agent ?? null);
+  // True until the agent's first output (or an exit / error / disconnect) — a freshly launched CLI
+  // takes a few seconds to print anything, and the pane would otherwise sit blank.
+  const [booting, setBooting] = useState(true);
+  const qc = useQueryClient();
 
   // Dev-stack parity: map this worktree (cwd) to its loom task for the FE/BE + start/stop strip.
   const { data: tasks } = useQuery({
@@ -553,6 +558,7 @@ export function TerminalView({
       setScrolledUp(b.viewportY < b.baseY);
     });
 
+    let sawOutput = false;
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
       ws = new WebSocket(`${proto}://${location.host}/api/ws/term`);
@@ -580,8 +586,10 @@ export function TerminalView({
                 setLiveAgent(m.agent);
               }
             } else if (m.type === 'exit') {
+              setBooting(false);
               term.write(`\r\n\x1b[2m[${sessionAgent} exited — close and reopen to start a new session]\x1b[0m\r\n`);
             } else if (m.type === 'error') {
+              setBooting(false);
               term.write(`\r\n\x1b[31m[loom] ${m.message}\x1b[0m\r\n`);
             } else if (m.type === 'snapshot-start') {
               // Begin buffering; a 3s fallback returns to live if end never arrives.
@@ -622,6 +630,12 @@ export function TerminalView({
           }
         } else {
           const arr = new Uint8Array(ev.data as ArrayBuffer);
+          if (!sawOutput && arr.length) {
+            sawOutput = true;
+            setBooting(false);
+            // The chat is attached now — a task's brand-new chat only gets its sidebar row from here.
+            qc.invalidateQueries({ queryKey: ['chats'] });
+          }
           if (snapBuffering) {
             snapBuf.push(arr); // hold until snapshot-end
             return;
@@ -634,6 +648,7 @@ export function TerminalView({
         dec.decode(new Uint8Array()); // flush partial multibyte so it can't splice onto the reconnect stream
         resetSnap(); // a snapshot mid-flight on a dying socket must not swallow the reconnect stream
         if (disposed) return;
+        setBooting(false); // the "reconnecting…" line below is more useful than a spinner
         // The session host keeps claude running across loom restarts / network blips — reconnect.
         retry += 1;
         term.write('\r\n\x1b[2m[disconnected — reconnecting…]\x1b[0m\r\n');
@@ -992,6 +1007,14 @@ export function TerminalView({
               ref={holderRef}
               className={`flex-1 min-w-0 px-2 py-1.5 overflow-hidden ${dragOver ? 'ring-2 ring-inset ring-accent-dim' : ''}`}
             />
+            {booting && (
+              <div className="loom-delayed-fade pointer-events-none absolute inset-0 flex items-center justify-center">
+                <div className="flex items-center gap-2.5 mono text-xs text-muted">
+                  <Spinner size={14} />
+                  starting {liveAgent ?? agent ?? 'agent'}…
+                </div>
+              </div>
+            )}
             {jumpNote && (
               <div
                 key={jumpNote.id}

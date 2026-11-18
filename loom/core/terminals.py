@@ -52,6 +52,11 @@ from loom.core.pty_server import (
 from loom.core.runtime import _RESILIENCE_ENV, _loom_runtime
 
 _registry: dict[str, "_SessionBase"] = {}
+# chat_id → the close_chat() currently stopping that chat's agent. Stopping one takes seconds
+# (the daemon waits on its child to exit), and callers no longer sit through it (archive replies
+# at once); re-opening the chat must wait that out, or the dying daemon's last act — unlinking
+# its socket files — would delete the new daemon's.
+_closing: dict[str, "asyncio.Task[bool]"] = {}
 
 _SEND_TIMEOUT = 5.0          # max seconds to push a frame to one subscriber before dropping it
 _BACKLOG_MAX = 256 * 1024    # bytes of recent output kept for replay-on-attach
@@ -1041,11 +1046,19 @@ async def _codex_bind_watch(chat_id: str, cwd: str | None, launched_at: float) -
         _codex_watchers.pop(chat_id, None)
 
 
+async def _after_close(chat_id: str) -> None:
+    """Wait out a close_chat() of this chat that's still stopping its agent (see `_closing`)."""
+    pending = _closing.get(chat_id)
+    if pending is not None:
+        await asyncio.wait({pending})
+
+
 async def open_terminal(
     chat_id: str, cwd: str | None, cols: int = 120, rows: int = 32, *, initial_prompt: str | None = None,
 ) -> _SessionBase:
     """Attach to (or launch) a chat's agent. `initial_prompt` only takes effect when this call
     actually starts a brand-new session — it becomes the CLI's startup prompt."""
+    await _after_close(chat_id)
     loop = asyncio.get_running_loop()
     backend = await loop.run_in_executor(None, terminal_backend, chat_id)
     agent = await loop.run_in_executor(None, _agent_for, chat_id)
@@ -1089,6 +1102,7 @@ async def start_chat(chat_id: str, cwd: str | None, *, initial_prompt: str | Non
     launched) — `launched` = this call started a new agent process (vs. attaching to a running
     one). A brand-new session gets `initial_prompt` as its startup prompt; a resumed one does
     not (use send_text)."""
+    await _after_close(chat_id)
     ts = _registry.get(chat_id)
     if ts is not None and ts.attached:
         return ts, False
@@ -1193,7 +1207,15 @@ async def send_text(chat_id: str, cwd: str | None, text: str, *, submit: bool = 
 
 async def close_chat(chat_id: str) -> bool:
     """Stop a chat's agent process (the transcript stays; reopening the chat resumes it).
-    Returns whether anything was running."""
+    Returns whether anything was running. A close already under way is joined, not repeated."""
+    task = _closing.get(chat_id)
+    if task is None:
+        task = _closing[chat_id] = asyncio.ensure_future(_close_chat(chat_id))
+        task.add_done_callback(lambda t: _closing.pop(chat_id, None) if _closing.get(chat_id) is t else None)
+    return await asyncio.shield(task)
+
+
+async def _close_chat(chat_id: str) -> bool:
     ts = _registry.get(chat_id)
     if ts is not None:
         await ts.close()

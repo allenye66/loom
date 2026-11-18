@@ -35,11 +35,13 @@ export function InlineRename({
   onCommit,
   onCancel,
   className = '',
+  label = 'chat name',
 }: {
   value: string;
   onCommit: (name: string) => void;
   onCancel: () => void;
   className?: string;
+  label?: string; // accessible name of the field
 }) {
   const [draft, setDraft] = useState(value);
   const done = useRef(false); // Enter/Escape unmount the input, which fires blur — don't commit twice
@@ -68,7 +70,7 @@ export function InlineRename({
       onMouseDown={(e) => e.stopPropagation()}
       draggable={false}
       spellCheck={false}
-      aria-label="chat name"
+      aria-label={label}
       className={`min-w-0 rounded bg-canvas border border-edge outline-none focus:border-accent px-1 py-0.5 ${className}`}
     />
   );

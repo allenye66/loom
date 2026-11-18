@@ -156,6 +156,19 @@ body {
     opacity: 0;
   }
 }
+/* fades in after a beat — so a state that usually lasts a few ms (re-attaching a running session)
+   never flashes, while one that lasts seconds (launching the agent) still shows up */
+.loom-delayed-fade {
+  animation: loom-delayed-fade 160ms ease-out 350ms both;
+}
+@keyframes loom-delayed-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
 /* the "your message 3/12" note; removes itself on animationend */
 .loom-jump-note {
   animation: loom-jump-note 1.8s ease-out forwards;
