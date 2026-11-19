@@ -417,7 +417,7 @@ Goal: cut the human's attention cost across dozens of chats (the research round'
   Driven by a server-sent stream (`/api/events/stream` — a hidden tab's timers are throttled, a network stream
   isn't): a new `Stop` / `Notification` for a chat → one notification, only while the tab is in the background,
   bursts coalesced into one ("3 chats need you"), clicking opens the chat. Never for a muted or archived chat.
-  Mute is a per-chat overlay flag (`muted`, the 🔔/🔕 on a row and in the chat header, or `loom chats
+  Mute is a per-chat overlay flag (`muted`, the bell / slashed-bell icon on a row and in the chat header, or `loom chats
   mute|unmute`), persisted server-side so every browser — and any future push channel — honours it. The tab
   title shows `(N) loom` for unmuted chats waiting on you. grok/codex chats have no events, so they get the
   sidebar's "needs you" only.

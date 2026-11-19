@@ -30,6 +30,7 @@ import {
 } from '../api';
 import { AgentIcon } from '../components/AgentIcon';
 import { Spinner } from '../components/Spinner';
+import { toastAction } from '../ui/toast';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
 // opening a chat triggers (otherwise clicking a chat would snap the tab back to 'active').
@@ -208,6 +209,27 @@ export function DevStackBar({
   // The down services to (re)start when not everything is up. Stop only when both are up.
   const down = [...(feUp ? [] : ['frontend']), ...(beUp ? [] : ['backend'])];
   const busy = a.start.isPending || a.stop.isPending;
+  // Say what the click is attempting — "start" on a half-up stack only brings the down service up,
+  // "stop" takes the whole stack down — then what came of it. mutateAsync + promises (not per-call
+  // callbacks) so the result still lands if you switch chats while it runs.
+  const svcLabel = (n: string) => `${n === 'frontend' ? 'frontend' : 'backend'} :${n === 'frontend' ? task.ports!.frontend : task.ports!.backend}`;
+  const runStartStop = () => {
+    const id = `devstack:${task.id}`;
+    if (allUp) {
+      const all = ['frontend', 'backend'].map(svcLabel).join(' + ');
+      void toastAction(id, `stopping ${all}…`, () => a.stop.mutateAsync(task.id), () => `stopped ${all}`, (m) => `stop failed — ${m}`);
+      return;
+    }
+    const names = down.map(svcLabel).join(' + ');
+    const kept = ['frontend', 'backend'].filter((n) => !down.includes(n)).map(svcLabel).join(' + ');
+    void toastAction(
+      id,
+      `starting ${names}…${kept ? ` (${kept} already running)` : ''}`,
+      () => a.start.mutateAsync({ id: task.id, only: down }),
+      () => `launched ${names} — status updates when it answers`,
+      (m) => `start failed — ${m}`,
+    );
+  };
   const [statusTxt, statusCls] = allUp
     ? ['● running', 'text-ok']
     : anyUp
@@ -236,7 +258,7 @@ export function DevStackBar({
         </button>
       )}
       <button
-        onClick={() => (allUp ? a.stop.mutate(task.id) : a.start.mutate({ id: task.id, only: down }))}
+        onClick={runStartStop}
         disabled={busy}
         title={
           allUp

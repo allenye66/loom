@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useChatActions, type Chat } from '../api';
+import { BellIcon, BellOffIcon } from '../ui/icons';
 
 /** The shared active-chat list (same cache key the sidebar and ⌘K use). */
 export const chatsKey = ['chats', { scope: 'all', tab: 'active', q: '' }] as const;
@@ -27,10 +28,10 @@ export function useChatMuted(id?: string): boolean {
   return !!data?.find((c) => c.id === id)?.muted;
 }
 
-/** 🔔 / 🔕 — `variant="row"` is the sidebar's hover control (always visible once muted). */
+/** Bell / slashed bell — `variant="row"` is the sidebar's hover control (always visible once muted). */
 export function MuteButton({ id, muted, variant = 'header' }: { id: string; muted: boolean; variant?: 'row' | 'header' }) {
   const setMuted = useSetMuted();
-  const base = variant === 'row' ? 'shrink-0 text-xs leading-none' : 'text-sm leading-none px-1.5';
+  const base = variant === 'row' ? 'shrink-0 leading-none' : 'leading-none px-1.5';
   const vis = variant === 'row' ? (muted ? 'opacity-60 hover:opacity-100' : 'opacity-0 group-hover:opacity-100') : muted ? 'opacity-80' : 'opacity-60 hover:opacity-100';
   return (
     <button
@@ -42,7 +43,7 @@ export function MuteButton({ id, muted, variant = 'header' }: { id: string; mute
       aria-pressed={muted}
       className={`${base} ${vis}`}
     >
-      {muted ? '🔕' : '🔔'}
+      {muted ? <BellOffIcon size={variant === 'row' ? 12 : 14} /> : <BellIcon size={variant === 'row' ? 12 : 14} />}
     </button>
   );
 }

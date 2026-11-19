@@ -8,6 +8,7 @@ import { CreatingPane } from './chat/CreatingPane';
 import { BoardModal } from './board/BoardModal';
 import { AttentionNotifier } from './notify/attention';
 import { RadarModal } from './radar/RadarModal';
+import { Toaster } from './ui/toast';
 import { TerminalView } from './term/TerminalView';
 
 /** The loom mark: one thread weaving over and under three warp dots (parallel tasks).
@@ -220,6 +221,7 @@ function Shell() {
       <BoardModal />
       <RadarModal />
       <AttentionNotifier />
+      <Toaster />
       <ChatSidebar activeSid={active?.resume} />
       {viewingPending ? (
         <CreatingPane pending={viewingPending} />

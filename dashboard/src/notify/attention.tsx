@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import type { Chat } from '../api';
 import { useChatShell, useOpenChat } from '../chat/openChat';
 import { WORKING_WITHIN_S } from '../chat/shortcuts';
+import { BellIcon, BellOffIcon } from '../ui/icons';
 import { chatsKey, fetchChats } from './mute';
 
 const KEY = 'loom.notify';
@@ -45,7 +46,7 @@ export function useNotifyEnabled(): [boolean, () => void, NotificationPermission
   return [on && perm !== 'denied', toggle, perm];
 }
 
-/** Sidebar header bell: desktop notifications when a chat needs you (mute individual chats with their 🔔). */
+/** Sidebar header bell: desktop notifications when a chat needs you (mute individual chats with their bell). */
 export function NotifyBell() {
   const [on, toggle, perm] = useNotifyEnabled();
   if (perm === 'unsupported') return null;
@@ -60,9 +61,9 @@ export function NotifyBell() {
             ? 'desktop notifications on — when an unmuted chat needs you and this tab is in the background (click to turn off)'
             : 'turn on desktop notifications for chats that need you (you can mute individual chats)'
       }
-      className={`text-[12px] leading-none ${on ? 'opacity-100' : 'opacity-50 hover:opacity-100'}`}
+      className={`leading-none ${on ? 'text-accent' : 'text-muted opacity-70 hover:opacity-100 hover:text-ink'}`}
     >
-      {on ? '🔔' : '🔕'}
+      {on ? <BellIcon size={14} /> : <BellOffIcon size={14} />}
     </button>
   );
 }
