@@ -54,6 +54,7 @@ def serve(
     url = f"http://{host}:{port}"
     # Chats this server launches inherit it, so their `loom` CLI talks to THIS server.
     os.environ["LOOM_API_URL"] = url
+    os.environ["LOOM_BIND_HOST"] = host  # the server's Host/Origin guard is only on when loom listens on loopback
     console.print(f"[bold magenta]loom[/] → {url}")
     if open_browser:
         with contextlib.suppress(Exception):

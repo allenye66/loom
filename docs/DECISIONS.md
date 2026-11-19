@@ -435,6 +435,26 @@ Goal: cut the human's attention cost across dozens of chats (the research round'
   change, instead of reimplementing an undo model. Ctrl+Z is mapped too, since forwarding it would SUSPEND
   the agent. Verified in the real TUI.
 
+## D25 — The API only answers this machine's own pages and tools (2026-11-19)
+Problem: CORS was `*` and nothing checked `Host`/`Origin` on REST or the terminal WebSocket, while the API
+can type into agents that run with bypassed permissions (`/chats/{id}/send`, `/api/ws/term`, `/shell`).
+Verified against the live server: a page on another origin read 3 projects / 260 chat records. Loopback
+binding only keeps *other machines* out — the user's own browser will call it for any site it has open.
+- `server/guard.py`, a pure-ASGI middleware outside CORS (so it covers WebSocket handshakes and a refused
+  request gets no CORS headers): **Host** must be a loopback name (kills DNS rebinding — the browser's
+  Host mirrors the attacker's domain) and, if the browser sent an **Origin**, it must be a loopback origin
+  on any port (the dashboard, `vite` dev servers, per-worktree frontends). `Origin: null` and foreign
+  sites get 403 / WS close 1008. CORS now echoes only loopback origins (`allow_origin_regex`), never `*`.
+- Requests with no Origin (the `loom` CLI, `curl`, the agents' hooks) are unaffected — they aren't browsers.
+- Off when loom is bound to a non-loopback address (`loom serve --host 0.0.0.0` — you chose the network);
+  `LOOM_ALLOWED_HOSTS=a.ts.net,…` adds names deliberately (e.g. reaching loom over Tailscale on loopback).
+- **Known gap:** a page served from *another localhost port* is a loopback origin and still allowed — one
+  of your own dev servers with an XSS hole or a malicious dependency can still read/drive loom. Closing it
+  needs a secret shared by the dashboard and the CLI/hooks (a per-install token in `~/.loom`, sent as a
+  header, injected into agents' env); deliberately not done yet — it touches every client.
+- Verified in a real browser: a page on a foreign origin can neither read the API nor open the WebSocket
+  (403 in the server log, nothing reached an agent); the dashboard works on `localhost` and `127.0.0.1`.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

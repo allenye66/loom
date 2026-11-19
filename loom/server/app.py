@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,8 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from loom import __version__
+from loom.core.config import LOOM_API_HOST
 from loom.core import manager, monitor, perf, radar, registry, sessions, terminals
 from loom.server.api import router
+from loom.server.guard import CORS_ORIGIN_REGEX, LoopbackOnlyMiddleware
 from loom.server.board_api import router as board_router
 
 DASHBOARD_DIST = Path(__file__).resolve().parents[2] / "dashboard" / "dist"
@@ -68,14 +71,17 @@ async def _lifespan(_app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="loom", version=__version__, lifespan=_lifespan)
-    # Single-user localhost tool — permissive CORS so the Vite dev server (5173)
-    # can talk to the API while you hack on the dashboard.
+    # Single-user localhost tool. CORS is answered only to loopback origins (any port — the Vite dev
+    # server, per-worktree frontends, the dashboard itself), never `*`; and the guard below refuses any
+    # request whose Host or Origin isn't this machine (see server/guard.py: DNS rebinding, foreign sites).
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[],
+        allow_origin_regex=CORS_ORIGIN_REGEX,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(LoopbackOnlyMiddleware, bind_host=os.environ.get("LOOM_BIND_HOST") or LOOM_API_HOST)  # outermost
     # Time every API request; log the slow ones. A sync endpoint's wall-clock here also
     # captures time spent waiting for a threadpool slot — i.e. server-side contention that
     # the UI feels as lag. Only /api/* (skips static asset serving).
