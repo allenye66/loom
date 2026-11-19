@@ -86,13 +86,21 @@ def _claude_settings(chat_id: str, *, fullscreen: bool) -> dict:
     # prompt + session id) to loom, and loom answers with text to attach — or nothing. A tiny curl
     # (not the `loom` CLI: a Python startup on every message would add latency) that never fails
     # the turn: short timeout, errors swallowed.
-    ctx_url = shlex.quote(f"{harness_env()['LOOM_API_URL'].rstrip('/')}/api/chats/{chat_id}/prompt-context")
+    base = harness_env()["LOOM_API_URL"].rstrip("/")
+    ctx_url = shlex.quote(f"{base}/api/chats/{chat_id}/prompt-context")
     ctx_cmd = f"curl -s -m 3 -X POST --data-binary @- {ctx_url} || true"
+    # Lifecycle events (core/events.py): same tiny curl, output discarded (a SessionStart hook's
+    # stdout would otherwise be injected into the conversation), errors swallowed.
+    ev_url = shlex.quote(f"{base}/api/chats/{chat_id}/event")
+    ev_cmd = f"curl -s -m 2 -X POST --data-binary @- {ev_url} >/dev/null 2>&1 || true"
+    ev = {"type": "command", "command": ev_cmd}
     settings: dict = {
         "theme": "dark",
         "hooks": {
-            "Stop": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
-            "Notification": [{"hooks": [{"type": "command", "command": f"touch {mark}"}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": f"touch {mark}"}, ev]}],
+            "Notification": [{"hooks": [{"type": "command", "command": f"touch {mark}"}, ev]}],
+            "SessionStart": [{"hooks": [ev]}],
+            "SessionEnd": [{"hooks": [ev]}],
             "UserPromptSubmit": [{"hooks": [
                 {"type": "command", "command": f"rm -f {mark}"},
                 {"type": "command", "command": ctx_cmd},

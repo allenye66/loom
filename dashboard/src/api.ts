@@ -159,6 +159,7 @@ export type Chat = {
   repo?: string | null;
   task?: string | null;
   name?: string | null;
+  muted?: boolean; // no desktop notifications / attention badge
   category?: string | null; // the sidebar group (a category id) — set by GET /chats
   category_name?: string | null;
   tags: string[];
@@ -250,7 +251,7 @@ export function useRefreshBrief(chatId: string | null | undefined) {
   });
 }
 
-type ChatPatch = Partial<Pick<Chat,'starred' | 'archived' | 'hidden' | 'name' | 'tags' | 'description' | 'mode'>>;
+type ChatPatch = Partial<Pick<Chat,'starred' | 'archived' | 'hidden' | 'muted' | 'name' | 'tags' | 'description' | 'mode'>>;
 
 /** Move a chat between the cached active / archived lists right away (the sidebar's rows
  *  disappear the instant you click, not when the server answers). Returns what it overwrote. */

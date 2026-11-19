@@ -21,7 +21,7 @@ import contextlib
 import hashlib
 import time
 
-from loom.core import board, categories, db, manager, sessions
+from loom.core import board, categories, db, manager, radar, sessions
 from loom.core.mentions import mention_tokens, resolve_token, slugify
 
 MAX_SIBLINGS = 12
@@ -196,6 +196,14 @@ def prompt_context(chat_id: str, prompt: str, *, session_id: str | None = None) 
         changed, newly = _ws_changed(f"{chat_id}:{session_id or '-'}", sig, board_on)
         if changed:
             parts.append(_workspace_block(me_name, chat_id, cat, sibs, board_on, newly))
+        note = radar.overlap_note(chat_id, cat["id"])  # from the radar's cache — never computed in a hook
+        with db.connect() as con:
+            rkey = f"{chat_id}:{session_id or '-'}:radar"
+            rh = hashlib.sha1(note.encode()).hexdigest()[:16] if note else ""
+            if _state_get(con, rkey) != rh:
+                _state_set(con, rkey, rh)
+                if note:
+                    parts.append(note)
         if board_on:  # (a disabled board has no posts to deliver)
             posts = board.unread(cat["id"], chat_id)
             if posts:

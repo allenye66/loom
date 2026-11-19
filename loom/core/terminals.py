@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 from loom.core import agents
+from loom.core import events as events_mod
 from loom.core import sessions as sessions_mod
 from loom.core.config import LOGS_DIR, LOOM_HOME
 from loom.core.pty_server import (
@@ -966,8 +967,14 @@ def list_active(detached: bool = False) -> list[dict]:
     attached (i.e. opened this loom run) — unless `detached`, which also lists agents whose
     pty daemon is alive but that loom hasn't re-attached since a restart (`attached: false`,
     `idle_sec: null` — loom isn't reading their output, so it can't tell working from idle).
+    `turn` / `turn_since` are the agent's own lifecycle (core/events.py: running | waiting | idle |
+    ended), from its hooks — exact where `idle_sec` is only an inference, and it survives restarts.
     Blocking (socket-dir scan) when `detached` — call off the event loop."""
     now = time.monotonic()
+    try:
+        turns = events_mod.turn_states()
+    except Exception:  # noqa: BLE001 — a status hint must never break the list
+        turns = {}
     out: list[dict] = []
     for ts in list(_registry.values()):
         if not ts.attached:
@@ -978,6 +985,8 @@ def list_active(detached: bool = False) -> list[dict]:
             "needs": _marker_path(ts.chat_id).exists(),
             "attached": True,
             "waiting_on": waiting_on(ts),
+            "turn": (turns.get(ts.chat_id) or {}).get("turn"),
+            "turn_since": (turns.get(ts.chat_id) or {}).get("since"),
         })
     if detached:
         seen = {d["chat_id"] for d in out}
@@ -986,6 +995,7 @@ def list_active(detached: bool = False) -> list[dict]:
                 out.append({
                     "chat_id": cid, "idle_sec": None, "needs": _marker_path(cid).exists(),
                     "attached": False, "waiting_on": None,
+                    "turn": (turns.get(cid) or {}).get("turn"), "turn_since": (turns.get(cid) or {}).get("since"),
                 })
     return out
 

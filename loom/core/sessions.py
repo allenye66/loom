@@ -872,6 +872,7 @@ def _merge(s: dict, resolve=None) -> dict:
         "description": ov.get("description"),
         "pr_manual": ov.get("pr"),
         "starred": ov.get("starred", False),
+        "muted": bool(ov.get("muted", False)),
         "archived": ov.get("archived", False),
         "archived_at": ov.get("archived_at"),  # epoch stamp; sorts the archived tab (may be None)
         "hidden": ov.get("hidden", False),

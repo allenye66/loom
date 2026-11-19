@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from loom import __version__
-from loom.core import manager, monitor, perf, registry, sessions, terminals
+from loom.core import manager, monitor, perf, radar, registry, sessions, terminals
 from loom.server.api import router
 from loom.server.board_api import router as board_router
 
@@ -42,6 +42,8 @@ async def _status_sweeper() -> None:
         if n % 8 == 0:  # ~once a minute: bind any chat whose conversation turned up under another session id
             with contextlib.suppress(Exception):
                 await loop.run_in_executor(None, sessions.repair_all)
+            with contextlib.suppress(Exception):
+                await loop.run_in_executor(None, radar.compute_all)
         await asyncio.sleep(_SWEEP_INTERVAL)
 
 

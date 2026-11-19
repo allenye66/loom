@@ -8,6 +8,9 @@
     POST /api/boards/{key}/enable          turn a category's board on — the USER only (see below)
     GET  /api/chats/{sid}/workspace        the chat's category, siblings, board state (`loom whoami`)
     POST /api/chats/{sid}/prompt-context   the UserPromptSubmit hook: text to attach to this message
+    POST /api/chats/{sid}/event            the Stop / Notification / SessionStart / SessionEnd hooks (core/events.py)
+    GET  /api/events?since=N · /api/events/stream   new lifecycle events (poll, or server-sent) — the notifier's feed
+    GET  /api/radar · /api/categories/{id}/radar   conflict radar: chats in a category changing the same files
 
 A board key is a category id. Chats outside any category have no board, and a category's board is
 off until the user enables it (post / wait answer 409 with what to do; reads show `enabled: false`).
@@ -24,10 +27,10 @@ from collections import defaultdict, deque
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from loom.core import board, categories, terminals, workspace
+from loom.core import board, categories, events, radar, terminals, workspace
 from loom.server.api import _chat_cwd
 
 router = APIRouter()
@@ -220,7 +223,64 @@ async def prompt_context(sid: str, request: Request) -> str:
     with contextlib.suppress(Exception):
         data = json.loads(raw or b"{}")
         prompt, session_id = str(data.get("prompt") or ""), data.get("session_id")
+    with contextlib.suppress(Exception):
+        await run_in_threadpool(events.record, sid, "UserPromptSubmit", session_id)
     try:
         return await run_in_threadpool(lambda: workspace.prompt_context(sid, prompt, session_id=session_id))
     except Exception:  # noqa: BLE001
         return ""
+
+
+@router.post("/chats/{sid}/event", response_class=PlainTextResponse)
+async def chat_event(sid: str, request: Request) -> str:
+    """A lifecycle hook (`hook_event_name` in claude's hook JSON) → the event ledger. Always answers
+    with an empty body: a SessionStart hook's stdout is injected into the conversation."""
+    with contextlib.suppress(Exception):
+        data = json.loads(await request.body() or b"{}")
+        await run_in_threadpool(events.record, sid, str(data.get("hook_event_name") or ""), data.get("session_id"))
+    return ""
+
+
+@router.get("/events")
+def events_feed(since: int | None = None, limit: int = 200) -> dict:
+    """New lifecycle events after `since` (omit it to just learn the newest id — a client's baseline)."""
+    latest = events.latest_id()
+    if since is None:
+        return {"events": [], "latest": latest}
+    return {"events": events.since(since, max(1, min(limit, 500))), "latest": latest}
+
+
+@router.get("/events/stream")
+async def events_stream(since: int | None = None):
+    """Server-sent events: each new lifecycle event the moment it lands (a background tab's timers are
+    throttled; a network stream isn't). First message `hello` carries the newest id (the baseline)."""
+    async def gen():
+        last = since if since is not None else await run_in_threadpool(events.latest_id)
+        yield f"event: hello\ndata: {json.dumps({'latest': last})}\n\n"
+        quiet = 0
+        while True:
+            evs = await run_in_threadpool(events.since, last, 200)
+            if evs:
+                last = evs[-1]["id"]
+                quiet = 0
+                yield f"data: {json.dumps({'events': evs})}\n\n"
+            else:
+                quiet += 1
+                if quiet % 15 == 0:
+                    yield ": keepalive\n\n"
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@router.get("/radar")
+async def radar_overview() -> dict:
+    """Per category: how many chat pairs overlap / would conflict (cached; recomputed when stale)."""
+    return {"categories": await run_in_threadpool(radar.overview)}
+
+
+@router.get("/categories/{key}/radar")
+async def category_radar(key: str, refresh: bool = False) -> dict:
+    _category(key)
+    r = await run_in_threadpool(lambda: radar.get(key, max_age=0 if refresh else radar.TTL_S))
+    return r or {"key": key, "category": _category(key)["name"], "members": [], "overlaps": [], "computed_at": None}

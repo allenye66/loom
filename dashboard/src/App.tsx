@@ -6,6 +6,8 @@ import { ChatSidebar } from './chat/ChatSidebar';
 import { CommandPalette } from './chat/CommandPalette';
 import { CreatingPane } from './chat/CreatingPane';
 import { BoardModal } from './board/BoardModal';
+import { AttentionNotifier } from './notify/attention';
+import { RadarModal } from './radar/RadarModal';
 import { TerminalView } from './term/TerminalView';
 
 /** The loom mark: one thread weaving over and under three warp dots (parallel tasks).
@@ -216,6 +218,8 @@ function Shell() {
     <div className="flex h-screen min-h-0 bg-canvas">
       <CommandPalette />
       <BoardModal />
+      <RadarModal />
+      <AttentionNotifier />
       <ChatSidebar activeSid={active?.resume} />
       {viewingPending ? (
         <CreatingPane pending={viewingPending} />

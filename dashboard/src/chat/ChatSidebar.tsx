@@ -4,6 +4,9 @@ import { useChatShell, useOpenChat } from './openChat';
 import { InlineRename, useRenameChat } from './InlineRename';
 import { PALETTE_KEY_LABEL, WORKING_WITHIN_S } from './shortcuts';
 import { BoardButton } from '../board/BoardButtons';
+import { MuteButton } from '../notify/mute';
+import { NotifyBell } from '../notify/attention';
+import { RadarBadge } from '../radar/RadarBadge';
 import { NotesButton } from '../notes/NotesButton';
 import {
   addCategory,
@@ -465,6 +468,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     last: number;
     mode?: 'chat' | 'terminal' | null;
     agent?: AgentId | null;
+    muted?: boolean;
   };
   const rows: Row[] = taskChats.map((c) => ({
     id: c.id,
@@ -474,6 +478,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     last: c.last_active,
     mode: c.mode,
     agent: c.agent,
+    muted: c.muted,
   }));
 
   // The open chat's header title follows its sidebar row — so a rename (here, in the header, or
@@ -764,7 +769,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           </span>
         )}
         {working && <span title="agent is working (recent output)" className="text-[9px] mono text-accent shrink-0 animate-pulse">working</span>}
-        {needs && <span title="idle — agent may be waiting on you" className="text-[9px] mono text-ok shrink-0">needs you</span>}
+        {needs && <span title={r.muted ? 'waiting on you (muted — no notification)' : 'idle — agent may be waiting on you'} className={`text-[9px] mono text-ok shrink-0 ${r.muted ? 'opacity-40' : ''}`}>needs you</span>}
         {r.mode === 'terminal' && !working && !needs && <span title="terminal chat (real agent TUI)" className="text-[9px] mono text-accent shrink-0">❯</span>}
         {/* Open this chat as a terminal (resumes the same transcript in the real claude TUI). */}
         {r.mode !== 'terminal' && (
@@ -779,6 +784,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
             term
           </button>
         )}
+        <MuteButton id={r.id} muted={!!r.muted} variant="row" />
         <button
           onClick={(e) => { e.stopPropagation(); archiveToggle(r.id); }}
           title={tab === 'archived' ? 'unarchive' : 'archive'}
@@ -848,6 +854,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         )}
         {g.id !== null && (
           <>
+            <RadarBadge catId={g.id} name={g.name} />
             <BoardButton catId={g.id} name={g.name} />
             <button
               onClick={() => setRenamingCat(g.id)}
@@ -875,6 +882,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       <div className="px-3 py-2.5 flex items-center justify-between gap-2">
         <ProjectMenu repos={repos ?? []} active={project} counts={countByRepo} onPick={pickProject} />
         <div className="flex items-center gap-2 shrink-0">
+          <NotifyBell />
           <button
             onClick={() => setCreatingCat((v) => !v)}
             title="new category"

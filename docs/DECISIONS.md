@@ -344,6 +344,13 @@ between them. Decisions:
   Baking the category and siblings into the system prompt was rejected: it goes stale the moment
   the user drags a chat to another category. Only claude has this hook; grok/codex get the harness
   note and resolve `@name` through the CLI (`loom chats show @name`).
+- **Update (11-19): `#` is the primary mention trigger; `@@` still works.** Probed against a real
+  claude 2.1.328 TUI: `@` makes claude draw its big file picker (MCP resources included), and `@@`'s
+  take-back Backspace then tears it down — a visible flicker, which is why `@@` felt unreliable. Claude
+  does nothing with `#` (no memory mode in this version), so `#` at the start of a word is *swallowed*
+  and opens loom's picker with nothing to undo. Real uses of `#` stay typeable: Space on an empty query
+  types `# ` (heading), `##` types `##`, and `#123` / `#foo` with no match commit literally on
+  Space/Enter/punctuation; mid-word `#` (`C#`) never triggers. Verified in the real TUI via the browser.
 - **`@@` triggers the mention picker** (claude's own `@` is its file picker). The first `@` has
   reached the TUI before the second arrives, so the picker sends a Backspace to take it back out,
   swallows keystrokes while open, and pastes `@chat-slug ` (bracketed, so claude's picker doesn't
@@ -396,6 +403,37 @@ was refused while the daemon still hosted the session. Fix = the pattern codex a
 - Verified with real claude: a conversation run under a different session id, then asked by its loom
   id — resumed (`--resume <real id>`, the agent remembered a secret word) via both detection paths, and
   a real `claude --bg` session was stopped and resumed. Your actual affected chat is found in 4 ms.
+
+## D24 — The attention layer: lifecycle events, notifications with per-chat mute, conflict radar (2026-11-19)
+Goal: cut the human's attention cost across dozens of chats (the research round's top asks). Decisions:
+- **Exact agent state from the agent's own hooks.** Claude `Stop` / `Notification` / `SessionStart` /
+  `SessionEnd` (plus `UserPromptSubmit`, already posted for the context hook) POST to
+  `/api/chats/{id}/event` → `chat_events` in `loom.db` (`core/events.py`, 300 newest per chat). `/api/terminals`
+  gains `turn` (running | waiting | idle | ended) + `turn_since` — exact, survives loom restarts, and unlike
+  `idle_sec` is not inferred from output silence. The `needs/<id>` marker files stay (they also serve
+  grok/codex, which have no such hooks). The event hook discards curl's output (a SessionStart hook's stdout
+  is injected into the conversation); verified against real claude that the extra hook events are accepted.
+- **Desktop notifications, per-chat mute.** The bell in the sidebar header turns them on (browser permission).
+  Driven by a server-sent stream (`/api/events/stream` — a hidden tab's timers are throttled, a network stream
+  isn't): a new `Stop` / `Notification` for a chat → one notification, only while the tab is in the background,
+  bursts coalesced into one ("3 chats need you"), clicking opens the chat. Never for a muted or archived chat.
+  Mute is a per-chat overlay flag (`muted`, the 🔔/🔕 on a row and in the chat header, or `loom chats
+  mute|unmute`), persisted server-side so every browser — and any future push channel — honours it. The tab
+  title shows `(N) loom` for unmuted chats waiting on you. grok/codex chats have no events, so they get the
+  sidebar's "needs you" only.
+- **Conflict radar, scoped to a category.** Worktrees don't prevent collisions, they move them to merge time.
+  Within a category (the chats the user grouped as related), `core/radar.py` finds pairs whose worktrees
+  changed a common file (commits since the fork from the task's base branch + uncommitted edits; lockfiles
+  ignored) and tests whether their *committed* work would conflict with `git merge-tree --write-tree`
+  (nothing checked out or touched; ~0.15 s for 3 worktrees). Shown as a ⚠ badge on the category header
+  (red = would conflict) and a modal with files and a "tell both chats" button; each affected agent is also
+  told once per change through its per-message context. A merge queue (serial rebase → test → land, per
+  category) is the natural next step and is not built.
+- **`⌘Z` / `Ctrl+Z` undo the input box.** Claude's input has its own undo on Ctrl+_ (word-granular; it
+  restores Backspace-deleted text; no redo; its first step is sometimes a no-op) and a kill-ring (Ctrl+Y
+  restores text removed with Ctrl+U/W). The terminal maps ⌘Z to Ctrl+_, retrying once if the screen didn't
+  change, instead of reimplementing an undo model. Ctrl+Z is mapped too, since forwarding it would SUSPEND
+  the agent. Verified in the real TUI.
 
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's

@@ -460,6 +460,7 @@ class ChatPatch(BaseModel):
     starred: bool | None = None
     archived: bool | None = None
     hidden: bool | None = None
+    muted: bool | None = None  # no desktop notifications / attention badge for this chat
     name: str | None = None
     tags: list[str] | None = None
     description: str | None = None

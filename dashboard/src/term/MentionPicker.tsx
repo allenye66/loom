@@ -42,14 +42,22 @@ function rank(chats: Chat[], q: string, me: Chat | undefined): Scored[] {
 }
 
 /**
- * `@@` → pick a loom chat to mention. Claude's own `@` is its file picker, so the trigger is a
- * doubled `@` at the start of a word: the first `@` has already reached the TUI by the time the
- * second arrives, so we send a Backspace to take it back out, swallow the keystrokes while this
- * picker is open, and on Enter paste `@chat-slug ` (bracketed, so claude doesn't open its file
- * picker on it). The visible text stays a plain `@name`; the agent's UserPromptSubmit hook resolves
- * it server-side (core/workspace.py) and attaches which chat that is and how to reach it.
- * Esc cancels (types nothing); Backspace on an empty query leaves a single `@`; Space on an empty
- * query types a literal `@@ `.
+ * `#` (or `@@`) → pick a loom chat to mention.
+ *
+ * `#` at the start of a word opens the picker and is *swallowed* — claude's input box does nothing
+ * special with `#` (verified on 2.1.328), so nothing flickers. `@@` still works too, but claude's own
+ * `@` is its file picker: the first `@` has already reached the TUI when the second arrives, so we
+ * send a Backspace to take it back out (which draws and tears down claude's big picker for a
+ * moment — why `#` is the better trigger). While the picker is open it swallows the keystrokes; on
+ * Enter/Tab it pastes `@chat-slug ` (bracketed, so claude doesn't open its file picker on it). The
+ * visible text stays a plain `@name`; the agent's UserPromptSubmit hook resolves it server-side
+ * (core/workspace.py) and attaches which chat that is and how to reach it.
+ *
+ * `#` is also how people write `#123` and `# Heading`, so a `#` that isn't a mention types normally:
+ * `# ` (Space on an empty query), `##`, and `#123`/`#foo` when nothing matches and you press Space,
+ * Enter or punctuation — the literal text is sent as if the picker never opened. Mid-word `#`
+ * (`C#`, `a#b`) never triggers. Esc cancels (types nothing); Backspace on an empty `#` query too.
+ * For `@@`: Backspace on an empty query leaves a single `@`; Space types a literal `@@ `.
  *
  * Mounted once per terminal. `handleRef.current(data)` is called by the terminal's onData handler
  * for every chunk of keyboard input; returning true means "I consumed it, don't send it".
@@ -66,6 +74,7 @@ export function MentionPicker({
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(0);
+  const [trigger, setTrigger] = useState<'#' | '@@'>('#'); // which keystroke opened the picker
   // Typing state outside React (read on every keystroke): the last typed char, and whether the
   // previous `@` sat at a word start. null = unknown (cursor moved, pasted, backspaced…) → no trigger.
   const st = useRef<{ last: string | null; pendingAt: boolean }>({ last: '\n', pendingAt: false });
@@ -102,19 +111,29 @@ export function MentionPicker({
 
   const isPrintable = (d: string) => d.length >= 1 && [...d].every((ch) => ch >= ' ' && ch !== '\x7f');
 
+  // Literal text for a `#` that turned out not to be a mention (an issue ref, a heading…).
+  const literal = (text: string) => {
+    sendRef.current?.('#' + text);
+    st.current = { last: text.length ? text[text.length - 1] : '#', pendingAt: false };
+    close();
+  };
+  const PUNCT = /^[.,;:!?)\]}'"]$/;
+
   handleRef.current = (d: string): boolean => {
     // Terminal-generated reports (focus in/out) aren't typing: leave state alone, let them through.
     if (d === '\x1b[I' || d === '\x1b[O') return false;
 
     if (open) {
+      const hash = trigger === '#';
       if (d === '\r' || d === '\t') {
         if (results[sel]) choose(results[sel].c);
+        else if (hash && d === '\r') literal(q); // nothing matches: keep what was typed (don't submit)
         return true;
       }
       if (d === '\x1b' || d === '\x03') {
-        // Cancelled: the first @ is already out of the input box, so the cursor sits at the same word
-        // start where we triggered — a boundary again (leaving the state "unknown" would make the
-        // very next `@@` silently not trigger).
+        // Cancelled. `#` was never forwarded and `@@`'s first @ is already out, so the cursor sits at
+        // the word start we triggered at — a boundary again (an "unknown" state would make the next
+        // trigger silently not fire).
         st.current = { last: ' ', pendingAt: false };
         close();
         return true;
@@ -129,8 +148,8 @@ export function MentionPicker({
       }
       if (d === '\x7f') {
         if (q === '') {
-          sendRef.current?.('@'); // undo one of the two @s
-          st.current = { last: '@', pendingAt: false };
+          if (!hash) sendRef.current?.('@'); // `@@`: undo one of the two @s
+          st.current = { last: hash ? ' ' : '@', pendingAt: false };
           close();
         } else {
           setQ(q.slice(0, -1));
@@ -139,9 +158,17 @@ export function MentionPicker({
         return true;
       }
       if (d === ' ' && q === '') {
-        sendRef.current?.('@@ '); // a literal "@@"
+        sendRef.current?.(hash ? '# ' : '@@ '); // a literal "# " (heading) / "@@ "
         st.current = { last: ' ', pendingAt: false };
         close();
+        return true;
+      }
+      if (hash && d === '#' && q === '') {
+        literal('#'); // `##` (markdown heading) — not a mention
+        return true;
+      }
+      if (hash && results.length === 0 && q !== '' && (d === ' ' || PUNCT.test(d))) {
+        literal(q + d); // `#123 ` / `#foo,` — nothing matched, so it was a literal
         return true;
       }
       // typed text / paste → into the query (pasted bracketed text arrives wrapped in the markers)
@@ -153,13 +180,28 @@ export function MentionPicker({
       return true; // swallow everything else (other escape sequences) while the picker is up
     }
 
-    // --- closed: watch for `@@` at the start of a word ---
+    // --- closed: watch for `#` / `@@` at the start of a word ---
     const s = st.current;
+    if (d === '#') {
+      if (s.last !== null && BOUNDARY.has(s.last)) {
+        s.pendingAt = false;
+        s.last = null;
+        setTrigger('#');
+        setQ('');
+        setSel(0);
+        setOpen(true);
+        return true; // swallowed: claude ignores `#`, so there's nothing to take back
+      }
+      s.pendingAt = false;
+      s.last = '#';
+      return false; // mid-word (C#, a#b): type it normally
+    }
     if (d === '@') {
       if (s.pendingAt) {
         s.pendingAt = false;
         s.last = null;
         sendRef.current?.('\x7f'); // take the first @ back out of claude's input box
+        setTrigger('@@');
         setQ('');
         setSel(0);
         setOpen(true);
@@ -187,16 +229,21 @@ export function MentionPicker({
       onMouseDown={(e) => e.preventDefault() /* keep the terminal focused */}
     >
       <div className="px-3 py-2 border-b border-edge flex items-center gap-2 mono text-xs">
-        <span className="text-accent shrink-0">@@</span>
+        <span className="text-accent shrink-0">{trigger}</span>
         <span className="text-ink truncate">{q}</span>
         <span className="inline-block w-px h-3.5 bg-accent animate-pulse shrink-0" />
         <span className="flex-1" />
-        <span className="text-[10px] text-muted shrink-0 hidden sm:inline">↑↓ pick · ↵ insert · esc cancel · space = literal @@</span>
+        <span className="text-[10px] text-muted shrink-0 hidden sm:inline">
+          ↑↓ pick · ↵ insert · esc cancel · {trigger === '#' ? 'space = literal #' : 'space = literal @@'}
+        </span>
       </div>
       <div className="max-h-64 overflow-auto thin-scroll py-1" role="listbox">
         {!chats && <div className="px-3 py-3 mono text-xs text-muted">loading chats…</div>}
         {chats && results.length === 0 && (
-          <div className="px-3 py-3 mono text-xs text-muted">no chat matches “{q}”</div>
+          <div className="px-3 py-3 mono text-xs text-muted">
+            no chat matches “{q}”
+            {trigger === '#' && q && <span className="text-muted/70"> — space / enter / punctuation types “#{q}” as is</span>}
+          </div>
         )}
         {results.map((r, i) => (
           <div

@@ -14,6 +14,7 @@ import { STATUS_TONE, StatusPanel } from '../status/StatusPanel';
 import { UsageChip } from '../usage/UsageChip';
 import { MentionPicker } from './MentionPicker';
 import { BoardChip } from '../board/BoardButtons';
+import { MuteButton, useChatMuted } from '../notify/mute';
 import { useBrief, type Task } from '../api';
 import { createMessageNav, type JumpResult } from './messageNav';
 import { captureReadingPosition, restoreReadingPosition } from './readingPosition';
@@ -401,6 +402,7 @@ export function TerminalView({
   onClose: () => void;
 }) {
   const holderRef = useRef<HTMLDivElement>(null);
+  const chatMuted = useChatMuted(resume);
   // `@@` chat-mention picker (MentionPicker): it sees every keystroke via mentionRef and types back via inputSendRef.
   const mentionRef = useRef<((d: string) => boolean) | null>(null);
   const inputSendRef = useRef<((data: string) => void) | null>(null);
@@ -544,7 +546,33 @@ export function TerminalView({
       jump(dir);
       term.focus(); // back to the terminal so ⌘↑/⌘↓ and typing keep working after a click
     };
+    // Undo in claude's input box: ⌘Z (and Ctrl+Z — which would otherwise SUSPEND the agent) send
+    // Ctrl+_, claude's own input-undo (verified on 2.1.328: word-granular, and it restores text
+    // deleted with Backspace; redo doesn't exist). Its first step is sometimes a no-op, so if the
+    // visible screen didn't change we press it once more (max 2 retries).
+    const screenSig = () => {
+      const b = term.buffer.active;
+      const rows: string[] = [];
+      for (let i = Math.max(0, b.length - term.rows); i < b.length; i++) rows.push(b.getLine(i)?.translateToString(true) ?? '');
+      return rows.join('\n');
+    };
+    const undoInput = () => {
+      const before = screenSig();
+      send({ type: 'input', data: '\x1f' });
+      let tries = 0;
+      const check = () => {
+        if (tries++ >= 2 || screenSig() !== before) return;
+        send({ type: 'input', data: '\x1f' });
+        window.setTimeout(check, 160);
+      };
+      window.setTimeout(check, 160);
+    };
     term.attachCustomKeyEventHandler((e) => {
+      if (e.type === 'keydown' && (e.key === 'z' || e.key === 'Z') && !e.altKey && !e.shiftKey && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        undoInput();
+        return false; // never forward ⌘Z / Ctrl+Z (Ctrl+Z = SIGTSTP) to the agent
+      }
       const arrow = e.key === 'ArrowUp' || e.key === 'ArrowDown';
       if (!arrow || e.altKey || !(e.metaKey || (e.ctrlKey && e.shiftKey)) || !canJump()) return true;
       if (e.type === 'keydown') {
@@ -974,6 +1002,7 @@ export function TerminalView({
             </button>
             <OpenShellButton cwd={cwd} />
             <OpenInIde cwd={cwd} />
+            {resume && <MuteButton id={resume} muted={chatMuted} />}
             <button
               onClick={onClose}
               title="detach (the session keeps running)"

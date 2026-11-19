@@ -511,6 +511,26 @@ def chats_rename(ref: str = typer.Argument(...), name: str = typer.Argument(...,
     print(f"renamed {c['id'][:8]} → {name}")
 
 
+def _set_muted(refs: list[str], muted: bool) -> None:
+    w = _World()
+    for ref in refs:
+        c = w.resolve(ref)
+        _api("PATCH", f"/chats/{c['id']}", body={"muted": muted})
+        print(f"{'muted' if muted else 'unmuted'} {c['id'][:8]}  {_title(c)}")
+
+
+@chats_app.command("mute")
+def chats_mute(refs: list[str] = typer.Argument(..., help="chat id / prefix / name …")) -> None:
+    """Silence a chat's desktop notifications and attention badge (it still shows `needs you` in the sidebar)."""
+    _set_muted(refs, True)
+
+
+@chats_app.command("unmute")
+def chats_unmute(refs: list[str] = typer.Argument(..., help="chat id / prefix / name …")) -> None:
+    """Turn a chat's notifications back on."""
+    _set_muted(refs, False)
+
+
 def _resolve_category(w: _World, name: str, project: str | None, create: bool) -> dict | None:
     if name.strip().lower() in _NONE_CATEGORY:
         return None

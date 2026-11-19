@@ -114,6 +114,10 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   the context that matters via a `UserPromptSubmit` hook (roster, unread posts, resolved `@chat`
   mentions — nothing when there's nothing new); `@@` in the terminal opens a chat picker. Boards are
   **off until the user enables one per category** (the ▤ on the category header); chats are told.
+- **Attention layer** (D24) — desktop notifications when a chat needs you (opt-in bell; per-chat 🔔 mute;
+  driven by the agents' own lifecycle hooks over a live stream), a `(N) loom` tab badge, a per-category
+  **conflict radar** (⚠ on the category: chats changing the same files, and whether they'd conflict), `⌘Z`
+  undo in the input box, and `#` as the chat-mention trigger (`@@` still works).
 - **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
   categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
   working on a handoff prompt).
