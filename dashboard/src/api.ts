@@ -30,7 +30,7 @@ export type Task = {
   chat_mode?: 'chat' | 'terminal' | null; // locked surface for this task's chat (null = unchosen)
   chat_agent?: AgentId | null; // locked CLI for this task's chat
 };
-export type Repo = { name: string; root: string; base_branch: string };
+export type Repo = { name: string; root: string; base_branch: string; hidden?: boolean };
 export type Check = { name: string; ok: boolean; hint: string };
 
 async function jget<T>(path: string): Promise<T> {
@@ -54,12 +54,23 @@ async function jsend<T>(path: string, method: string, body?: unknown): Promise<T
 export const useTasks = () =>
   useQuery({ queryKey: ['tasks'], queryFn: () => jget<{ tasks: Task[] }>('/tasks').then((d) => d.tasks) });
 
-export const useRepos = () =>
-  useQuery({
-    queryKey: ['repos'],
-    queryFn: () => jget<{ repos: Repo[] }>('/repos').then((d) => d.repos),
-    refetchInterval: false,
-  });
+// One cached list holds every registered project (hidden ones carry `hidden: true`); the hooks below
+// slice it. Hiding is reversible and deletes/stops nothing — see core/repos.py.
+const allReposQuery = {
+  queryKey: ['repos'],
+  queryFn: () => jget<{ repos: Repo[] }>('/repos?include_hidden=true').then((d) => d.repos),
+  refetchInterval: false as const,
+};
+const visibleRepos = (rs: Repo[]) => rs.filter((r) => !r.hidden);
+const hiddenRepos = (rs: Repo[]) => rs.filter((r) => r.hidden);
+const hiddenNames = (rs: Repo[]) => new Set(rs.filter((r) => r.hidden).map((r) => r.name));
+/** The projects the dashboard lists (hidden ones excluded). */
+export const useRepos = () => useQuery({ ...allReposQuery, select: visibleRepos });
+/** Projects the user hid — the restore list. */
+export const useHiddenRepos = () => useQuery({ ...allReposQuery, select: hiddenRepos });
+/** Names of hidden projects, to keep their chats out of ⌘K / the sidebar / notifications. */
+const NO_NAMES = new Set<string>(); // stable identity while loading, so effects/memos keyed on it don't churn
+export const useHiddenRepoNames = () => useQuery({ ...allReposQuery, select: hiddenNames }).data ?? NO_NAMES;
 
 export const useDoctor = () =>
   useQuery({
@@ -136,6 +147,19 @@ export function useTaskActions() {
     addRepo: useMutation({
       mutationFn: (root: string) => jsend<Repo>('/repos', 'POST', { root }),
       onSuccess: () => qc.invalidateQueries({ queryKey: ['repos'] }),
+    }),
+    // Optimistic: the project leaves (or rejoins) the lists at once; rolled back if the request fails.
+    setRepoHidden: useMutation({
+      mutationFn: (v: { name: string; hidden: boolean }) =>
+        jsend<Repo>(`/repos/${encodeURIComponent(v.name)}`, 'PATCH', { hidden: v.hidden }),
+      onMutate: async (v) => {
+        await qc.cancelQueries({ queryKey: ['repos'] });
+        const prev = qc.getQueryData<Repo[]>(['repos']);
+        if (prev) qc.setQueryData(['repos'], prev.map((r) => (r.name === v.name ? { ...r, hidden: v.hidden || undefined } : r)));
+        return { prev };
+      },
+      onError: (_e, _v, ctx) => ctx?.prev && qc.setQueryData(['repos'], ctx.prev),
+      onSettled: () => qc.invalidateQueries({ queryKey: ['repos'] }),
     }),
   };
 }

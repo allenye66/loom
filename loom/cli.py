@@ -71,6 +71,30 @@ def repo_add(root: str) -> None:
     console.print(f"registered [bold]{info['name']}[/] → {info['root']}")
 
 
+@app.command("repo-hide")
+def repo_hide(name: str) -> None:
+    """Hide a project from the dashboard (its chats keep running; nothing is deleted)."""
+    from loom.core import repos
+
+    try:
+        repos.set_hidden(name, True)
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    console.print(f"hid [bold]{name}[/] — `loom repo-unhide {name}` (or re-add it) to bring it back")
+
+
+@app.command("repo-unhide")
+def repo_unhide(name: str) -> None:
+    """Show a hidden project in the dashboard again."""
+    from loom.core import repos
+
+    try:
+        repos.set_hidden(name, False)
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    console.print(f"showing [bold]{name}[/] again")
+
+
 @app.command()
 def new(
     branch: str,

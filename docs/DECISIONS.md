@@ -455,6 +455,23 @@ binding only keeps *other machines* out — the user's own browser will call it 
 - Verified in a real browser: a page on a foreign origin can neither read the API nor open the WebSocket
   (403 in the server log, nothing reached an agent); the dashboard works on `localhost` and `127.0.0.1`.
 
+## D26 — Projects can be hidden (reversible), not deleted (2026-11-19)
+Want: take a repo out of the way (finished project, accidental add) without losing anything.
+- **A `hidden` flag on the project's entry in `repos.json`** (`repos.set_hidden`, `PATCH /api/repos/{name}`
+  `{hidden}`; `GET /repos` omits hidden ones unless `include_hidden=true`). Nothing is deleted or stopped:
+  worktrees, tasks, chats and running agents are untouched, and internal callers (`sessions` resolving a
+  chat's repo from its cwd, spawning into a project, the harness's cwd→project lookup) still see every
+  project — so a hidden project's agents keep working and `loom chats …` still resolves from inside it.
+- **Out of sight and quiet.** Hidden projects' chats are left out of the sidebar, ⌘K, the `(N) loom` tab
+  badge and desktop notifications (a notification for a chat you can't see would be a dead end).
+- **UI:** the project menu's hover eye-slash hides instantly with an **undo** toast (no confirm dialog —
+  it's reversible); a "hidden (N)" list in the same menu has "show". Hiding the active project falls back
+  to the next one; with all hidden the sidebar shows "no project" and the menu keeps the restore list.
+  Re-adding a hidden project (`+ add project…`, `loom repo-add`) also un-hides it. CLI: `loom repo-hide /
+  repo-unhide <name>`, `loom projects [--hidden]`.
+- Not built: truly forgetting a project (deleting its entry / tasks) — hide covers "get it out of my way"
+  and can't lose work.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

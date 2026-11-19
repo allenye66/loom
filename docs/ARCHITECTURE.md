@@ -44,7 +44,7 @@ loom manages two things: **worktree tasks** (isolated dev/test stacks) and
 | `core/manager.py` | Task lifecycle: `create_task` (worktree+alloc+setup), `start_task`/`stop_task` (Phase-2 dev servers), `remove_task`, `refresh_status`. |
 | `core/tests.py` | Isolated test runs: `build_test_run` (render cmd/env from `.loom.yaml`), `serialize_lock` (file lock so concurrent runs don't clash on one shared test resource). |
 | `core/doctor.py` | Preflight checks (git/uv/node + agent CLIs claude/grok/codex, one required; optional bun/tmux/gh/docker). |
-| `core/repos.py` | **Projects**: the `repos.json` registry (name→root). `register` takes any git repo (stored at its top level) and refuses a second repo with an existing name. |
+| `core/repos.py` | **Projects**: the `repos.json` registry (name→root). `register` takes any git repo (stored at its top level) and refuses a second repo with an existing name. | A project can be **hidden** (`hidden` flag, `set_hidden`; D26) — out of the dashboard, nothing deleted.
 | `core/agents.py` | **Agent adapters** (claude \| grok \| codex): argv/env construction per CLI, transcript discovery, needs-you hooks. Codex extras: it mints its own session id (no `--session-id`), so loom binds the discovered native id into the overlay (`agent_session_id`) via the `notify` hook file / a rollout cwd-scan, and resumes with `codex resume <that id>`. |
 | `core/sessions.py` | **Chat manager**: index `~/.claude/projects/**/*.jsonl` + `~/.grok/sessions/**` + `~/.codex/sessions/**` rollouts (mtime-cached), merge a local overlay, search, soft-trash, and `get_transcript()` (reconstruct a session into render items; claude + codex formats). Codex rows claimed by an `agent_session_id` binding are re-keyed to their loom chat id. Chat→task resolution: the `task.chat_id` link wins (homes adopted chats in their task's worktree), then worktree/repo cwd-prefix inference. |
 | `core/runtime.py` | Per-worktree runtime context: if a session's cwd is inside a worktree, build its `LOOM_*` env (ports/log dir) + the `<loom-runtime>` system-prompt note. Project-agnostic. Also the `<loom-harness>` note every chat gets (`HARNESS_NOTE`, via `agent_note`) and `harness_env` (`LOOM_API_URL` + loom's bin on PATH). |
@@ -202,7 +202,7 @@ into the system prompt. grok/codex have no such hook: they get the harness note 
 ## REST + WS endpoints (`server/api.py`)
 ```
 GET  /api/health, /api/doctor, /api/usage
-GET/POST  /api/repos
+GET/POST  /api/repos[?include_hidden] · PATCH /api/repos/{name} {hidden}
 GET/POST/DELETE  /api/tasks ;  POST /api/tasks/{id}/{start,stop,test} ;  GET /api/tasks/{id}/{test,logs,chat}
 GET  /api/tasks/{id}/logs?kind=  (efficient tail: backend|frontend|test|…)
 GET  /api/tasks/{id}/logs/kinds · /logs/since · SSE /logs/stream ;  DELETE /logs?kind=

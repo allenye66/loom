@@ -121,7 +121,7 @@ class _World:
         if me and me.get("repo"):
             return me["repo"]
         cwd = os.getcwd()
-        for r in _api("GET", "/repos")["repos"]:
+        for r in _api("GET", "/repos", params={"include_hidden": "true"})["repos"]:  # a hidden project's chats still run
             root = r["root"].rstrip("/")
             if cwd == root or cwd.startswith(root + "/"):
                 return r["name"]
@@ -696,17 +696,21 @@ def _print_workspace(sid: str) -> None:
     print(f"{'others':<11} {others}" + (f" (+{len(ws['siblings']) - 12} more)" if len(ws["siblings"]) > 12 else ""))
 
 
-def projects(as_json: bool = typer.Option(False, "--json")) -> None:
+def projects(
+    as_json: bool = typer.Option(False, "--json"),
+    show_hidden: bool = typer.Option(False, "--hidden", help="include projects the user hid from the dashboard"),
+) -> None:
     """The user's projects (registered repos) with their chat counts; * = this chat's / cwd's."""
     w = _World()
     here = w.default_project()
     data = []
-    for r in _api("GET", "/repos")["repos"]:
+    for r in _api("GET", "/repos", params={"include_hidden": "true" if show_hidden else "false"})["repos"]:
         mine = [c for c in w.loom_chats if c.get("repo") == r["name"]]
         active = [c for c in mine if not c.get("archived") and not c.get("hidden")]
         data.append({
             "name": r["name"],
             "root": r.get("root"),
+            "hidden": bool(r.get("hidden")),
             "current": r["name"] == here,
             "active": len(active),
             "archived": sum(1 for c in mine if c.get("archived")),
@@ -718,7 +722,7 @@ def projects(as_json: bool = typer.Option(False, "--json")) -> None:
         return
     _table(
         ["", "PROJECT", "ACTIVE", "WORKING", "NEEDS-YOU", "ARCHIVED", "ROOT"],
-        [["*" if d["current"] else "", d["name"], str(d["active"]), str(d["working"]), str(d["needs_you"]),
+        [["*" if d["current"] else "", d["name"] + (" (hidden)" if d["hidden"] else ""), str(d["active"]), str(d["working"]), str(d["needs_you"]),
           str(d["archived"]), d["root"] or "-"] for d in data],
     )
 

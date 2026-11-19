@@ -114,8 +114,23 @@ class RepoIn(BaseModel):
 
 
 @router.get("/repos")
-def list_repos() -> dict:
-    return {"repos": repos.list_repos()}
+def list_repos(include_hidden: bool = False) -> dict:
+    """The projects the dashboard lists; `include_hidden=true` adds the ones the user hid (each
+    carries `hidden: true`) — the restore list, and name→root resolution for a hidden project's chats."""
+    return {"repos": repos.list_repos(include_hidden=include_hidden)}
+
+
+class RepoPatch(BaseModel):
+    hidden: bool
+
+
+@router.patch("/repos/{name}")
+def patch_repo(name: str, body: RepoPatch) -> dict:
+    """Hide / un-hide a project (reversible; nothing is deleted or stopped)."""
+    try:
+        return repos.set_hidden(name, body.hidden)
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
 
 
 @router.post("/repos")

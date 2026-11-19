@@ -48,10 +48,28 @@ def register(root: str) -> dict:
             f"a project named {cfg.name!r} is already registered at {existing['root']} — "
             "give this one a different `name:` in its .loom.yaml"
         )
+    # Adding a project again is a deliberate "I want it" — it comes back if it was hidden.
     d[cfg.name] = {"name": cfg.name, "root": cfg.root, "base_branch": cfg.base_branch}
     _write(d)
     return d[cfg.name]
 
 
-def list_repos() -> list[dict]:
-    return list(_read().values())
+def list_repos(include_hidden: bool = True) -> list[dict]:
+    """Registered projects. Internal callers resolve a chat's repo from its cwd, so they want all of
+    them (a hidden project's chats still run); the dashboard's list asks for the visible ones."""
+    return [r for r in _read().values() if include_hidden or not r.get("hidden")]
+
+
+def set_hidden(name: str, hidden: bool) -> dict:
+    """Hide a project from the dashboard (or bring it back). Nothing is deleted or stopped: its
+    worktrees, chats and running agents are untouched — it's just out of the sidebar, ⌘K and
+    notifications. Reversible; re-adding the project also un-hides it."""
+    d = _read()
+    if name not in d:
+        raise ValueError(f"unknown project '{name}'")
+    if hidden:
+        d[name]["hidden"] = True
+    else:
+        d[name].pop("hidden", None)
+    _write(d)
+    return d[name]

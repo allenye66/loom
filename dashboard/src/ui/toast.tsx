@@ -4,7 +4,8 @@ import { useSyncExternalStore } from 'react';
  *  what came of it. Reusing an `id` replaces that toast in place ("starting…" → "launched"), so a
  *  single action never stacks two. Click one to dismiss it. */
 export type ToastKind = 'pending' | 'ok' | 'err' | 'info';
-type Toast = { id: string; text: string; kind: ToastKind; seq: number };
+type ToastAction = { label: string; run: () => void };
+type Toast = { id: string; text: string; kind: ToastKind; seq: number; action?: ToastAction };
 
 const TTL: Record<ToastKind, number> = { ok: 2600, info: 3200, err: 6500, pending: 30000 }; // pending: safety net only
 const MAX = 4;
@@ -23,10 +24,10 @@ export function dismissToast(id: string) {
 }
 
 /** Show (or update) a toast. Returns its id. */
-export function toast(text: string, opts: { id?: string; kind?: ToastKind; ttl?: number } = {}): string {
+export function toast(text: string, opts: { id?: string; kind?: ToastKind; ttl?: number; action?: ToastAction } = {}): string {
   const id = opts.id ?? `t${++seq}`;
   const kind = opts.kind ?? 'info';
-  const next: Toast = { id, text, kind, seq: ++seq };
+  const next: Toast = { id, text, kind, seq: ++seq, action: opts.action };
   const at = toasts.findIndex((t) => t.id === id);
   if (at >= 0) toasts = toasts.map((t, i) => (i === at ? next : t));
   else toasts = [...toasts, next].slice(-MAX);
@@ -77,17 +78,28 @@ export function Toaster() {
   return (
     <div className="fixed bottom-4 right-4 z-[70] flex flex-col items-end gap-1.5 pointer-events-none" role="status" aria-live="polite">
       {list.map((t) => (
-        <button
+        <div
           key={t.id}
-          onClick={() => dismissToast(t.id)}
-          title="dismiss"
-          className={`pointer-events-auto max-w-[360px] mono text-[11px] text-left rounded border bg-surface-2/95 backdrop-blur px-2.5 py-1.5 shadow-lg shadow-black/40 flex items-start gap-2 ${
+          className={`pointer-events-auto max-w-[380px] mono text-[11px] rounded border bg-surface-2/95 backdrop-blur px-2.5 py-1.5 shadow-lg shadow-black/40 flex items-start gap-2 ${
             t.kind === 'err' ? 'border-bad/50 text-ink' : 'border-edge text-ink'
           }`}
         >
-          <span className={`mt-[5px] w-1.5 h-1.5 rounded-full shrink-0 ${DOT[t.kind]}`} />
-          <span className="break-words min-w-0">{t.text}</span>
-        </button>
+          <button onClick={() => dismissToast(t.id)} title="dismiss" className="flex items-start gap-2 text-left min-w-0">
+            <span className={`mt-[5px] w-1.5 h-1.5 rounded-full shrink-0 ${DOT[t.kind]}`} />
+            <span className="break-words min-w-0">{t.text}</span>
+          </button>
+          {t.action && (
+            <button
+              onClick={() => {
+                t.action!.run();
+                dismissToast(t.id);
+              }}
+              className="shrink-0 text-accent hover:underline"
+            >
+              {t.action.label}
+            </button>
+          )}
+        </div>
       ))}
     </div>
   );

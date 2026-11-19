@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useTasks, type Chat } from '../api';
+import { useHiddenRepoNames, useTasks, type Chat } from '../api';
 import { AgentIcon } from '../components/AgentIcon';
 import { useChatShell, useOpenChat } from './openChat';
 import { PALETTE_KEY_LABEL, WORKING_WITHIN_S, isPaletteShortcut } from './shortcuts';
@@ -107,6 +107,7 @@ function PaletteDialog({ onClose }: { onClose: () => void }) {
   const active = useQuery(chatsQuery('active'));
   const archived = useQuery(chatsQuery('archived'));
   const { data: tasks } = useTasks();
+  const hiddenRepos = useHiddenRepoNames();
   const { data: terms } = useQuery({
     queryKey: ['terminals'],
     queryFn: () =>
@@ -121,8 +122,8 @@ function PaletteDialog({ onClose }: { onClose: () => void }) {
   const all = useMemo(() => {
     const worktrees = new Set((tasks ?? []).map((t) => t.worktree_path));
     const mine = (c: Chat) => c.task != null || (!!c.cwd && worktrees.has(c.cwd));
-    return [...(active.data ?? []), ...(archived.data ?? [])].filter(mine);
-  }, [active.data, archived.data, tasks]);
+    return [...(active.data ?? []), ...(archived.data ?? [])].filter((c) => mine(c) && !(c.repo && hiddenRepos.has(c.repo)));
+  }, [active.data, archived.data, tasks, hiddenRepos]);
   const multiRepo = useMemo(() => new Set(all.map((c) => c.repo)).size > 1, [all]);
 
   const words = useMemo(() => q.toLowerCase().split(/\s+/).filter(Boolean), [q]);

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useDoctor, useRepos, useTasks, useTaskActions, type Repo } from './api';
+import { useDoctor, useHiddenRepos, useRepos, useTasks, useTaskActions, type Repo } from './api';
 import { ChatProvider } from './chat/ChatContext';
 import { useChatShell } from './chat/openChat';
 import { ChatSidebar } from './chat/ChatSidebar';
@@ -187,6 +187,7 @@ function RepoPicker({ value, onChange }: { value: string; onChange: (v: string) 
  *  not a browsable page. */
 function EmptyState() {
   const { data: repos } = useRepos();
+  const { data: hidden } = useHiddenRepos();
   const noRepos = !repos || repos.length === 0;
   return (
     <div className="flex-1 min-w-0 flex flex-col items-center justify-center gap-6 p-10 text-center">
@@ -199,7 +200,11 @@ function EmptyState() {
       </div>
       {noRepos && (
         <div className="flex flex-col items-center gap-1.5">
-          <div className="text-xs text-muted">Add a project (any git repo) to get started:</div>
+          <div className="text-xs text-muted">
+            {hidden?.length
+              ? `${hidden.length} hidden project${hidden.length > 1 ? 's' : ''} — show one from the project menu (top left), or add another:`
+              : 'Add a project (any git repo) to get started:'}
+          </div>
           <RepoPicker value="" onChange={() => {}} />
         </div>
       )}

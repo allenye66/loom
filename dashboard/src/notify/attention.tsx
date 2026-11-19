@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import type { Chat } from '../api';
+import { useHiddenRepoNames, type Chat } from '../api';
 import { useChatShell, useOpenChat } from '../chat/openChat';
 import { WORKING_WITHIN_S } from '../chat/shortcuts';
 import { BellIcon, BellOffIcon } from '../ui/icons';
@@ -82,6 +82,7 @@ export function AttentionNotifier() {
   const openChat = useOpenChat();
   const [enabled] = useNotifyEnabled();
   const { data: chats } = useQuery({ queryKey: chatsKey, queryFn: fetchChats, refetchInterval: 8000 });
+  const hiddenRepos = useHiddenRepoNames(); // a hidden project is out of sight — and quiet
   const { data: terms } = useQuery({
     queryKey: ['terminals'],
     queryFn: () =>
@@ -92,8 +93,8 @@ export function AttentionNotifier() {
   });
 
   // keep the latest values readable from the long-lived event handler
-  const live = useRef({ chats: [] as Chat[], activeSid: undefined as string | undefined, enabled: false, openChat });
-  live.current = { chats: chats ?? [], activeSid: active?.resume, enabled, openChat };
+  const live = useRef({ chats: [] as Chat[], activeSid: undefined as string | undefined, enabled: false, openChat, hiddenRepos: new Set<string>() });
+  live.current = { chats: chats ?? [], activeSid: active?.resume, enabled, openChat, hiddenRepos };
 
   // --- tab title badge ---
   useEffect(() => {
@@ -101,11 +102,11 @@ export function AttentionNotifier() {
     let n = 0;
     for (const t of terms ?? []) {
       const c = byId.get(t.chat_id);
-      if (!c || c.archived || c.muted || t.chat_id === active?.resume) continue;
+      if (!c || c.archived || c.muted || (c.repo && hiddenRepos.has(c.repo)) || t.chat_id === active?.resume) continue;
       if (t.needs && t.idle_sec >= WORKING_WITHIN_S) n++;
     }
     document.title = n ? `(${n}) loom` : 'loom';
-  }, [chats, terms, active?.resume]);
+  }, [chats, terms, active?.resume, hiddenRepos]);
 
   // --- desktop notifications from the live event stream ---
   useEffect(() => {
@@ -143,7 +144,7 @@ export function AttentionNotifier() {
       for (const e of evs) {
         if (e.event !== 'Stop' && e.event !== 'Notification' && e.event !== 'StopFailure') continue;
         const c = l.chats.find((x) => x.id === e.chat_id);
-        if (!c || c.archived || c.muted) continue;
+        if (!c || c.archived || c.muted || (c.repo && l.hiddenRepos.has(c.repo))) continue;
         pending.set(c.id, { name: c.name || c.display_title || c.id.slice(0, 8), waitingOn: e.event === 'Notification' });
       }
       if (pending.size && timer === undefined) timer = window.setTimeout(fire, 2500); // coalesce a burst

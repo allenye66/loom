@@ -21,6 +21,8 @@ import {
   useChatActions,
   useDoctor,
   useRepos,
+  useHiddenRepos,
+  useHiddenRepoNames,
   useTasks,
   useTaskActions,
   type AgentId,
@@ -30,7 +32,8 @@ import {
 } from '../api';
 import { AgentIcon } from '../components/AgentIcon';
 import { Spinner } from '../components/Spinner';
-import { toastAction } from '../ui/toast';
+import { toast, toastAction } from '../ui/toast';
+import { EyeIcon, EyeOffIcon } from '../ui/icons';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
 // opening a chat triggers (otherwise clicking a chat would snap the tab back to 'active').
@@ -287,7 +290,9 @@ function ProjectMenu({
   counts: Map<string, number>;
   onPick: (name: string) => void;
 }) {
-  const { addRepo } = useTaskActions();
+  const { addRepo, setRepoHidden } = useTaskActions();
+  const { data: hidden } = useHiddenRepos();
+  const [showHidden, setShowHidden] = useState(false);
   const [open, setOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [path, setPath] = useState('');
@@ -296,8 +301,23 @@ function ProjectMenu({
   const close = () => {
     setOpen(false);
     setAdding(false);
+    setShowHidden(false);
     setPath('');
     setErr(null);
+  };
+  // Hide is reversible and deletes/stops nothing, so it's instant with an undo — no confirm dialog.
+  const hide = (r: Repo) => {
+    setRepoHidden.mutate({ name: r.name, hidden: true });
+    toast(`hid ${r.name} — its chats keep running, nothing is deleted`, {
+      id: `repo:${r.name}`,
+      kind: 'ok',
+      ttl: 9000,
+      action: { label: 'undo', run: () => setRepoHidden.mutate({ name: r.name, hidden: false }) },
+    });
+  };
+  const show = (r: Repo) => {
+    setRepoHidden.mutate({ name: r.name, hidden: false });
+    toast(`showing ${r.name} again`, { id: `repo:${r.name}`, kind: 'ok' });
   };
   useEffect(() => {
     if (!open) return;
@@ -334,22 +354,54 @@ function ProjectMenu({
       {open && (
         <div className="absolute left-0 top-full mt-1 z-30 w-48 rounded-md border border-edge bg-surface shadow-xl overflow-hidden">
           {repos.map((r) => (
-            <button
-              key={r.name}
-              onClick={() => {
-                onPick(r.name);
-                close();
-              }}
-              className="w-full text-left px-3 py-2 hover:bg-surface-2 border-b border-edge flex flex-col gap-0.5"
-            >
-              <span className="text-[11px] mono text-ink flex items-center gap-1.5">
-                <span className="truncate">{r.name}</span>
-                {r.name === active?.name && <span className="text-accent shrink-0">✓</span>}
-                <span className="ml-auto text-[10px] text-muted shrink-0">{counts.get(r.name) ?? 0}</span>
-              </span>
-              <span className="text-[10px] text-muted truncate">{r.root}</span>
-            </button>
+            <div key={r.name} className="group relative border-b border-edge hover:bg-surface-2">
+              <button
+                onClick={() => {
+                  onPick(r.name);
+                  close();
+                }}
+                className="w-full text-left pl-3 pr-8 py-2 flex flex-col gap-0.5"
+              >
+                <span className="text-[11px] mono text-ink flex items-center gap-1.5">
+                  <span className="truncate">{r.name}</span>
+                  {r.name === active?.name && <span className="text-accent shrink-0">✓</span>}
+                  <span className="ml-auto text-[10px] text-muted shrink-0">{counts.get(r.name) ?? 0}</span>
+                </span>
+                <span className="text-[10px] text-muted truncate">{r.root}</span>
+              </button>
+              <button
+                onClick={() => hide(r)}
+                title={`hide ${r.name} from loom — chats keep running, nothing is deleted (undo / restore from "hidden" below)`}
+                aria-label={`hide ${r.name}`}
+                className="absolute right-2 top-2 text-muted hover:text-ink opacity-0 group-hover:opacity-100 focus:opacity-100"
+              >
+                <EyeOffIcon size={12} />
+              </button>
+            </div>
           ))}
+          {!!hidden?.length && (
+            <div className="border-b border-edge">
+              <button
+                onClick={() => setShowHidden((v) => !v)}
+                className="w-full text-left px-3 py-1.5 text-[10px] mono text-muted hover:text-ink flex items-center gap-1.5"
+              >
+                <span className="text-[9px]">{showHidden ? '▾' : '▸'}</span>
+                hidden ({hidden.length})
+              </button>
+              {showHidden &&
+                hidden.map((r) => (
+                  <div key={r.name} className="flex items-center gap-2 pl-5 pr-2 py-1 hover:bg-surface-2" title={r.root}>
+                    <span className="text-[11px] mono text-muted truncate flex-1">{r.name}</span>
+                    <button
+                      onClick={() => show(r)}
+                      className="shrink-0 text-[10px] mono text-muted hover:text-accent inline-flex items-center gap-1"
+                    >
+                      <EyeIcon size={11} /> show
+                    </button>
+                  </div>
+                ))}
+            </div>
+          )}
           {adding ? (
             <div className="p-2 flex flex-col gap-1.5">
               <div className="flex gap-1">
@@ -462,7 +514,10 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     refetchInterval: 2000,
   });
   const termById = new Map((termData ?? []).map((t) => [t.chat_id, t]));
-  const allTaskChats = (chatList ?? []).filter((c) => c.task != null || (c.cwd && worktreeSet.has(c.cwd)));
+  const hiddenRepoNames = useHiddenRepoNames();
+  const allTaskChats = (chatList ?? []).filter(
+    (c) => (c.task != null || (c.cwd && worktreeSet.has(c.cwd))) && !(c.repo && hiddenRepoNames.has(c.repo)),
+  );
   const countByRepo = new Map<string, number>();
   for (const c of allTaskChats) if (c.repo) countByRepo.set(c.repo, (countByRepo.get(c.repo) ?? 0) + 1);
   // Only the active project's chats (each row carries its repo, resolved server-side).
@@ -550,7 +605,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const { categories: allCategories, assign } = useCategories();
   // Each project has its own categories. Ones made before projects existed have none yet:
   // file each under the project most of its chats are in (else the first project).
-  const categories = project ? allCategories.filter((c) => !c.repo || c.repo === project.name) : allCategories;
+  const categories = project ? allCategories.filter((c) => !c.repo || c.repo === project.name) : []; // no project (e.g. all hidden) → no groups
   useEffect(() => {
     if (!repos?.length || !chatList) return;
     const repoOf = new Map(chatList.map((c) => [c.id, c.repo]));
