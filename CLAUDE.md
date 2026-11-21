@@ -115,10 +115,16 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   the context that matters via a `UserPromptSubmit` hook (roster, unread posts, resolved `@chat`
   mentions — nothing when there's nothing new); `@@` in the terminal opens a chat picker. Boards are
   **off until the user enables one per category** (the ▤ on the category header); chats are told.
-- **Attention layer** (D24) — desktop notifications when a chat needs you (opt-in bell; per-chat bell mute;
-  driven by the agents' own lifecycle hooks over a live stream), a `(N) loom` tab badge, a per-category
-  **conflict radar** (⚠ on the category: chats changing the same files, and whether they'd conflict), `⌘Z`
-  undo in the input box, and `#` as the chat-mention trigger (`@@` still works).
+- **Attention layer** (D24 → D28) — **agent-pushed** notifications: an agent that needs the user's decision runs
+  `loom notify "<question>"` → desktop notification (opt-in, per-chat mute) + the bell's **notification panel**
+  (reply inline or jump to the chat; the agent is told which question the reply answers) + `(N) loom` tab badge.
+  **PR-conflict awareness** is for agents only (no UI): open PRs by chats in a category are tested pairwise and each
+  agent is told through its per-message context. `⌘Z` undo in the input box; `#` as the chat-mention trigger.
+- **PR scout** (D29) — while you're on a chat, a per-minute scan links PRs the transcript scraper missed (branch→PR
+  via `gh`, plus a gated Haiku read of the conversation).
+- **PR → author agent** (D27) — `loom chats pr <url|#N>` finds the loom chat that wrote a PR (created / pinned /
+  head-branch evidence); `loom chats ask <id> "…"` asks it and prints the reply (read its `brief`/`show` first —
+  asking interrupts it); messages an agent sends another chat are tagged as from an agent, not the user.
 - **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
   categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
   working on a handoff prompt).

@@ -1,7 +1,9 @@
 """loom's SQLite database (`~/.loom/loom.db`) — shared state that needs real transactions.
 
 Today: the per-category message boards (core/board.py), the per-chat "what have I already told
-this agent" markers (core/workspace.py), and the agent lifecycle event ledger (core/events.py). loom's older state (chat overlay, categories,
+this agent" markers (core/workspace.py), the agent lifecycle event ledger (core/events.py), the user's
+inbox of agent-pushed notifications (core/inbox.py), and the PR scout's per-chat bookkeeping
+(core/prscout.py). loom's older state (chat overlay, categories,
 registry) stays in JSON files; they have a single writer (the server) and work fine, and moving
 them is a separate, riskier job than adding a new feature on a solid base.
 
@@ -52,6 +54,25 @@ CREATE TABLE IF NOT EXISTS chat_events (
     session_id TEXT
 );
 CREATE INDEX IF NOT EXISTS chat_events_chat ON chat_events (chat_id, id);
+CREATE TABLE IF NOT EXISTS inbox (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id      TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    created      REAL NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'open',   -- open | answered | dismissed
+    resolved     REAL,
+    resolved_via TEXT,                           -- panel | chat | dismiss
+    reply        TEXT
+);
+CREATE INDEX IF NOT EXISTS inbox_status ON inbox (status, chat_id);
+CREATE TABLE IF NOT EXISTS pr_scout (
+    chat_id    TEXT PRIMARY KEY,
+    scanned    REAL NOT NULL DEFAULT 0,          -- last scan (throttle)
+    haiku_at   REAL NOT NULL DEFAULT 0,          -- last Haiku read (cost gate)
+    haiku_day  TEXT NOT NULL DEFAULT '',         -- YYYY-MM-DD of the daily counter below
+    haiku_n    INTEGER NOT NULL DEFAULT 0,       -- Haiku reads today
+    judged     TEXT NOT NULL DEFAULT '{}'        -- {"owner/repo#n": verdict} — candidates already judged
+);
 CREATE TABLE IF NOT EXISTS ctx_state (
     key     TEXT PRIMARY KEY,
     ws_hash TEXT NOT NULL,

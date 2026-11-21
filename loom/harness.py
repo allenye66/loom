@@ -3,7 +3,8 @@
 An agent running inside a loom chat (or you, in any shell) can see and drive loom's chats:
 list them with their category and live status, read one, get its status brief, archive /
 close / rename / categorize, spawn a new chat in a fresh worktree with a handoff prompt, and
-type a message into another chat. Every loom chat is told about this in its system prompt
+type a message into another chat — or find the chat that wrote a PR and ask it a question
+(`chats pr`, `chats ask`; D27). Every loom chat is told about this in its system prompt
 (core/runtime.py HARNESS_NOTE) and carries `LOOM_CHAT_ID` (who "self" is) + `LOOM_API_URL`.
 
 A thin HTTP client over the RUNNING loom server — never the JSON state files directly: the
@@ -18,6 +19,7 @@ import json
 import os
 import sys
 import time
+import uuid
 import webbrowser
 
 import httpx
@@ -657,6 +659,134 @@ def chats_send(
     print(f"{how if not no_submit else 'typed (not submitted)'} → {c['id'][:8]}  {_title(c)}")
 
 
+@chats_app.command("scan-prs")
+def chats_scan_prs(
+    ref: str = typer.Argument("self", help="chat id / prefix / name / branch (default: this chat)"),
+    force: bool = typer.Option(False, "--force", help="ignore the 45 s throttle"),
+) -> None:
+    """Run the PR scout on a chat now: find PRs it opened that the transcript scraper missed, and link them.
+
+    (The dashboard does this every minute while you have the chat open.) Tier 1 asks GitHub which PRs have
+    the chat's branch as their head; tier 2 has Haiku read the recent conversation for PRs it mentions —
+    only when there's something new to judge. Found PRs show as PR chips on the chat."""
+    c = _World().resolve(ref)
+    r = _api("POST", f"/chats/{c['id']}/pr-scout", params={"force": "true" if force else "false"}, timeout=180)
+    if r.get("skipped"):
+        print(f"{c['id'][:8]}  skipped — {r['skipped']}")
+        return
+    for f in r["found"]:
+        print(f"{c['id'][:8]}  linked PR #{f['number']} ({f['key']}) — {f['title'] or ''}  [found by {'branch match' if f['source'] == 'branch' else 'reading the conversation'}]")
+    if not r["found"]:
+        print(f"{c['id'][:8]}  nothing new" + (" (Haiku read the conversation)" if r.get("haiku") else ""))
+
+
+@chats_app.command("pr")
+def chats_pr(
+    ref: str = typer.Argument(..., help="a PR URL, owner/repo#N, or a number (in this chat's repo)"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Which loom chat wrote this PR? Finds the agent behind a PR you need to understand.
+
+    A chat is tied to a PR when its transcript shows it opening it (`created`), the user attached the
+    PR to it (`pinned`), or the PR's head branch is its task branch (`branch`). Read what it knows
+    first — `loom chats brief <id>` / `loom chats show <id> --tail 30` cost the other agent nothing —
+    and use `loom chats ask` only for what the code, the PR and that transcript don't answer."""
+    w = _World()
+    data = _api("GET", "/prs/chats", params={"ref": ref, "cwd": os.getcwd()}, timeout=90)
+    pr, found = data["pr"], data["chats"]
+    if as_json:
+        _out_json({"pr": pr, "chats": [{**c, "status": "archived" if c["archived"] else w.status(c["id"])} for c in found]})
+        return
+    state = pr.get("state", "unknown") + (f" · checks {pr['checks']}" if pr.get("checks") not in (None, "unknown", "none") else "")
+    print(f"PR {pr['repo']}#{pr['number']}  {pr.get('title') or '(title unavailable — is `gh` signed in?)'}")
+    print(f"   {state}" + (f" · branch {pr['branch']}" if pr.get("branch") else "") + (f" · {pr['url']}" if pr.get("url") else ""))
+    if not found:
+        print("\nno loom chat is tied to this PR — it may come from outside loom (or from a chat since deleted); "
+              "the PR's commits and description are what's left.")
+        return
+    print()
+    _table(
+        ["ID", "EVIDENCE", "STATUS", "CHAT", "PROJECT", "BRANCH"],
+        [[c["id"][:8], c["evidence"], "archived" if c["archived"] else w.status(c["id"]), _clip(c["name"], 40), c.get("project") or "-", c.get("branch") or "-"]
+         for c in found],
+    )
+    top = found[0]["id"][:8]
+    print(f"\nread first (free):   loom chats brief {top}   ·   loom chats show {top} --tail 30")
+    print(f'only if still needed: loom chats ask {top} "<one self-contained question>"   (interrupts that agent)')
+
+
+@chats_app.command("ask")
+def chats_ask(
+    ref: str = typer.Argument(..., help="chat id / prefix / name / branch (e.g. from `loom chats pr`)"),
+    question: str = typer.Argument(None, help="the question (`-` = stdin)"),
+    file: str = typer.Option(None, "--file", "-f", help="read the question from a file"),
+    wait: int = typer.Option(90, "--wait", "-w", help="seconds to wait for the answer (max 100 per call)"),
+    wake: bool = typer.Option(False, "--wake", help="allow restarting the agent of an ARCHIVED chat"),
+) -> None:
+    """Ask another chat's agent a question and print its reply.
+
+    For when you need context only that agent has (typically the one that wrote a PR you must build on)
+    and neither the code, the PR, nor `loom chats brief|show <id>` answers it. It interrupts that agent
+    (mid-turn it queues the question) and may restart a stopped one — so ask sparingly, and make the
+    question self-contained: that agent knows nothing of your task. The message reaches it tagged as
+    coming from another agent, not the user. Blocks until the reply lands (or --wait runs out; read
+    it later with `loom chats show <id> --tail 5`)."""
+    msg = _read_text(question, file, "question")
+    if not msg or not msg.strip():
+        _die("nothing to ask (pass the question, `-` for stdin, or --file)")
+    w = _World()
+    c = w.resolve(ref)
+    sid = c["id"]
+    if sid == _self_id():
+        _die("that's this chat — you can't ask yourself")
+    if c.get("archived") and not wake:
+        _die(f"{sid[:8]} ({_title(c)}) is archived — the user shelved it, and asking would restart its agent. "
+             "Prefer `loom chats brief|show`; pass --wake only if you really need its answer.")
+    nonce = uuid.uuid4().hex[:6]
+    framed = (f"[ask {nonce}] {msg.strip()}\n\nAnswer concisely in your reply — the asking agent reads it directly. "
+              "Don't change files or run anything unless the question requires it.")
+    base = _api("GET", "/events")["latest"]
+    r = _api("POST", f"/chats/{sid}/send", body={"text": framed, "submit": True, "force": False}, timeout=90)
+    print(f"asked {sid[:8]}  {_title(c)}" + ("  (started its agent first)" if r.get("launched") else ""), flush=True)
+    live_events = (c.get("agent") or "claude") == "claude"  # only claude's hooks feed the event ledger
+
+    def answer() -> str | None:
+        items = _api("GET", f"/chats/{sid}/transcript", timeout=60)["items"]
+        at = max((i for i, it in enumerate(items) if it.get("kind") == "user" and nonce in (it.get("text") or "")), default=None)
+        if at is None:
+            return None  # our question hasn't been submitted yet (it's queued behind a running turn)
+        texts = [(it.get("text") or "").strip() for it in items[at + 1:] if it.get("kind") not in ("user", "error")]
+        texts = [t for t in texts if t]
+        return "\n\n".join(texts) if texts else None
+
+    deadline = time.time() + max(5, min(wait, 100))
+    cursor, quiet_since = base, None
+    while time.time() < deadline:
+        finished = False
+        if live_events:
+            for e in _api("GET", "/events", params={"since": cursor})["events"]:
+                cursor = e["id"]
+                finished = finished or (e["chat_id"] == sid and e["event"] in ("Stop", "StopFailure", "SessionEnd"))
+        else:  # no lifecycle events from grok/codex: "finished" = quiet for a few seconds
+            t = next((x for x in _api("GET", "/terminals", params={"detached": "true"})["terminals"] if x["chat_id"] == sid), {})
+            quiet_since = quiet_since or time.time() if (t.get("idle_sec") or 0) >= 8 else None
+            finished = quiet_since is not None
+        if finished:
+            for _ in range(3):  # the transcript can trail the Stop by a moment
+                ans = answer()
+                if ans:
+                    print(f"\n--- reply from {sid[:8]} ({_title(c)}) ---\n{_clip(ans, 6000)}")
+                    return
+                time.sleep(1.5)
+        time.sleep(1.5)
+    part = answer()
+    print(f"\nno complete answer within {wait}s — {sid[:8]} is still working or hasn't reached the question. "
+          f"Read it later: loom chats show {sid[:8]} --tail 5", file=sys.stderr)
+    if part:
+        print(f"(partial so far)\n{_clip(part, 2000)}")
+    raise typer.Exit(3)
+
+
 @chats_app.command("open")
 def chats_open(ref: str = typer.Argument(...)) -> None:
     """Open a chat in loom's browser UI."""
@@ -664,6 +794,28 @@ def chats_open(ref: str = typer.Argument(...)) -> None:
     url = f"{_base()}/?chat={c['id']}"
     webbrowser.open(url)
     print(url)
+
+
+def notify(
+    text: str = typer.Argument(None, help="what you need from the user (`-` = stdin)"),
+    file: str = typer.Option(None, "--file", "-f", help="read it from a file"),
+) -> None:
+    """Push a notification to the USER: you need their decision, approval or information to proceed.
+
+    It pops a desktop notification (if they enabled them) and sits in the dashboard's notification panel
+    until they answer — inline, or by opening this chat. Then END YOUR TURN with the question: their reply
+    arrives as your next message, marked as the answer to this. Write it self-contained (they may have
+    forgotten this chat's context): the decision needed, the options, and your recommendation.
+
+    Use it only when you truly can't proceed without them. Not for progress, "done", or anything you can
+    decide yourself; identical open notifications are merged and a chat may have at most 5 open."""
+    msg = _read_text(text, file, "notification")
+    if not msg or not msg.strip():
+        _die("nothing to send (pass the text, `-` for stdin, or --file)")
+    sid = _self_id() or _die("`loom notify` only works inside a loom chat (LOOM_CHAT_ID is unset) — it needs to know which chat is asking")
+    r = _api("POST", f"/chats/{sid}/notify", body={"text": msg})
+    print(("pushed to the user's inbox" if r.get("created") else "already pending in the user's inbox (same text)") + f" (#{r['id']}). "
+          "Now end your turn with the question — their reply arrives as your next message.")
 
 
 def whoami(as_json: bool = typer.Option(False, "--json")) -> None:

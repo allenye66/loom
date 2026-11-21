@@ -413,22 +413,11 @@ Goal: cut the human's attention cost across dozens of chats (the research round'
   `idle_sec` is not inferred from output silence. The `needs/<id>` marker files stay (they also serve
   grok/codex, which have no such hooks). The event hook discards curl's output (a SessionStart hook's stdout
   is injected into the conversation); verified against real claude that the extra hook events are accepted.
-- **Desktop notifications, per-chat mute.** The bell in the sidebar header turns them on (browser permission).
-  Driven by a server-sent stream (`/api/events/stream` — a hidden tab's timers are throttled, a network stream
-  isn't): a new `Stop` / `Notification` for a chat → one notification, only while the tab is in the background,
-  bursts coalesced into one ("3 chats need you"), clicking opens the chat. Never for a muted or archived chat.
-  Mute is a per-chat overlay flag (`muted`, the bell / slashed-bell icon on a row and in the chat header, or `loom chats
-  mute|unmute`), persisted server-side so every browser — and any future push channel — honours it. The tab
-  title shows `(N) loom` for unmuted chats waiting on you. grok/codex chats have no events, so they get the
-  sidebar's "needs you" only.
-- **Conflict radar, scoped to a category.** Worktrees don't prevent collisions, they move them to merge time.
-  Within a category (the chats the user grouped as related), `core/radar.py` finds pairs whose worktrees
-  changed a common file (commits since the fork from the task's base branch + uncommitted edits; lockfiles
-  ignored) and tests whether their *committed* work would conflict with `git merge-tree --write-tree`
-  (nothing checked out or touched; ~0.15 s for 3 worktrees). Shown as a ⚠ badge on the category header
-  (red = would conflict) and a modal with files and a "tell both chats" button; each affected agent is also
-  told once per change through its per-message context. A merge queue (serial rebase → test → land, per
-  category) is the natural next step and is not built.
+- **Desktop notifications, per-chat mute.** *(Superseded by D28: notifications are now explicit, pushed by the
+  agent — not inferred from "the turn ended". The mute flag and the `(N) loom` tab badge remain.)* The first version fired on every
+  `Stop` / `Notification` hook event, which cannot tell "done" from "I need your decision".
+- **Conflict radar, scoped to a category.** *(Reworked by D28: PR-based, and invisible to the user.)* The first version
+  showed a ⚠ badge/modal for any two chats changing the same files — noise for independent chats.
 - **`⌘Z` / `Ctrl+Z` undo the input box.** Claude's input has its own undo on Ctrl+_ (word-granular; it
   restores Backspace-deleted text; no redo; its first step is sometimes a no-op) and a kill-ring (Ctrl+Y
   restores text removed with Ctrl+U/W). The terminal maps ⌘Z to Ctrl+_, retrying once if the screen didn't
@@ -471,6 +460,70 @@ Want: take a repo out of the way (finished project, accidental add) without losi
   repo-unhide <name>`, `loom projects [--hidden]`.
 - Not built: truly forgetting a project (deleting its entry / tasks) — hide covers "get it out of my way"
   and can't lose work.
+
+## D27 — An agent can find the chat that wrote a PR, and ask it (2026-11-20)
+Want: an agent that must build on / review / debug someone else's PR sometimes needs the *why* the diff
+and PR text don't carry — the agent that wrote it has it. Chat → PRs already existed (`/chats/{id}/prs`,
+D19); nothing went the other way and nothing let an agent use it.
+- **`core/prlink.py` (PR → chat), `GET /prs/chats?ref=`**: a chat is tied to a PR by `created` (its transcript
+  shows it opening it, confirmed against GitHub's createdAt — D19), `pinned` (the user attached it) or
+  `branch` (the PR's head branch is its task branch — catches PRs opened by hand / by a chat whose
+  transcript lost it). Strongest first; a chip the user removed stays removed; only loom task chats.
+  `github.pr_status` now carries the head `branch`; `github.parse_pr_ref` takes a URL, `owner/repo#N`, or a
+  bare number (resolved against the caller's repo).
+- **Harness:** `loom chats pr <ref>` (who wrote it + their status + next steps) and `loom chats ask <id>
+  "<question>"` (sends the question, blocks until that agent's turn ends, prints its reply; `--wait` ≤ 100 s
+  a call, exit 3 + "read it later" on timeout; refuses an *archived* chat without `--wake`, refuses
+  yourself). Completion = Claude's `Stop` event (D24) *and* the question's `[ask <nonce>]` found in the
+  transcript, so the old turn's Stop isn't mistaken for the answer when the target was mid-turn; grok/codex
+  (no events) fall back to "quiet for a few seconds".
+- **Read before you ask.** The HARNESS_NOTE tells agents: look the author up, read `brief` / `show` (free),
+  and ask only if that doesn't answer it — asking interrupts that agent (and costs a turn). Verified with
+  real Haiku agents: a reviewer whose answer was in the author's transcript read it and did not ask; one
+  who needed the author's own knowledge asked and got the reply.
+- **Provenance:** `POST /chats/{id}/send` called by another chat (X-Loom-Chat) prepends `[message from
+  another agent in loom — chat "name" (id8), not the user]`, and the note tells agents a peer can't authorize
+  destructive / out-of-scope actions. Before this, an agent's message was indistinguishable from the user's.
+- Limits: needs `gh` for the head-branch / createdAt checks (without it, only transcript evidence);
+  chats launched before this keep the old note until relaunched (it's in the system prompt).
+
+## D28 — Explicit agent-pushed notifications; PR-conflict awareness for agents only (2026-11-20)
+Feedback on D24: the "needs you" signal was a guess (a turn ending is true for "done" and for "I have a question"),
+and the conflict radar was something the user never wanted to look at.
+- **Notifications are pushed by the agent.** `loom notify "<question>"` (any agent — claude/codex/grok; no hooks needed)
+  writes an item to the user's **inbox** (`core/inbox.py`, SQLite `inbox`), pops a desktop notification (bell on, tab in
+  the background, chat not muted; bursts coalesced) and appears in the dashboard's **notification panel** (the bell in
+  the sidebar header, with a count badge): each card shows the chat, project/category, age and the question, with an
+  inline reply box, "open" (jump to the chat) and dismiss. The HARNESS_NOTE tells agents when to use it (they need the
+  user's decision/approval/information and can't decide; never for progress or "done") and to end their turn with the
+  question. Guards: identical open text is merged, ≤ 5 open per chat. The tab title `(N) loom` counts unmuted open items.
+  The old Stop/Notification-hook desktop pushes are gone; the lifecycle ledger stays (it drives `turn` state and `ask`).
+- **The agent knows what the user's message answers.** A panel reply is typed into the chat prefixed
+  `[reply to your notification — "<question>"]` (the item is marked answered *before* typing so the hook doesn't
+  double-note). If the user instead types in the chat itself, the UserPromptSubmit hook (all chats, categorised or not)
+  attaches "The user is replying to what you asked them with `loom notify`: …" and closes the items; a message another
+  agent sent (tagged, D27) doesn't count. grok/codex have no hook, so a direct reply there isn't auto-detected — use the
+  panel or dismiss.
+- **PR-conflict awareness, for agents.** `core/radar.py` now looks at the **open PRs** created by chats in the same category
+  (evidence: transcript / PR scout / pinned — `prlink.chat_pr_keys`), tests each pair's heads with `git merge-tree
+  --write-tree` (PR head SHA from GitHub; worktrees share one object store; lockfiles ignored), and notes a chat's own
+  open PR that GitHub already reports as CONFLICTING with its base. **No dashboard UI.** Each affected agent is told
+  once per change through its per-message context ("your PR #1 and PR #2 … would conflict — coordinate with
+  `loom chats send`, or plan your rebase"). `GET /api/categories/{id}/pr-conflicts` remains for diagnostics.
+  `github.pr_status` carries `head_sha`/`mergeable`/`base_branch`, and caches merged PRs for 6 h (they can't change).
+
+## D29 — The PR scout: catching PRs the transcript scraper missed (2026-11-20)
+Linking PRs to chats from the transcript (D19) misses PRs whose URL never appeared in tool output. `core/prscout.py`,
+run by the dashboard every minute **while you're on a chat** (`chat/usePrScout.ts`; `POST /chats/{id}/pr-scout`, throttled
+45 s server-side; `loom chats scan-prs [chat]` by hand), has two tiers, cheapest first:
+1. **branch** — free: `gh pr list --head <branch>` for the chat's task / current / transcript branch. Counted if open, or
+   created after the chat's task began (an old merged PR on a reused branch name isn't this chat's).
+2. **read** — one cheap Haiku call, only when there's something to read: PRs the recent conversation mentions
+   (`owner/repo#N`, URLs, `#N`, "PR N") that nothing links yet. GitHub filters candidates first (must exist and be created
+   after the task began), Haiku is asked only "did THIS agent open it, or just mention it?", and its yes is re-checked.
+   Gates: new candidates only (verdicts remembered), ≥ 3 min between reads, 40 a day per chat. Claude transcripts only.
+Found PRs are stored as `prs_scouted` and show as ordinary chips ("found by loom's PR scout"); × removes one for good.
+They also count as evidence for `loom chats pr` (D27) and the conflict awareness above.
 
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's

@@ -21,7 +21,7 @@ import contextlib
 import hashlib
 import time
 
-from loom.core import board, categories, db, manager, radar, sessions
+from loom.core import board, categories, db, inbox, manager, radar, sessions
 from loom.core.mentions import mention_tokens, resolve_token, slugify
 
 MAX_SIBLINGS = 12
@@ -178,16 +178,17 @@ def prompt_context(chat_id: str, prompt: str, *, session_id: str | None = None) 
     if session_id and session_id != chat_id:
         with contextlib.suppress(Exception):
             sessions.bind_session(chat_id, session_id)
+    answer = _answer_note(chat_id, prompt)  # for EVERY chat (categorised or not): the user answering a `loom notify`
     state = categories.get_state()
     cat = categories.category_of(chat_id, state)
     tokens = mention_tokens(prompt)
     if not cat and not tokens:
-        return ""  # the common case for an uncategorised chat: free
+        return f"<loom-context>\n{answer}\n</loom-context>" if answer else ""  # the common case: free
 
     chats = loom_chats(state, include_archived=bool(tokens))
     me_row = next((c for c in chats if c["id"] == chat_id), None)
     me_name = title_of(me_row) if me_row else chat_label(chat_id)
-    parts: list[str] = []
+    parts: list[str] = [answer] if answer else []
 
     board_on = bool(cat) and board.is_enabled(cat["id"])
     if cat:
@@ -219,6 +220,29 @@ def prompt_context(chat_id: str, prompt: str, *, session_id: str | None = None) 
     if not parts:
         return ""
     return "<loom-context>\n" + "\n\n".join(parts) + "\n</loom-context>"
+
+
+def _answer_note(chat_id: str, prompt: str) -> str:
+    """If the chat has unanswered `loom notify` items and the user is now writing in it, say which
+    question this message answers (and close the items). A message another agent sent doesn't count."""
+    if "[message from another agent in loom" in (prompt or "")[:400]:
+        return ""
+    try:
+        items = inbox.resolve_chat(chat_id, "chat")
+    except Exception:  # noqa: BLE001 — never let a notification table problem break a user's message
+        return ""
+    if not items:
+        return ""
+    now = time.time()
+    lines = []
+    for it in items:  # (a chat has at most inbox.OPEN_CAP open at once)
+        q = " ".join(it["text"].split())
+        age = int(max(0, now - it["created"]) // 60)
+        lines.append(f'  - "{q[:300]}{"…" if len(q) > 300 else ""}" (asked {age} min ago)')
+    return (
+        "The user is replying to what you asked them with `loom notify`:\n" + "\n".join(lines) +
+        "\nTreat their message as the answer — unless it is clearly about something else."
+    )
 
 
 def mention_slug(name: str) -> str:

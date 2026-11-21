@@ -19,6 +19,7 @@ from loom.core import manager, monitor, perf, radar, registry, sessions, termina
 from loom.server.api import router
 from loom.server.guard import CORS_ORIGIN_REGEX, LoopbackOnlyMiddleware
 from loom.server.board_api import router as board_router
+from loom.server.inbox_api import router as inbox_router
 
 DASHBOARD_DIST = Path(__file__).resolve().parents[2] / "dashboard" / "dist"
 
@@ -97,6 +98,7 @@ def create_app() -> FastAPI:
 
     app.include_router(router, prefix="/api")
     app.include_router(board_router, prefix="/api")
+    app.include_router(inbox_router, prefix="/api")
 
     if DASHBOARD_DIST.exists():
         app.mount("/", StaticFiles(directory=str(DASHBOARD_DIST), html=True), name="dashboard")

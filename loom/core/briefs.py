@@ -357,6 +357,13 @@ def _run(chat_id: str, path: Path) -> None:
 
 def _summarize(text: str) -> tuple[dict, dict]:
     """One headless Haiku call → (brief dict, {cost_usd, duration_ms, model})."""
+    return haiku_json(PROMPT, text, SCHEMA)
+
+
+def haiku_json(system: str, text: str, schema: dict, *, timeout: int = TIMEOUT_SEC) -> tuple[dict, dict]:
+    """One headless `claude -p --model haiku` call that must answer with JSON matching `schema`
+    → (answer, {cost_usd, duration_ms, model}). Runs through the user's own login, no tools, no hooks,
+    no session saved — so it leaves nothing for loom's chat index to adopt."""
     argv = [
         agents.binary("claude"), "-p",
         "--model", MODEL,
@@ -364,15 +371,15 @@ def _summarize(text: str) -> tuple[dict, dict]:
         "--tools", "",
         "--setting-sources", "",  # no user/project hooks, CLAUDE.md, plugins
         "--strict-mcp-config",
-        "--system-prompt", PROMPT,
-        "--json-schema", json.dumps(SCHEMA),
+        "--system-prompt", system,
+        "--json-schema", json.dumps(schema),
         "--output-format", "json",
     ]
     # Same scrub as terminal sessions: an inherited Claude Code context would leak in.
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")}
     BRIEFS_DIR.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
-        argv, input=text, capture_output=True, text=True, env=env, cwd=BRIEFS_DIR, timeout=TIMEOUT_SEC,
+        argv, input=text, capture_output=True, text=True, env=env, cwd=BRIEFS_DIR, timeout=timeout,
     )
     try:
         out = json.loads(proc.stdout)
@@ -384,6 +391,6 @@ def _summarize(text: str) -> tuple[dict, dict]:
     if not isinstance(brief, dict):
         brief = json.loads(out.get("result") or "null")
     if not isinstance(brief, dict):
-        raise RuntimeError("summarizer returned no brief")
+        raise RuntimeError("the Haiku call returned no structured answer")
     model = next(iter(out.get("modelUsage") or {}), None)
     return brief, {"cost_usd": out.get("total_cost_usd"), "duration_ms": out.get("duration_ms"), "model": model}

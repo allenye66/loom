@@ -4,7 +4,7 @@ import { useState } from 'react';
 type Pr = {
   number: number | string;
   repo?: string | null;
-  source?: 'created' | 'pinned';
+  source?: 'created' | 'scouted' | 'pinned';
   url?: string | null;
   state: string;
   title?: string | null;
@@ -82,7 +82,7 @@ export function PrBadges({ sid, prs, repo }: { sid?: string; prs: (number | stri
         const text = `PR #${n}${label}`;
         const title =
           (p.title ? `${meta.label || 'PR'} — ${p.title}` : `PR #${n}`) +
-          (p.source === 'pinned' ? ' (pinned)' : '');
+          (p.source === 'pinned' ? ' (pinned)' : p.source === 'scouted' ? " (found by loom's PR scout)" : '');
         const key = `${p.repo ?? ''}#${n}`;
         const chip = url ? (
           <a href={url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} title={title} className={cls}>

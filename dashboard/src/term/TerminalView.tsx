@@ -15,6 +15,7 @@ import { UsageChip } from '../usage/UsageChip';
 import { MentionPicker } from './MentionPicker';
 import { BoardChip } from '../board/BoardButtons';
 import { MuteButton, useChatMuted } from '../notify/mute';
+import { usePrScout } from '../chat/usePrScout';
 import { useBrief, type Task } from '../api';
 import { createMessageNav, type JumpResult } from './messageNav';
 import { captureReadingPosition, restoreReadingPosition } from './readingPosition';
@@ -403,6 +404,7 @@ export function TerminalView({
 }) {
   const holderRef = useRef<HTMLDivElement>(null);
   const chatMuted = useChatMuted(resume);
+  usePrScout(resume); // while you're on this chat: look for PRs the transcript scraper missed
   // `@@` chat-mention picker (MentionPicker): it sees every keystroke via mentionRef and types back via inputSendRef.
   const mentionRef = useRef<((d: string) => boolean) | null>(null);
   const inputSendRef = useRef<((data: string) => void) | null>(null);

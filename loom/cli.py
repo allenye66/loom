@@ -28,6 +28,7 @@ app.add_typer(harness.categories_app, name="categories")
 app.add_typer(harness.board_app, name="board")
 app.command("whoami")(harness.whoami)
 app.command("projects")(harness.projects)
+app.command("notify")(harness.notify)
 
 
 @app.command()

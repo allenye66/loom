@@ -5,8 +5,7 @@ import { InlineRename, useRenameChat } from './InlineRename';
 import { PALETTE_KEY_LABEL, WORKING_WITHIN_S } from './shortcuts';
 import { BoardButton } from '../board/BoardButtons';
 import { MuteButton } from '../notify/mute';
-import { NotifyBell } from '../notify/attention';
-import { RadarBadge } from '../radar/RadarBadge';
+import { NotifyBell } from '../notify/inbox';
 import { NotesButton } from '../notes/NotesButton';
 import {
   addCategory,
@@ -931,7 +930,6 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         )}
         {g.id !== null && (
           <>
-            <RadarBadge catId={g.id} name={g.name} />
             <BoardButton catId={g.id} name={g.name} />
             <button
               onClick={() => setRenamingCat(g.id)}

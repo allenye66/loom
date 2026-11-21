@@ -10,7 +10,7 @@
     POST /api/chats/{sid}/prompt-context   the UserPromptSubmit hook: text to attach to this message
     POST /api/chats/{sid}/event            the Stop / Notification / SessionStart / SessionEnd hooks (core/events.py)
     GET  /api/events?since=N · /api/events/stream   new lifecycle events (poll, or server-sent) — the notifier's feed
-    GET  /api/radar · /api/categories/{id}/radar   conflict radar: chats in a category changing the same files
+    GET  /api/categories/{id}/pr-conflicts   open-PR conflicts between a category's agents (diagnostics; agents are told via context)
 
 A board key is a category id. Chats outside any category have no board, and a category's board is
 off until the user enables it (post / wait answer 409 with what to do; reads show `enabled: false`).
@@ -30,7 +30,8 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
-from loom.core import board, categories, events, radar, terminals, workspace
+from loom.core import board, categories, events, inbox, radar, terminals, workspace
+from loom.server.inbox_api import _enrich
 from loom.server.api import _chat_cwd
 
 router = APIRouter()
@@ -256,14 +257,20 @@ async def events_stream(since: int | None = None):
     throttled; a network stream isn't). First message `hello` carries the newest id (the baseline)."""
     async def gen():
         last = since if since is not None else await run_in_threadpool(events.latest_id)
+        last_in = await run_in_threadpool(inbox.latest_id)
         yield f"event: hello\ndata: {json.dumps({'latest': last})}\n\n"
         quiet = 0
         while True:
             evs = await run_in_threadpool(events.since, last, 200)
+            new_in = await run_in_threadpool(inbox.since, last_in, 50)  # notifications agents just pushed
             if evs:
                 last = evs[-1]["id"]
-                quiet = 0
                 yield f"data: {json.dumps({'events': evs})}\n\n"
+            if new_in:
+                last_in = new_in[-1]["id"]
+                yield f"data: {json.dumps({'inbox': await run_in_threadpool(_enrich, new_in)})}\n\n"
+            if evs or new_in:
+                quiet = 0
             else:
                 quiet += 1
                 if quiet % 15 == 0:
@@ -273,14 +280,10 @@ async def events_stream(since: int | None = None):
     return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-@router.get("/radar")
-async def radar_overview() -> dict:
-    """Per category: how many chat pairs overlap / would conflict (cached; recomputed when stale)."""
-    return {"categories": await run_in_threadpool(radar.overview)}
-
-
-@router.get("/categories/{key}/radar")
-async def category_radar(key: str, refresh: bool = False) -> dict:
+@router.get("/categories/{key}/pr-conflicts")
+async def category_pr_conflicts(key: str, refresh: bool = False) -> dict:
+    """Diagnostics only (no dashboard UI — D24/D28): the open-PR conflicts agents in this category are told
+    about through their per-message context."""
     _category(key)
     r = await run_in_threadpool(lambda: radar.get(key, max_age=0 if refresh else radar.TTL_S))
-    return r or {"key": key, "category": _category(key)["name"], "members": [], "overlaps": [], "computed_at": None}
+    return r or {"key": key, "category": _category(key)["name"], "open_prs": [], "conflicts": [], "base_conflicts": [], "computed_at": None}

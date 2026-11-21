@@ -7,7 +7,7 @@ import { CommandPalette } from './chat/CommandPalette';
 import { CreatingPane } from './chat/CreatingPane';
 import { BoardModal } from './board/BoardModal';
 import { AttentionNotifier } from './notify/attention';
-import { RadarModal } from './radar/RadarModal';
+import { NotifyPanel } from './notify/inbox';
 import { Toaster } from './ui/toast';
 import { TerminalView } from './term/TerminalView';
 
@@ -224,8 +224,8 @@ function Shell() {
     <div className="flex h-screen min-h-0 bg-canvas">
       <CommandPalette />
       <BoardModal />
-      <RadarModal />
       <AttentionNotifier />
+      <NotifyPanel />
       <Toaster />
       <ChatSidebar activeSid={active?.resume} />
       {viewingPending ? (

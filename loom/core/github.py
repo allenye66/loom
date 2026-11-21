@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -19,7 +20,8 @@ from pathlib import Path
 from loom.core.config import LOOM_HOME
 
 _cache: dict[tuple[str, str], tuple[float, dict]] = {}
-_TTL = 60.0  # seconds
+_TTL = 60.0  # seconds (open PRs: checks and mergeability change)
+_TTL_BY_STATE = {"merged": 6 * 3600.0, "closed": 600.0}  # a merged PR never changes back
 
 
 def _gh_json(args: list[str]) -> dict | None:
@@ -33,6 +35,46 @@ def _gh_json(args: list[str]) -> dict | None:
         return json.loads(p.stdout or "null")
     except Exception:  # noqa: BLE001 — gh missing/timeout/bad json → no status
         return None
+
+
+_PR_URL = re.compile(r"github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)")
+_PR_SHORT = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
+
+
+def parse_pr_ref(ref: str, default_repo: str | None = None) -> tuple[str, int]:
+    """("owner/repo", number) from a PR URL, "owner/repo#123", or a bare "#123" / "123" (→ default_repo).
+    Raises ValueError with a message fit to show the user."""
+    ref = ref.strip()
+    for rx in (_PR_URL, _PR_SHORT):
+        m = rx.search(ref)
+        if m:
+            return m.group(1), int(m.group(2))
+    if re.fullmatch(r"#?\d+", ref):
+        if not default_repo:
+            raise ValueError("can't tell which repo that PR number is in — pass the full PR URL or owner/repo#N")
+        return default_repo, int(ref.lstrip("#"))
+    raise ValueError("expected a PR URL, owner/repo#N, or a PR number")
+
+
+_branch_cache: dict[tuple[str, str], tuple[float, list]] = {}
+
+
+def prs_for_branch(repo: str, branch: str, ttl: float = 45.0) -> list[dict]:
+    """PRs whose HEAD is `branch` in `repo`, any state: [{number, state, created_at, title, url}]. [] if gh
+    can't say. Cached briefly (the PR scout asks every minute for an open chat)."""
+    key = (repo, branch)
+    hit = _branch_cache.get(key)
+    if hit and time.monotonic() - hit[0] < ttl:
+        return hit[1]
+    data = _gh_json(["pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--limit", "20",
+                     "--json", "number,state,createdAt,headRefName,title,url"])
+    out = [
+        {"number": p["number"], "state": str(p.get("state") or "").lower(), "created_at": _iso(p.get("createdAt")),
+         "title": p.get("title"), "url": p.get("url")}
+        for p in (data if isinstance(data, list) else []) if isinstance(p, dict) and p.get("headRefName") == branch
+    ]
+    _branch_cache[key] = (time.monotonic(), out)
+    return out
 
 
 _FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
@@ -98,17 +140,18 @@ def pr_status(repo: str | None, number: str | int) -> dict:
     Cached for _TTL seconds per (repo, number).
     """
     url = f"https://github.com/{repo}/pull/{number}" if repo else None
-    base = {"number": number, "repo": repo, "url": url, "state": "unknown",
+    base = {"number": number, "repo": repo, "url": url, "state": "unknown", "branch": None,
+            "head_sha": None, "base_branch": None, "mergeable": None, "created_at": None,
             "title": None, "draft": False, "merged": False, "checks": "unknown", "status": "unknown"}
     if not repo:
         return base
     key = (repo, str(number))
     now = time.monotonic()
     hit = _cache.get(key)
-    if hit and now - hit[0] < _TTL:
+    if hit and now - hit[0] < _TTL_BY_STATE.get(hit[1].get("state"), _TTL):
         return hit[1]
     data = _gh_json(["pr", "view", str(number), "--repo", repo, "--json",
-                     "number,state,title,url,isDraft,mergedAt,mergeable,mergeStateStatus,statusCheckRollup"])
+                     "number,state,title,url,isDraft,mergedAt,mergeable,mergeStateStatus,statusCheckRollup,headRefName,headRefOid,baseRefName,createdAt"])
     if isinstance(data, dict):
         merged = bool(data.get("mergedAt"))
         st = (data.get("state") or "").lower()  # gh: OPEN | CLOSED | MERGED
@@ -120,6 +163,11 @@ def pr_status(repo: str | None, number: str | int) -> dict:
         base.update({
             "url": data.get("url") or base["url"],
             "title": data.get("title"),
+            "branch": data.get("headRefName"),
+            "head_sha": data.get("headRefOid"),
+            "base_branch": data.get("baseRefName"),
+            "mergeable": mergeable or None,  # MERGEABLE | CONFLICTING | UNKNOWN (GitHub computes it lazily)
+            "created_at": _iso(data.get("createdAt")),
             "draft": draft,
             "merged": merged,
             "state": state,

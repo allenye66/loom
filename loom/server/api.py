@@ -33,6 +33,8 @@ from loom.core import (
     manager,
     monitor,
     perf,
+    prlink,
+    prscout,
     registry,
     repos,
     sessions,
@@ -649,16 +651,37 @@ class ChatSendIn(BaseModel):
     force: bool = False  # type it even if the input box holds an unsent draft
 
 
+def _sender_tag(sender: str, target: str) -> str:
+    """One provenance line for a message another AGENT types into a chat (the call carries the caller's
+    chat id). Without it, an agent's message is indistinguishable from the user's own words — and the
+    receiving agent would treat a peer's request with the user's authority."""
+    sender = sessions.canonical_id(sender)
+    if not sender or sender == target:
+        return ""
+    name = ""
+    with contextlib.suppress(Exception):
+        c = next((c for c in sessions.list_chats(scope="all", tab="all") if c["id"] == sender), None)
+        name = (c or {}).get("name") or (c or {}).get("display_title") or ""
+    label = f'chat "{name}" ({sender[:8]})' if name else f"chat {sender[:8]}"
+    return f"[message from another agent in loom — {label}, not the user]"
+
+
 @router.post("/chats/{sid}/send")
-async def send_to_chat(sid: str, body: ChatSendIn) -> dict:
-    """Type a message into a chat's agent (resuming it first if it isn't running)."""
+async def send_to_chat(sid: str, body: ChatSendIn, x_loom_chat: str | None = Header(None)) -> dict:
+    """Type a message into a chat's agent (resuming it first if it isn't running). When the caller is
+    another loom chat (its id in X-Loom-Chat), the message is tagged as coming from that agent."""
     if not body.text.strip():
         raise HTTPException(400, "empty message")
     sid = sessions.canonical_id(sid)
     await run_in_threadpool(_known_chat, sid)
     cwd = await run_in_threadpool(_chat_cwd, sid)
+    text = body.text
+    if x_loom_chat:
+        tag = await run_in_threadpool(_sender_tag, x_loom_chat, sid)
+        if tag:
+            text = f"{tag}\n{text}"
     try:
-        out = await terminals.send_text(sid, cwd, body.text, submit=body.submit, force=body.force)
+        out = await terminals.send_text(sid, cwd, text, submit=body.submit, force=body.force)
     except terminals.ComposerBusy as e:
         raise HTTPException(409, str(e)) from e
     return {"chat_id": sid, **out}
@@ -901,11 +924,12 @@ def chat_prs(sid: str) -> dict:
 
     PRs = the ones this chat CREATED (github.created_prs over the transcript evidence; a
     pasted/looked-up old PR never qualifies) + any the user pinned, minus any they removed.
-    `source` on each is "created" | "pinned"."""
+    `source` on each is "created" | "scouted" (found by the PR scout, D29) | "pinned"."""
     chat = sessions.get_chat(sid) or {}
     ov = sessions.get_overlay(sid)
     hidden = set(ov.get("prs_hidden") or [])
     keys = [(k, "created") for k in github.created_prs(chat.get("pr_seen") or {}, chat.get("tool_windows") or [])]
+    keys += [(k, "scouted") for k in ov.get("prs_scouted") or []]
     keys += [(k, "pinned") for k in _pinned_keys(ov, chat)]
     out, done = [], set()
     for key, source in keys:
@@ -915,6 +939,31 @@ def chat_prs(sid: str) -> dict:
         repo, _, n = key.rpartition("#")
         out.append({**github.pr_status(repo, int(n)), "source": source})
     return {"branch": chat.get("branch"), "prs": out}
+
+
+@router.get("/prs/chats")
+def chats_for_pr(ref: str, cwd: str | None = None, x_loom_chat: str | None = Header(None)) -> dict:
+    """Which loom chats are tied to this PR (created it / user-pinned it / its branch is the PR's head)?
+    `ref`: a PR URL, owner/repo#N, or a bare number — resolved against the calling chat's repo (or `cwd`'s)."""
+    default_repo = None
+    if x_loom_chat:
+        me = sessions.canonical_id(x_loom_chat)
+        default_repo = _chat_default_repo(sessions.get_chat(me) or {}) or github.repo_for_dir(_chat_cwd(me))
+    default_repo = default_repo or github.repo_for_dir(cwd)
+    try:
+        repo, number = github.parse_pr_ref(ref, default_repo)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return prlink.chats_for_pr(repo, number)
+
+
+@router.post("/chats/{sid}/pr-scout")
+async def pr_scout(sid: str, force: bool = False) -> dict:
+    """One PR-scout pass over this chat (the dashboard calls it every minute while the chat is open):
+    finds PRs the transcript scraper missed and links them. Throttled server-side; see core/prscout.py."""
+    sid = sessions.canonical_id(sid)
+    await run_in_threadpool(_known_chat, sid)
+    return await run_in_threadpool(lambda: prscout.scan(sid, force=force))
 
 
 class PrRefIn(BaseModel):

@@ -1,159 +1,87 @@
-import { useEffect, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useEffect, useRef } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useHiddenRepoNames, type Chat } from '../api';
-import { useChatShell, useOpenChat } from '../chat/openChat';
-import { WORKING_WITHIN_S } from '../chat/shortcuts';
-import { BellIcon, BellOffIcon } from '../ui/icons';
+import { useOpenChat } from '../chat/openChat';
+import { notificationsSupported, useNotifyEnabled } from './enabled';
+import { inboxKey, setPanelOpen, useInbox, type InboxItem } from './inbox';
 import { chatsKey, fetchChats } from './mute';
 
-const KEY = 'loom.notify';
-const supported = typeof window !== 'undefined' && 'Notification' in window;
-
-function read(): boolean {
-  try {
-    return localStorage.getItem(KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-const listeners = new Set<() => void>();
-function write(on: boolean) {
-  try {
-    localStorage.setItem(KEY, on ? '1' : '0');
-  } catch {
-    /* private mode — the toggle just won't persist */
-  }
-  listeners.forEach((l) => l());
-}
-
-/** Desktop notifications on/off (per browser). Turning on asks the browser for permission. */
-export function useNotifyEnabled(): [boolean, () => void, NotificationPermission | 'unsupported'] {
-  const [on, setOn] = useState(read);
-  const [perm, setPerm] = useState<NotificationPermission | 'unsupported'>(supported ? Notification.permission : 'unsupported');
-  useEffect(() => {
-    const l = () => setOn(read());
-    listeners.add(l);
-    return () => {
-      listeners.delete(l);
-    };
-  }, []);
-  const toggle = async () => {
-    if (on) return write(false);
-    if (supported && Notification.permission === 'default') setPerm(await Notification.requestPermission());
-    else if (supported) setPerm(Notification.permission);
-    write(true);
-  };
-  return [on && perm !== 'denied', toggle, perm];
-}
-
-/** Sidebar header bell: desktop notifications when a chat needs you (mute individual chats with their bell). */
-export function NotifyBell() {
-  const [on, toggle, perm] = useNotifyEnabled();
-  if (perm === 'unsupported') return null;
-  return (
-    <button
-      onClick={toggle}
-      aria-pressed={on}
-      title={
-        perm === 'denied'
-          ? 'notifications are blocked for this site in your browser settings'
-          : on
-            ? 'desktop notifications on — when an unmuted chat needs you and this tab is in the background (click to turn off)'
-            : 'turn on desktop notifications for chats that need you (you can mute individual chats)'
-      }
-      className={`leading-none ${on ? 'text-accent' : 'text-muted opacity-70 hover:opacity-100 hover:text-ink'}`}
-    >
-      {on ? <BellIcon size={14} /> : <BellOffIcon size={14} />}
-    </button>
-  );
-}
-
-type Pending = { name: string; waitingOn: boolean };
-
 /**
- * The attention layer, mounted once in the shell (renders nothing):
- *  - tab title `(N) loom`: unmuted chats waiting on you (not the one you're looking at);
- *  - desktop notifications, driven by the agents' own lifecycle events (Stop / Notification hooks →
- *    core/events.py → a server-sent stream, so a hidden tab hears them instantly). Only when the tab
- *    is in the background, never for muted or archived chats, and bursts are coalesced into one.
+ * The attention layer, mounted once in the shell (renders nothing). Push-based and explicit: an agent
+ * that needs the user runs `loom notify "<question>"` (core/inbox.py); nothing is inferred from "the
+ * turn ended". It does two things:
+ *  - tab title `(N) loom`: how many unmuted questions are waiting on you;
+ *  - a desktop notification for each new question the moment it's pushed (a server-sent stream, so a
+ *    hidden tab hears it instantly) — only while the tab is in the background and the chat isn't muted;
+ *    bursts are coalesced; clicking one opens the chat, or the panel if several.
+ * The panel itself (reply inline / jump to the chat) is notify/inbox.tsx.
  */
 export function AttentionNotifier() {
-  const active = useChatShell().active;
+  const qc = useQueryClient();
   const openChat = useOpenChat();
   const [enabled] = useNotifyEnabled();
-  const { data: chats } = useQuery({ queryKey: chatsKey, queryFn: fetchChats, refetchInterval: 8000 });
   const hiddenRepos = useHiddenRepoNames(); // a hidden project is out of sight — and quiet
-  const { data: terms } = useQuery({
-    queryKey: ['terminals'],
-    queryFn: () =>
-      fetch('/api/terminals')
-        .then((r) => r.json())
-        .then((d) => d.terminals as { chat_id: string; idle_sec: number; needs: boolean }[]),
-    refetchInterval: 2000,
-  });
+  const { unmuted } = useInbox();
+  const { data: chats } = useQuery({ queryKey: chatsKey, queryFn: fetchChats, refetchInterval: 8000 });
 
-  // keep the latest values readable from the long-lived event handler
-  const live = useRef({ chats: [] as Chat[], activeSid: undefined as string | undefined, enabled: false, openChat, hiddenRepos: new Set<string>() });
-  live.current = { chats: chats ?? [], activeSid: active?.resume, enabled, openChat, hiddenRepos };
+  // keep the latest values readable from the long-lived stream handler
+  const live = useRef({ chats: [] as Chat[], enabled: false, openChat, hiddenRepos: new Set<string>() });
+  live.current = { chats: chats ?? [], enabled, openChat, hiddenRepos };
 
   // --- tab title badge ---
   useEffect(() => {
-    const byId = new Map((chats ?? []).map((c) => [c.id, c]));
-    let n = 0;
-    for (const t of terms ?? []) {
-      const c = byId.get(t.chat_id);
-      if (!c || c.archived || c.muted || (c.repo && hiddenRepos.has(c.repo)) || t.chat_id === active?.resume) continue;
-      if (t.needs && t.idle_sec >= WORKING_WITHIN_S) n++;
-    }
-    document.title = n ? `(${n}) loom` : 'loom';
-  }, [chats, terms, active?.resume, hiddenRepos]);
+    document.title = unmuted.length ? `(${unmuted.length}) loom` : 'loom';
+  }, [unmuted.length]);
 
-  // --- desktop notifications from the live event stream ---
+  // --- desktop notifications from the live stream ---
   useEffect(() => {
     if (typeof EventSource === 'undefined') return;
-    const pending = new Map<string, Pending>();
+    const pending = new Map<number, InboxItem>();
     let timer: number | undefined;
     const fire = () => {
       timer = undefined;
-      const items = [...pending.entries()];
+      const items = [...pending.values()];
       pending.clear();
-      if (!items.length || !supported || Notification.permission !== 'granted') return;
+      if (!items.length || !notificationsSupported || Notification.permission !== 'granted') return;
       const one = items.length === 1;
-      const [id, p] = items[0];
-      const n = new Notification(one ? p.name : `${items.length} chats need you`, {
-        body: one ? (p.waitingOn ? 'needs your attention' : 'finished — waiting for you') : items.map(([, x]) => x.name).slice(0, 4).join(' · '),
-        tag: 'loom-attention',
+      const n = new Notification(one ? items[0].chat_name : `${items.length} agents need you`, {
+        body: one ? items[0].text.slice(0, 220) : items.map((x) => x.chat_name).slice(0, 4).join(' · '),
+        tag: 'loom-inbox',
       });
       n.onclick = () => {
         window.focus();
-        const c = live.current.chats.find((x) => x.id === id);
-        if (one && c) live.current.openChat({ resume: c.id, cwd: c.cwd ?? undefined, title: c.name || c.display_title, mode: c.mode ?? undefined, agent: c.agent ?? undefined });
+        if (one) {
+          const it = items[0];
+          live.current.openChat({ resume: it.chat_id, cwd: it.cwd ?? undefined, title: it.chat_name, mode: 'terminal', agent: it.agent ?? undefined });
+        } else {
+          setPanelOpen(true);
+        }
         n.close();
       };
     };
     const es = new EventSource('/api/events/stream');
     es.onmessage = (m) => {
-      let evs: { chat_id: string; event: string }[] = [];
+      let items: InboxItem[] = [];
       try {
-        evs = JSON.parse(m.data).events ?? [];
+        items = JSON.parse(m.data).inbox ?? [];
       } catch {
         return;
       }
+      if (!items.length) return;
+      qc.invalidateQueries({ queryKey: inboxKey }); // the panel + badge update at once
       const l = live.current;
-      if (!l.enabled || (!document.hidden && document.hasFocus())) return; // you're here: the sidebar already shows it
-      for (const e of evs) {
-        if (e.event !== 'Stop' && e.event !== 'Notification' && e.event !== 'StopFailure') continue;
-        const c = l.chats.find((x) => x.id === e.chat_id);
-        if (!c || c.archived || c.muted || (c.repo && l.hiddenRepos.has(c.repo))) continue;
-        pending.set(c.id, { name: c.name || c.display_title || c.id.slice(0, 8), waitingOn: e.event === 'Notification' });
+      if (!l.enabled || (!document.hidden && document.hasFocus())) return; // you're here: the badge already shows it
+      for (const it of items) {
+        if (it.muted || it.archived || (it.repo && l.hiddenRepos.has(it.repo))) continue;
+        pending.set(it.id, it);
       }
-      if (pending.size && timer === undefined) timer = window.setTimeout(fire, 2500); // coalesce a burst
+      if (pending.size && timer === undefined) timer = window.setTimeout(fire, 2000); // coalesce a burst
     };
     return () => {
       es.close();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, []);
+  }, [qc]);
 
   return null;
 }
