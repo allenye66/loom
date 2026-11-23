@@ -7,6 +7,7 @@ import { BoardButton } from '../board/BoardButtons';
 import { MuteButton } from '../notify/mute';
 import { NotifyBell } from '../notify/inbox';
 import { NotesButton } from '../notes/NotesButton';
+import { setActiveProjectName } from './activeProject';
 import {
   addCategory,
   assignChat,
@@ -479,6 +480,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   // first. Its chats are the only ones listed, and `+ new` creates the task in it.
   const [projectName, setProjectName] = useState<string | null>(loadProject);
   const project = repos?.find((r) => r.name === projectName) ?? repos?.[0];
+  useEffect(() => setActiveProjectName(project?.name), [project?.name]); // the notes modal scopes itself to this
   const pickProject = (name: string) => {
     saveProject(name);
     setProjectName(name);

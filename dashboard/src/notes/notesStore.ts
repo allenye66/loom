@@ -18,6 +18,7 @@ export type Note = {
   title: string; // chat title snapshot (for the modal / reopen)
   cwd?: string;
   agent?: AgentId;
+  repo?: string; // the project the chat belongs to (resolved lazily — see useProjectNotes)
 };
 
 type NotesMap = Record<string, Note>;
@@ -38,6 +39,7 @@ function load(): NotesMap {
           title: typeof n.title === 'string' && n.title ? n.title : id.slice(0, 8),
           cwd: typeof n.cwd === 'string' ? n.cwd : undefined,
           agent: n.agent === 'claude' || n.agent === 'grok' || n.agent === 'codex' ? n.agent : undefined,
+          repo: typeof n.repo === 'string' && n.repo ? n.repo : undefined,
         };
       }
     }
@@ -75,7 +77,7 @@ if (typeof window !== 'undefined') {
   });
 }
 
-export type NoteMeta = { title?: string; cwd?: string; agent?: AgentId };
+export type NoteMeta = { title?: string; cwd?: string; agent?: AgentId; repo?: string };
 
 /** Write (or, on empty text, clear) the note for a chat. Metadata is merged so a later
  *  save can't wipe a cwd/agent captured earlier. */
@@ -96,9 +98,27 @@ export function setNote(id: string, text: string, meta: NoteMeta = {}) {
         title: meta.title || existing?.title || id.slice(0, 8),
         cwd: meta.cwd ?? existing?.cwd,
         agent: meta.agent ?? existing?.agent,
+        repo: meta.repo ?? existing?.repo,
       },
     };
   }
+  persist();
+  emit();
+}
+
+/** Record which project notes belong to (a one-off backfill for notes saved before projects were
+ *  tracked, so deleting a worktree later doesn't strand a note without one). */
+export function setNoteRepos(repos: Record<string, string>) {
+  let changed = false;
+  const next = { ...cache };
+  for (const [id, repo] of Object.entries(repos)) {
+    if (next[id] && next[id].repo !== repo) {
+      next[id] = { ...next[id], repo };
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  cache = next;
   persist();
   emit();
 }
