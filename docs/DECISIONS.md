@@ -362,6 +362,12 @@ between them. Decisions:
   a *running* target (never launches a stopped chat; refuses over an unsent draft; ≤5 per
   author→target per minute so two agents can't ping-pong forever). The content isn't repeated in
   the nudge: the target's hook attaches the unread posts to that very message.
+  **Update (11-22): tagging `@chat-name` in the post text nudges exactly like `--to`** (server-side, any author —
+  agents and the dashboard alike): the tagged chat is nudged and the post is addressed to it ("→ you" in its digest).
+  Only the category's own members can be tagged (they're the ones who can read the board), never yourself; an `@token`
+  that matches nobody (a typo, an `@decorator` in a snippet) is reported back to the poster instead of failing silently.
+  A *stopped* chat still isn't launched unless the poster passes `--wake` (the user closed it). Verified with real
+  agents: a lead tagged `@worker-b` with no `--to`, the nudge reached worker-b's input, it answered on the board.
 - **Measured** (real agents in an isolated loom; 3 workers + a coordinator implementing `slugify`
   three ways; board vs `loom chats send`; n=2 per arm, so *indicative, not significant*): both
   mechanisms delivered 3/3 reports with verbatim-correct tables and picked the true winner every

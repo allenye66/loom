@@ -2,7 +2,7 @@
 
     GET  /api/boards                       every category's board: enabled?, counts, last post, unread for ?reader=
     GET  /api/boards/{key}                 posts (?since, ?limit, ?reader + ?unread_only, ?mark)
-    POST /api/boards/{key}                 post (author = X-Loom-Chat, else "user"); `to` nudges those chats
+    POST /api/boards/{key}                 post (author = X-Loom-Chat, else "user"); `to` and `@name` tags in the text nudge those chats
     GET  /api/boards/{key}/wait            long-poll: returns as soon as someone else posts (or times out)
     POST /api/boards/{key}/seen            move a reader's cursor
     POST /api/boards/{key}/enable          turn a category's board on — the USER only (see below)
@@ -31,6 +31,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from loom.core import board, categories, events, inbox, radar, terminals, workspace
+from loom.core.mentions import mention_tokens, resolve_token
 from loom.server.inbox_api import _enrich
 from loom.server.api import _chat_cwd
 
@@ -118,13 +119,31 @@ class PostIn(BaseModel):
     text: str
     to: list[str] = []  # chat ids to nudge (the post itself is visible to the whole category)
     reply_to: int | None = None
+    wake: bool = False  # also start the agent of a stopped (not archived) target, so the tag reaches it now
 
 
-async def _nudge(entry: dict, cat_name: str, targets: list[str]) -> dict:
+def _tagged(key: str, text: str, author: str) -> tuple[list[str], list[str]]:
+    """(chat ids, unmatched tokens) for the `@name` tags in a post. Only the category's own members can be
+    tagged — they're the ones who can read the board — and never the author. Tokens that match nobody (a
+    typo, or just an `@decorator` in a code snippet) come back so the poster can be told nothing was sent."""
+    members = [c for c in workspace.loom_chats() if c.get("category") == key and not c.get("archived") and c["id"] != author]
+    ids: list[str] = []
+    missed: list[str] = []
+    for tok in mention_tokens(text):
+        c = resolve_token(tok, members, prefer_category=key)
+        if c:
+            if c["id"] not in ids:
+                ids.append(c["id"])
+        elif len(tok) >= 3:
+            missed.append(tok)
+    return ids, missed
+
+
+async def _nudge(entry: dict, cat_name: str, targets: list[str], *, wake: bool = False) -> dict:
     """Type a one-line nudge into each target that's currently running. The content isn't
     repeated: the target's UserPromptSubmit hook attaches the unread posts to that very message
-    (and chats without hooks are told to run `loom board read`). Never launches a stopped chat —
-    it will see the post with its next message instead."""
+    (and chats without hooks are told to run `loom board read`). A stopped chat isn't launched (the
+    user closed it) unless the poster passes `wake` — it sees the post with its next message instead."""
     result: dict[str, str] = {}
     loop = asyncio.get_running_loop()
     for tid in targets:
@@ -133,8 +152,8 @@ async def _nudge(entry: dict, cat_name: str, targets: list[str]) -> dict:
         if _rate_limited(entry["from"], tid):
             result[tid] = "rate-limited (posted, not nudged)"
             continue
-        if not await loop.run_in_executor(None, terminals.process_alive, tid):
-            result[tid] = "not running — will see it with their next message"
+        if not wake and not await loop.run_in_executor(None, terminals.process_alive, tid):
+            result[tid] = "not running — will see it with their next message (--wake starts it)"
             continue
         cwd = await run_in_threadpool(_chat_cwd, tid)
         text = f'[board · {cat_name}] {entry["from_name"]} posted #{entry["seq"]} → you. Unread posts are attached; if not, run: loom board read'
@@ -156,14 +175,18 @@ async def post_to_board(key: str, body: PostIn, x_loom_chat: str | None = Header
     # Stored as "user" (the human), not "you": agents read these names, and to an agent "you" is itself.
     # The dashboard renders author "user" as "you" on its own.
     name = "user" if author == "user" else await run_in_threadpool(workspace.chat_label, author)
+    # `@name` tags in the text notify exactly like `--to`: the tagged agent is nudged and the post is
+    # addressed to it (so its digest marks it "→ you").
+    tagged, unmatched = await run_in_threadpool(_tagged, key, body.text, author)
+    to = list(dict.fromkeys([*body.to, *tagged]))
     try:
         entry = await run_in_threadpool(
-            lambda: board.post(key, author, name, body.text, to=body.to, reply_to=body.reply_to)
+            lambda: board.post(key, author, name, body.text, to=to, reply_to=body.reply_to)
         )
     except board.BoardError as e:
         raise HTTPException(400, str(e)) from e
-    nudged = await _nudge(entry, cat["name"], body.to) if body.to else {}
-    return {"post": entry, "nudged": nudged}
+    nudged = await _nudge(entry, cat["name"], to, wake=body.wake) if to else {}
+    return {"post": entry, "nudged": nudged, "tagged": tagged, "unmatched_tags": unmatched}
 
 
 @router.get("/boards/{key}/wait")

@@ -1020,21 +1020,29 @@ def board_read(
 @board_app.command("post")
 def board_post(
     text: str = typer.Argument(None, help="the message (`-` = stdin)"),
-    to: list[str] = typer.Option([], "--to", "-t", help="nudge these chats (id / name / @name) — repeatable; everyone in the category can still read it"),
+    to: list[str] = typer.Option([], "--to", "-t", help="nudge these chats (id / name / @name) — repeatable; everyone in the category can still read it. Tagging `@chat-name` in the text does the same"),
+    wake: bool = typer.Option(False, "--wake", help="also start the agent of a STOPPED tagged chat (the user closed it) so it gets the nudge now"),
     reply: int = typer.Option(None, "--reply", "-r", help="the post number you're answering"),
     category: str = typer.Option(None, "--category", "-c"),
     file: str = typer.Option(None, "--file", "-f", help="read the post from a file"),
 ) -> None:
-    """Post to your category's board — findings, decisions, handoffs, questions."""
+    """Post to your category's board — findings, decisions, handoffs, questions.
+
+    Tag a chat with `@chat-name` in the text (or pass --to) to notify it: if its agent is running it gets a
+    one-line nudge now and the post attached to that message; otherwise it sees the post with its next message.
+    Only chats in your category can be tagged."""
     msg = _read_text(text, file, "post")
     if not msg or not msg.strip():
         _die("nothing to post (pass the text, `-` for stdin, or --file)")
     key, cname = _board_key(category)
     ids = [_World().resolve(t)["id"] for t in to] if to else []
-    r = _api("POST", f"/boards/{key}", body={"text": msg, "to": ids, "reply_to": reply})
+    r = _api("POST", f"/boards/{key}", body={"text": msg, "to": ids, "reply_to": reply, "wake": wake})
     print(f'posted #{r["post"]["seq"]} to "{cname}"')
     for tid, how in (r.get("nudged") or {}).items():
         print(f"  → {tid[:8]}: {how}")
+    if r.get("unmatched_tags"):
+        print("  note: " + ", ".join(f"@{t}" for t in r["unmatched_tags"]) + " didn't match a chat in this category — nobody was nudged for it "
+              "(check `loom whoami` for the names; ignore this if it wasn't meant as a tag)")
 
 
 @board_app.command("wait")

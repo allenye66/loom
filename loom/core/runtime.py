@@ -110,7 +110,7 @@ opus/sonnet/fable, `--effort` low|medium|high|xhigh|max). \
 `loom chats --help` for more. \
 A category can have a shared message board — but only if the USER has enabled it (you can't); \
 `loom whoami` shows `board: on|off`. When it's on, it's the place to leave findings, decisions and \
-handoffs for the others (`loom board post "…" [--to <chat>]`; `loom board read`; `loom board wait \
+handoffs for the others (`loom board post "…"` — tag a chat with `@chat-name` to notify it; `loom board read`; `loom board wait \
 [-n N]` blocks until N other posts arrive — up to 100 s per call, so loop for longer — which beats \
 polling). The category roster, unread posts and any `@chat-name` mention in the user's message are \
 attached to your messages automatically. \

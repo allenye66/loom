@@ -103,7 +103,8 @@ def _workspace_block(me_name: str, chat_id: str, cat: dict, sibs: list[dict], bo
         return head + (
             ("The user just ENABLED this category's shared message board. " if newly else "This category has a shared message board. ")
             + "`loom board read|post|wait` — post findings, decisions and handoffs there; unread posts are attached to your next "
-            "user message. Message one chat directly with " + '`loom chats send <id> "…"`. ' + mentions
+            "user message. Tag a chat with `@chat-name` in a post to notify it (its agent gets a nudge). Message one chat directly with "
+            + '`loom chats send <id> "…"`. ' + mentions
         )
     return head + (
         "This category has no message board — the user hasn't enabled one (they can, from the dashboard). To hand something to "
@@ -141,7 +142,7 @@ def _mentions_block(tokens: list[str], chats: list[dict], me: str, prefer_cat: s
     return (
         "Mentioned loom chats:\n" + "\n".join(lines) +
         "\n  (reach one with `loom chats send <id> \"…\"`, read it with `loom chats show <id>`"
-        + (", or post to the board with `--to <id>`)" if board_on else ")")
+        + (", or post to the board tagging it with `@name`)" if board_on else ")")
     )
 
 
