@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useOpenChat } from '../chat/openChat';
 import { closeNotesModal, deleteNote, useNotesModalOpen, type Note } from './notesStore';
-import { useProjectNotes } from './useProjectNotes';
+import { useProjectNotes, type NoteStatus } from './useProjectNotes';
 
 function rel(ms: number): string {
   const s = (Date.now() - ms) / 1000;
@@ -12,14 +12,29 @@ function rel(ms: number): string {
   return new Date(ms).toLocaleDateString();
 }
 
+const STATUS_STYLE: Record<NoteStatus, { label: string; cls: string; title: string }> = {
+  active: { label: 'active', cls: 'border-ok/40 text-ok', title: "this note's chat is in the sidebar's active list" },
+  archived: { label: 'archived', cls: 'border-edge text-muted', title: "this note's chat is archived" },
+  gone: { label: 'chat gone', cls: 'border-warn/40 text-warn', title: 'the chat was deleted — only the note is left' },
+};
+function StatusBadge({ status }: { status: NoteStatus }) {
+  const s = STATUS_STYLE[status];
+  return (
+    <span title={s.title} className={`text-[10px] mono px-1.5 py-0.5 rounded border shrink-0 ${s.cls}`}>
+      {s.label}
+    </span>
+  );
+}
+
 /** Modal listing the chat notes of the project you're on, newest first (a toggle shows other projects' too). Each entry links back to the chat it
  *  came from (reopens the terminal via the stored cwd/agent). Mounted once (inside ChatProvider,
  *  so it can reach `useOpenChat` and float above the terminal overlay); renders null when closed. */
 export function NotesModal() {
   const open = useNotesModalOpen();
-  const { notes, mineCount, otherCount, scope, setScope, project, repoOf } = useProjectNotes();
+  const { notes, mineCount, otherCount, scope, setScope, project, repoOf, statusOf } = useProjectNotes({ withStatus: open });
   const openChat = useOpenChat();
   const [q, setQ] = useState('');
+  const [show, setShow] = useState<'all' | NoteStatus>('all');
 
   useEffect(() => {
     if (!open) return;
@@ -32,15 +47,19 @@ export function NotesModal() {
 
   // reopening always starts on the project you're on, not on a previous visit's "all projects"
   useEffect(() => {
-    if (!open) setScope('project');
+    if (!open) {
+      setScope('project');
+      setShow('all');
+    }
   }, [open, setScope]);
 
   if (!open) return null;
 
   const needle = q.trim().toLowerCase();
-  const filtered = needle
-    ? notes.filter((n) => (n.title + ' ' + n.text).toLowerCase().includes(needle))
-    : notes;
+  const count = (s: NoteStatus) => notes.filter((n) => statusOf(n) === s).length;
+  const filtered = notes
+    .filter((n) => show === 'all' || statusOf(n) === show)
+    .filter((n) => !needle || (n.title + ' ' + n.text).toLowerCase().includes(needle));
 
   const openFromNote = (n: Note) => {
     closeNotesModal();
@@ -75,7 +94,7 @@ export function NotesModal() {
         </div>
 
         {notes.length > 0 && (
-          <div className="px-4 py-2.5 border-b border-edge shrink-0">
+          <div className="px-4 py-2.5 border-b border-edge shrink-0 flex flex-col gap-2">
             <input
               autoFocus
               value={q}
@@ -83,6 +102,26 @@ export function NotesModal() {
               placeholder="search notes…"
               className="w-full mono text-xs px-2.5 py-1.5 rounded bg-canvas border border-edge outline-none focus:border-accent"
             />
+            {statusOf(notes[0]) && (
+              <div className="flex items-center gap-1.5 text-[10px] mono">
+                {(
+                  [
+                    ['all', 'all', notes.length],
+                    ['active', 'active', count('active')],
+                    ['archived', 'archived', count('archived')],
+                    ...(count('gone') ? [['gone', 'chat gone', count('gone')]] : []),
+                  ] as [typeof show, string, number][]
+                ).map(([key, label, n]) => (
+                  <button
+                    key={key}
+                    onClick={() => setShow(key)}
+                    className={`px-2 py-0.5 rounded border ${show === key ? 'border-accent-dim text-accent bg-accent/10' : 'border-edge text-muted hover:text-ink'}`}
+                  >
+                    {label} {n}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -98,12 +137,13 @@ export function NotesModal() {
             </div>
           ) : (
             filtered.map((n) => (
-              <div key={n.id} className="rounded-lg border border-edge bg-surface-2/40 p-3">
+              <div key={n.id} className={`rounded-lg border border-edge bg-surface-2/40 p-3 ${statusOf(n) === 'archived' ? 'opacity-75' : ''}`}>
                 <div className="flex items-center gap-2 mb-1.5">
                   <span className="text-sm text-ink font-medium truncate flex-1">{n.title}</span>
                   {(scope === 'all' || !repoOf(n)) && (
                     <span className="text-[10px] mono text-muted shrink-0">{repoOf(n) ?? 'project unknown'}</span>
                   )}
+                  {statusOf(n) && <StatusBadge status={statusOf(n)!} />}
                   {n.agent && (
                     <span className="text-[10px] mono px-1.5 py-0.5 rounded border border-edge text-muted shrink-0">
                       {n.agent}
@@ -115,12 +155,17 @@ export function NotesModal() {
                   {n.text}
                 </div>
                 <div className="flex items-center gap-2 mt-2.5">
-                  <button
-                    onClick={() => openFromNote(n)}
-                    className="text-[11px] px-2 py-1 rounded border border-edge text-accent hover:bg-accent/10"
-                  >
-                    open chat →
-                  </button>
+                  {statusOf(n) === 'gone' ? (
+                    <span className="text-[11px] text-muted">its chat no longer exists</span>
+                  ) : (
+                    <button
+                      onClick={() => openFromNote(n)}
+                      title={statusOf(n) === 'archived' ? 'this chat is archived — opening it resumes it' : undefined}
+                      className="text-[11px] px-2 py-1 rounded border border-edge text-accent hover:bg-accent/10"
+                    >
+                      open chat →
+                    </button>
+                  )}
                   <div className="flex-1" />
                   <button
                     onClick={() => {

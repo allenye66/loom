@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useRepos, useHiddenRepos, useTasks } from '../api';
+import { useRepos, useHiddenRepos, useTasks, type Chat } from '../api';
 import { useActiveProjectName } from '../chat/activeProject';
 import { chatsKey, fetchChats } from '../notify/mute';
 import { setNoteRepos, useNotesList, type Note } from './notesStore';
@@ -9,11 +9,21 @@ import { setNoteRepos, useNotesList, type Note } from './notesStore';
  *  browser), so its project is resolved from the chat / task it belongs to — and remembered on the note
  *  once known. A note whose project can't be told (its chat and worktree are gone) is kept in view rather
  *  than silently lost. `scope: 'all'` shows every project's notes. */
-export function useProjectNotes() {
+export type NoteStatus = 'active' | 'archived' | 'gone';
+
+export function useProjectNotes({ withStatus = false }: { withStatus?: boolean } = {}) {
   const all = useNotesList();
   const active = useActiveProjectName();
   const [scope, setScope] = useState<'project' | 'all'>('project');
   const { data: chats } = useQuery({ queryKey: chatsKey, queryFn: fetchChats, refetchInterval: false });
+  // Whether a note's chat is still active, archived, or gone — from the same lists the sidebar's tabs use (the
+  // archived list is only fetched while the notes modal is open).
+  const { data: archived } = useQuery({
+    queryKey: ['chats', { scope: 'all', tab: 'archived', q: '' }],
+    queryFn: () => fetch('/api/chats?scope=all&tab=archived').then((r) => r.json()).then((d) => d.chats as Chat[]),
+    enabled: withStatus,
+    refetchInterval: false,
+  });
   const { data: tasks } = useTasks();
   const { data: repos } = useRepos();
   const { data: hidden } = useHiddenRepos();
@@ -42,6 +52,13 @@ export function useProjectNotes() {
     if (Object.keys(found).length) setNoteRepos(found);
   }, [all, repoOf]);
 
+  const statusOf = useMemo(() => {
+    if (!chats || !archived) return (_n: Note): NoteStatus | undefined => undefined; // not loaded yet — say nothing
+    const live = new Set(chats.map((c) => c.id));
+    const shelved = new Set(archived.map((c) => c.id));
+    return (n: Note): NoteStatus => (live.has(n.id) ? 'active' : shelved.has(n.id) ? 'archived' : 'gone');
+  }, [chats, archived]);
+
   const mine = useMemo(() => (active ? all.filter((n) => { const r = repoOf(n); return !r || r === active; }) : all), [all, active, repoOf]);
   return {
     notes: scope === 'all' ? all : mine,
@@ -51,5 +68,6 @@ export function useProjectNotes() {
     setScope,
     project: active,
     repoOf,
+    statusOf,
   };
 }
