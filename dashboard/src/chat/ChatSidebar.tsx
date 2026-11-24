@@ -10,14 +10,19 @@ import { NotesButton } from '../notes/NotesButton';
 import { setActiveProjectName } from './activeProject';
 import {
   addCategory,
+  archiveCategory,
   assignChat,
   claimUnscopedCategories,
+  refreshCategories,
   removeCategory,
   renameCategory,
+  restoreCategory,
   setCategoryOrder,
   useCategories,
 } from '../categories/categoriesStore';
+import { useBoards } from '../board/boardApi';
 import {
+  moveChatInCache,
   useChatActions,
   useDoctor,
   useRepos,
@@ -474,6 +479,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const [order, setOrder] = useState<string[]>(loadChatOrder);
   const dragId = useRef<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [newCat, setNewCat] = useState(''); // category id the new chat goes into ('' = none)
   const [branch, setBranch] = useState('');
   const [agent, setAgent] = useState<AgentId>('claude');
   // Which project the sidebar shows: the remembered one while it's still registered, else the
@@ -606,7 +612,8 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const { categories: allCategories, assign } = useCategories();
   // Each project has its own categories. Ones made before projects existed have none yet:
   // file each under the project most of its chats are in (else the first project).
-  const categories = project ? allCategories.filter((c) => !c.repo || c.repo === project.name) : []; // no project (e.g. all hidden) → no groups
+  const categories = (project ? allCategories.filter((c) => !c.repo || c.repo === project.name) : []) // no project (e.g. all hidden) → no groups
+    .filter((c) => tab === 'archived' || !c.archived); // an archived category lives in the Archived tab until restored
   useEffect(() => {
     if (!repos?.length || !chatList) return;
     const repoOf = new Map(chatList.map((c) => [c.id, c.repo]));
@@ -627,9 +634,9 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   const grouped = !q && categories.length > 0;
   // The sidebar's groups top to bottom: Uncategorized (always first), then the project's
   // categories in order. A category can be dragged by its header to move it.
-  const groups: { id: string | null; key: string; name: string }[] = [
+  const groups: { id: string | null; key: string; name: string; archived?: boolean }[] = [
     { id: null, key: 'uncat', name: 'Uncategorized' },
-    ...categories.map((c) => ({ id: c.id, key: c.id, name: c.name })),
+    ...categories.map((c) => ({ id: c.id, key: c.id, name: c.name, archived: c.archived })),
   ];
   const dragCat = useRef<string | null>(null); // id of the category being dragged (handlers read this)
   const [draggingCat, setDraggingCat] = useState<string | null>(null); // same, for styling
@@ -690,8 +697,57 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     if (archived && active?.resume === id) close();
     patch.mutate(
       { id, patch: { archived } },
-      { onError: (e) => setNotice(`Couldn’t ${archived ? 'archive' : 'unarchive'} the chat: ${e.message}`) },
+      {
+        onError: (e) => setNotice(`Couldn’t ${archived ? 'archive' : 'unarchive'} the chat: ${e.message}`),
+        // restoring one chat of an archived category brings its category back — pick that up now, not on the next poll
+        onSuccess: () => { if (!archived) void refreshCategories(); },
+      },
     );
+  };
+
+  // --- archiving a whole category (reversible; its message board and roster are kept) -----------------
+  const { data: boards } = useBoards();
+  const postsIn = (catId: string) => boards?.find((b) => b.key === catId)?.count ?? 0;
+  const restoreCat = (id: string, name: string) => {
+    for (const cid of allCategories.find((c) => c.id === id)?.archived_with ?? []) moveChatInCache(qc, cid, false);
+    restoreCategory(id)
+      .then((ids) => {
+        qc.invalidateQueries({ queryKey: ['chats'] });
+        toast(`restored “${name}” — ${ids.length} chat${ids.length === 1 ? '' : 's'} un-archived`, { kind: 'ok' });
+      })
+      .catch((e) => setNotice(`Couldn’t restore “${name}”: ${e.message}`));
+  };
+  const archiveCat = (g: { id: string; name: string }) => {
+    const mine = allTaskChats.filter((c) => !c.archived && assign[c.id] === g.id);
+    const live = mine.filter((c) => termById.has(c.id)).length;
+    const posts = postsIn(g.id);
+    const s = (n: number) => (n === 1 ? '' : 's');
+    if (
+      !confirm(
+        `Archive category “${g.name}”?\n\n` +
+          `• ${mine.length} chat${s(mine.length)} will be archived` + (live ? ` — ${live} running agent${s(live)} will be stopped` : '') + `.\n` +
+          `• Its message board${posts ? ` (${posts} post${s(posts)})` : ''} and the chats' category are kept.\n\n` +
+          `Restore the whole category — or just one chat — from the Archived tab and it all comes back.`,
+      )
+    )
+      return;
+    void qc.cancelQueries({ queryKey: ['chats'] }); // an in-flight refetch would undo the move
+    for (const c of mine) moveChatInCache(qc, c.id, true);
+    if (active && mine.some((c) => c.id === active.resume)) close();
+    archiveCategory(g.id)
+      .then((ids) => {
+        qc.invalidateQueries({ queryKey: ['chats'] });
+        toast(`archived “${g.name}” — ${ids.length} chat${s(ids.length)}; board kept`, {
+          id: `cat:${g.id}`,
+          kind: 'ok',
+          ttl: 10000,
+          action: { label: 'undo', run: () => restoreCat(g.id, g.name) },
+        });
+      })
+      .catch((e) => {
+        qc.invalidateQueries({ queryKey: ['chats'] });
+        setNotice(`Couldn’t archive “${g.name}”: ${e.message}`);
+      });
   };
   // Fully delete an archived chat's worktree (git worktree + files). Warns first; the branch and
   // the chat transcript are kept. Also trims the worktree count, which keeps loom snappy.
@@ -722,13 +778,17 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     setCreating(false);
     // Feedback from the first instant: a placeholder row here + a loading state in the content pane
     // (the worktree can take a while to make); the terminal pane then shows "starting <agent>…".
-    const pid = beginPending({ branch: b, agent, repo: project?.name });
+    // An optional category: the server files the chat there as it creates it (so it never flashes in Uncategorized).
+    const cat = categories.find((c) => c.id === newCat && !c.archived);
+    setNewCat('');
+    const pid = beginPending({ branch: b, agent, repo: project?.name, category: cat?.name });
     const fail = (why: string) => {
       dropPending(pid);
       setNotice(`Couldn’t create ${b}: ${why}`);
     };
     try {
-      const task = await create.mutateAsync({ repo_root: repoRoot, branch: b, agent });
+      const task = await create.mutateAsync({ repo_root: repoRoot, branch: b, agent, category: cat?.id });
+      if (cat) void refreshCategories(); // pick up the new assignment now, not on the next poll
       // Only open a chat for a healthy task — a worktree that failed to create would just
       // produce repeated "working directory does not exist" errors.
       if (task?.state === 'error') return fail(task.note ?? 'unknown error');
@@ -887,7 +947,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   // Custom categories can also be dragged to move the whole group, renamed ✎ and deleted ✕
   // (Uncategorized is pinned first).
   const renderGroupHeader = (
-    g: { id: string | null; key: string; name: string; count: number },
+    g: { id: string | null; key: string; name: string; count: number; archived?: boolean },
     isColl: boolean,
   ) => {
     const renaming = g.id !== null && renamingCat === g.id;
@@ -926,13 +986,25 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
             className="flex-1 min-w-0 flex items-center gap-1.5 text-left text-muted hover:text-ink"
           >
             <span className="w-3 shrink-0 text-[11px] leading-none">{isColl ? '▸' : '▾'}</span>
-            <span className="flex-1 min-w-0 text-[10px] mono uppercase tracking-wide truncate">{g.name}</span>
+            <span className="flex-1 min-w-0 text-[10px] mono uppercase tracking-wide truncate">
+              {g.name}
+              {g.archived && <span className="ml-1.5 normal-case tracking-normal text-muted/60">archived</span>}
+            </span>
             <span className="text-[9px] mono shrink-0">{g.count}</span>
           </button>
         )}
         {g.id !== null && (
           <>
             <BoardButton catId={g.id} name={g.name} />
+            {!g.archived && (
+              <button
+                onClick={() => { setNewCat(g.id!); setCreating(true); }}
+                title={`new chat in “${g.name}”`}
+                className="opacity-0 group-hover/gh:opacity-100 text-[11px] text-muted hover:text-accent shrink-0 leading-none"
+              >
+                +
+              </button>
+            )}
             <button
               onClick={() => setRenamingCat(g.id)}
               title="rename category"
@@ -940,9 +1012,36 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
             >
               ✎
             </button>
+            {g.archived ? (
+              <button
+                onClick={() => restoreCat(g.id!, g.name)}
+                title="restore this category — un-archives the chats its archive archived, and its message board comes back"
+                className="text-[11px] text-accent hover:text-ink shrink-0 leading-none"
+              >
+                ↺
+              </button>
+            ) : (
+              <button
+                onClick={() => archiveCat({ id: g.id!, name: g.name })}
+                title="archive this category — archives all its chats (agents stopped); the board is kept and you can restore it, or any one chat, later"
+                className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-ink shrink-0 leading-none"
+              >
+                ⊘
+              </button>
+            )}
             <button
-              onClick={() => { if (confirm(`Delete category "${g.name}"?\n\nChats stay — they move back to Uncategorized.`)) removeCategory(g.id!); }}
-              title="delete category"
+              onClick={() => {
+                const posts = postsIn(g.id!);
+                if (
+                  confirm(
+                    `Delete category “${g.name}” for good?\n\nIts chats stay — they move back to Uncategorized.` +
+                      (posts ? `\n\nIts message board (${posts} post${posts === 1 ? '' : 's'}) is deleted with it and can't be restored.` : '') +
+                      `\n\nTo keep it, press Cancel and archive the category instead (⊘).`,
+                  )
+                )
+                  removeCategory(g.id!);
+              }}
+              title="delete category for good (archive it to keep its board)"
               className="opacity-0 group-hover/gh:opacity-100 text-[10px] text-muted hover:text-bad shrink-0 leading-none"
             >
               ✕
@@ -1048,6 +1147,23 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
               </button>
             ))}
           </div>
+          {categories.some((c) => !c.archived) && (
+            <label className="flex items-center gap-1.5 text-[10px] mono text-muted">
+              <span className="shrink-0">category</span>
+              <select
+                value={categories.some((c) => c.id === newCat && !c.archived) ? newCat : ''}
+                onChange={(e) => setNewCat(e.target.value)}
+                className="flex-1 min-w-0 mono text-[11px] px-1.5 py-1 rounded bg-surface border border-edge outline-none focus:border-accent text-ink"
+              >
+                <option value="">none (Uncategorized)</option>
+                {categories.filter((c) => !c.archived).map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
         </div>
       )}
 
@@ -1104,6 +1220,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         >
           <Spinner size={10} />
           <span className="text-xs text-muted truncate flex-1">{p.branch}</span>
+          {p.category && <span className="text-[9px] mono text-muted/70 truncate max-w-[5rem] shrink-0">→ {p.category}</span>}
           <span className="text-[9px] mono text-accent shrink-0 animate-pulse">{p.chatId ? 'starting…' : 'creating…'}</span>
         </div>
       ))}

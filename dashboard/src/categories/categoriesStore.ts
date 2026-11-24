@@ -17,7 +17,9 @@ import { useSyncExternalStore } from 'react';
 
 // `repo` = the project (registered repo name) the category belongs to. Categories made before
 // projects existed have none until the sidebar files them (claimUnscopedCategories).
-export type Category = { id: string; name: string; repo?: string };
+// `archived*`: the category was archived (reversible) — see core/categories.py. `archived_with` = the chats its archive
+// archived, which "restore" brings back.
+export type Category = { id: string; name: string; repo?: string; archived?: boolean; archived_at?: number; archived_with?: string[] };
 type State = {
   categories: Category[]; // display order
   assign: Record<string, string>; // chatId -> categoryId
@@ -36,7 +38,14 @@ function sanitize(raw: any): State {
   const categories = Array.isArray(raw?.categories)
     ? raw.categories
         .filter((c: any) => c && typeof c.id === 'string' && typeof c.name === 'string')
-        .map((c: any) => ({ id: c.id, name: c.name, ...(typeof c.repo === 'string' ? { repo: c.repo } : {}) }))
+        .map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          ...(typeof c.repo === 'string' ? { repo: c.repo } : {}),
+          ...(c.archived === true
+            ? { archived: true, archived_at: typeof c.archived_at === 'number' ? c.archived_at : undefined, archived_with: Array.isArray(c.archived_with) ? c.archived_with.filter((x: unknown) => typeof x === 'string') : [] }
+            : {}),
+        }))
     : [];
   const assign =
     raw?.assign && typeof raw.assign === 'object'
@@ -99,6 +108,8 @@ async function importLegacy(): Promise<void> {
 }
 
 let refreshing: Promise<void> | null = null;
+/** Re-read the server's categories now (e.g. after restoring a chat, which can restore its category). */
+export const refreshCategories = () => refresh();
 function refresh(): Promise<void> {
   refreshing ??= (async () => {
     try {
@@ -175,6 +186,37 @@ export function removeCategory(id: string) {
   for (const k of Object.keys(assign)) if (assign[k] === id) delete assign[k];
   setLocal({ categories: state.categories.filter((c) => c.id !== id), assign });
   void call('DELETE', `/categories/${encodeURIComponent(id)}`);
+}
+
+/** Archive a category: the server archives all its active chats (agents stopped) and flags it; its board and the
+ *  chats' assignments are kept. Resolves with the chat ids it archived. Optimistic; resyncs if the server refuses. */
+export async function archiveCategory(id: string): Promise<string[]> {
+  setLocal({ ...state, categories: state.categories.map((c) => (c.id === id ? { ...c, archived: true, archived_with: [] } : c)) });
+  try {
+    const r = await fetch(`/api/categories/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+    if (!r.ok) throw new Error(String(r.status));
+    const j = await r.json();
+    adopt(sanitize(j));
+    return Array.isArray(j.archived_chats) ? j.archived_chats : [];
+  } catch (e) {
+    void refresh();
+    throw e;
+  }
+}
+
+/** Restore an archived category and the chats its archive archived. Resolves with the chat ids it revived. */
+export async function restoreCategory(id: string): Promise<string[]> {
+  setLocal({ ...state, categories: state.categories.map((c) => { if (c.id !== id) return c; const { archived, archived_at, archived_with, ...rest } = c; void archived; void archived_at; void archived_with; return rest; }) });
+  try {
+    const r = await fetch(`/api/categories/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+    if (!r.ok) throw new Error(String(r.status));
+    const j = await r.json();
+    adopt(sanitize(j));
+    return Array.isArray(j.restored_chats) ? j.restored_chats : [];
+  } catch (e) {
+    void refresh();
+    throw e;
+  }
 }
 
 /** Assign a chat to a category, or pass null to move it back to Uncategorized. */

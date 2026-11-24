@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
-from loom.core import agents
+from loom.core import agents, github
 from loom.core import categories as categories_mod
 from loom.core import registry
 from loom.core import repos as repos_mod
@@ -850,8 +850,34 @@ def _cwd_resolver():
     return resolve
 
 
+def _pr_num(key) -> int | None:
+    """The PR number of "owner/repo#123" (or "123")."""
+    tail = str(key).rpartition("#")[2]
+    return int(tail) if tail.isdigit() else None
+
+
+def _pr_numbers(s: dict, ov: dict) -> tuple[list[int], list[int]]:
+    """(PRs tied to this chat, PRs it only mentioned) as numbers, for the sidebar's chips fallback and search.
+    Tied = Claude's pr-link records, PRs the chat created (as far as the createdAt cache knows — never a network
+    call here), the PR scout's finds, and ones the user pinned; minus ones the user removed. Mentioned = PR links the
+    agent saw but isn't known to have opened."""
+    gone = {_pr_num(k) for k in ov.get("prs_hidden") or []}
+    tied: set[int] = {int(x) for x in s.get("prs") or [] if str(x).isdigit()}
+    for k in [*(ov.get("prs_pinned") or []), *(ov.get("prs_scouted") or [])]:
+        if (n := _pr_num(k)) is not None:
+            tied.add(n)
+    if str(ov.get("pr") or "").isdigit():
+        tied.add(int(ov["pr"]))
+    seen = s.get("pr_seen") or {}
+    if seen:
+        tied |= {n for k in github.created_prs_cached(seen, s.get("tool_windows") or []) if (n := _pr_num(k)) is not None}
+    mentioned = {n for k in seen if (n := _pr_num(k)) is not None} - tied
+    return sorted(tied - gone), sorted(mentioned - gone)
+
+
 def _merge(s: dict, resolve=None) -> dict:
     ov = get_overlay(s["id"])
+    prs, pr_mentions = _pr_numbers(s, ov)
     repo_name, task_id, home_cwd = (resolve or _repo_task_for_cwd)(s.get("cwd"), s["id"])
     title = ov.get("name") or s.get("title") or (s.get("first_prompt") or "")[:64] or s["id"][:8]
     # Overlay agent wins once locked; else the index source (claude/grok/codex scan).
@@ -863,6 +889,8 @@ def _merge(s: dict, resolve=None) -> dict:
         # A task-linked chat's home is its worktree (overrides the transcript's recorded
         # cwd for adopted chats — terminal opens + sidebar filtering use this).
         "cwd": home_cwd or s.get("cwd"),
+        "prs": prs,
+        "pr_mentions": pr_mentions,
         "agent": agent,
         "repo": repo_name,
         "task": task_id,
@@ -925,9 +953,45 @@ def _haystack(r: dict) -> str:
         r.get("description") or "",
         " ".join(map(str, r.get("tags", []))),
         " ".join(map(str, r.get("prs", []))),
+        " ".join(map(str, r.get("pr_mentions", []))),
         str(r.get("pr_manual") or ""),
     ]
     return " ".join(parts).lower()
+
+
+# --- search: free text AND PR numbers ------------------------------------------------------
+# A term that names a PR — `#2140`, `acme/web#2140`, `pr2140`, `pr-2140`, a PR URL, or "PR 2140" as two words —
+# matches chats tied to (or that mentioned) exactly that PR number; any other term is a substring of the
+# chat's text. Every term must match.
+_PR_TERMS = (
+    re.compile(r"github\.com/[\w.-]+/[\w.-]+/pull/(\d+)"),
+    re.compile(r"^(?:[\w.-]+/[\w.-]+)?#(\d+)$"),
+    re.compile(r"^pr[#:\-]?(\d+)$"),
+)
+
+
+def _search_terms(q: str) -> list[tuple[str, int | None]]:
+    raw = q.lower().split()
+    out: list[tuple[str, int | None]] = []
+    i = 0
+    while i < len(raw):
+        t = raw[i]
+        if t in ("pr", "pr:", "pull") and i + 1 < len(raw) and re.fullmatch(r"#?\d+", raw[i + 1]):
+            out.append((raw[i + 1], int(raw[i + 1].lstrip("#"))))
+            i += 2
+            continue
+        num = next((int(m.group(1)) for rx in _PR_TERMS if (m := rx.search(t))), None)
+        out.append((t, num))
+        i += 1
+    return out
+
+
+def _matches(r: dict, q: str) -> bool:
+    hay = _haystack(r)
+    nums = {int(x) for x in [*(r.get("prs") or []), *(r.get("pr_mentions") or [])] if str(x).isdigit()}
+    if str(r.get("pr_manual") or "").isdigit():
+        nums.add(int(r["pr_manual"]))
+    return all((n in nums) if n is not None else (t in hay) for t, n in _search_terms(q))
 
 
 def _pending_chat_rows(indexed_ids: set, resolve) -> list[dict]:
@@ -995,8 +1059,7 @@ def list_chats(
     if branch:
         rows = [r for r in rows if (r.get("branch") or "") == branch]
     if q:
-        ql = q.lower()
-        rows = [r for r in rows if ql in _haystack(r)]
+        rows = [r for r in rows if _matches(r, q)]
 
     if tab == "archived":
         # Most-recently-archived first. Fall back to last activity for chats archived before

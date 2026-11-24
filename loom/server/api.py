@@ -26,6 +26,7 @@ from loom import __version__
 from loom.core import (
     agents,
     briefs,
+    board,
     categories,
     claude_session,
     doctor,
@@ -202,13 +203,26 @@ class TaskIn(BaseModel):
     base_branch: str | None = None
     note: str | None = None
     agent: Literal["claude", "grok", "codex"] | None = None  # CLI for this task's chat; locked at create
+    category: str | None = None  # optional: file the new chat under this category (id or name, in the task's project)
 
 
 @router.post("/tasks")
 def create_task(body: TaskIn) -> dict:
     try:
         cfg = load_repo_config(body.repo_root)
-        return _view(manager.create_task(cfg, body.branch, body.base_branch, body.note, agent=body.agent))
+        cat = None
+        if body.category:
+            cat = categories.find(body.category, cfg.name)
+            if not cat:
+                raise ValueError(f"unknown category '{body.category}' in project {cfg.name}")
+            if cat.get("archived"):
+                raise ValueError(f'category "{cat["name"]}" is archived — restore it first (or pick another)')
+            if cat.get("repo") not in (None, cfg.name):
+                raise ValueError(f'category "{cat["name"]}" belongs to project {cat["repo"]}, not {cfg.name}')
+        task = manager.create_task(cfg, body.branch, body.base_branch, body.note, agent=body.agent)
+        if cat and task.chat_id:  # filed before the dashboard first lists the chat, so it never flashes in Uncategorized
+            categories.assign([task.chat_id], cat["id"])
+        return _view(task)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(400, str(e)) from e
 
@@ -565,6 +579,23 @@ async def _archive_followup(sid: str, caller: str | None, prev: asyncio.Task | N
         )
 
 
+def _schedule_archive_followup(sid: str, caller: str | None) -> None:
+    prev = _archive_tail.get(sid)
+    job = _spawn(f"archive follow-up {sid[:8]}", _archive_followup(sid, caller, prev))
+    _archive_tail[sid] = job
+    job.add_done_callback(lambda j: _archive_tail.pop(sid, None) if _archive_tail.get(sid) is j else None)
+
+
+async def _set_chat_archived(sid: str, archived: bool, caller: str | None) -> None:
+    """Archive / unarchive one chat the way the sidebar does: flag now, side effects (stop the agent + dev
+    stack, ports) in the background."""
+    patch: dict = {"archived": archived}
+    if archived:
+        patch["archived_at"] = time.time()
+    await run_in_threadpool(sessions.set_overlay, sid, patch)
+    _schedule_archive_followup(sid, caller)
+
+
 @router.patch("/chats/{sid}")
 async def patch_chat(sid: str, body: ChatPatch, x_loom_chat: str | None = Header(None)) -> dict:
     """`X-Loom-Chat` = the chat making the request (the `loom` CLI sends $LOOM_CHAT_ID), so an
@@ -586,10 +617,11 @@ async def patch_chat(sid: str, body: ChatPatch, x_loom_chat: str | None = Header
         patch["archived_at"] = time.time()
     out = await run_in_threadpool(sessions.set_overlay, sid, patch)
     if body.archived is not None:
-        prev = _archive_tail.get(sid)
-        job = _spawn(f"archive follow-up {sid[:8]}", _archive_followup(sid, x_loom_chat, prev))
-        _archive_tail[sid] = job
-        job.add_done_callback(lambda j: _archive_tail.pop(sid, None) if _archive_tail.get(sid) is j else None)
+        _schedule_archive_followup(sid, x_loom_chat)
+    if body.archived is False:
+        # Restoring one chat of an archived category brings the category back (with its board and roster);
+        # the category's other chats stay archived inside it.
+        await run_in_threadpool(_restore_category_of, sid)
     return out
 
 
@@ -833,10 +865,58 @@ def patch_category(cat_id: str, body: CategoryPatch) -> dict:
     return categories.get_state()
 
 
+def _restore_category_of(sid: str) -> None:
+    state = categories.get_state()
+    cid = state["assign"].get(sid)
+    if cid and next((c for c in state["categories"] if c["id"] == cid and c.get("archived")), None):
+        categories.restore(cid)
+
+
+def _category_or_404(cat_id: str) -> dict:
+    cat = next((c for c in categories.get_state()["categories"] if c["id"] == cat_id), None)
+    if not cat:
+        raise HTTPException(404, f"unknown category '{cat_id}'")
+    return cat
+
+
+@router.post("/categories/{cat_id}/archive")
+async def archive_category(cat_id: str, x_loom_chat: str | None = Header(None)) -> dict:
+    """Archive a category: every active chat in it is archived (agents stopped, dev stacks and ports
+    released — in the background, like archiving one chat) and the category leaves the active list. Its message
+    board and the chats' assignments are kept; restore the category, or any one chat, to bring it back."""
+    cat = await run_in_threadpool(_category_or_404, cat_id)
+    if cat.get("archived"):
+        return {"archived_chats": [], **categories.get_state()}
+    state = categories.get_state()
+    rows = await run_in_threadpool(lambda: sessions.list_chats(scope="all", tab="active"))
+    members = [c["id"] for c in rows if state["assign"].get(c["id"]) == cat_id]
+    for sid in members:
+        await _set_chat_archived(sid, True, x_loom_chat)
+    await run_in_threadpool(categories.archive, cat_id, members)
+    return {"archived_chats": members, **categories.get_state()}
+
+
+@router.post("/categories/{cat_id}/restore")
+async def restore_category(cat_id: str) -> dict:
+    """Restore an archived category and the chats its archive archived (not ones archived separately
+    before). Restoring doesn't start any agent — opening a chat does, as always."""
+    await run_in_threadpool(_category_or_404, cat_id)
+    with_ids = await run_in_threadpool(categories.restore, cat_id)
+    revived = []
+    for sid in with_ids:
+        if (await run_in_threadpool(sessions.get_overlay, sid)).get("archived"):
+            await _set_chat_archived(sid, False, None)
+            revived.append(sid)
+    return {"restored_chats": revived, **categories.get_state()}
+
+
 @router.delete("/categories/{cat_id}")
 def delete_category(cat_id: str) -> dict:
+    """Delete a category for good: its chats go back to Uncategorized and its message board — posts,
+    cursors, the enabled flag — is deleted with it (archive instead to keep it all)."""
     categories.remove(cat_id)
-    return categories.get_state()
+    purged = board.purge(cat_id)
+    return {"purged_posts": purged, **categories.get_state()}
 
 
 @router.put("/categories-order")

@@ -120,6 +120,10 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   (reply inline or jump to the chat; the agent is told which question the reply answers) + `(N) loom` tab badge.
   **PR-conflict awareness** is for agents only (no UI): open PRs by chats in a category are tested pairwise and each
   agent is told through its per-message context. `⌘Z` undo in the input box; `#` as the chat-mention trigger.
+- **Category archive** (D30) — archive a category (⊘ on its header, `loom categories archive`): all its chats are archived,
+  its message board and roster are kept, and restoring the category — or any one chat — brings it back; deleting a
+  category now purges its board. Chat search matches PR numbers (`#2140`, `PR 2140`, a PR URL); `+ new` can file the chat
+  in a category.
 - **PR scout** (D29) — while you're on a chat, a per-minute scan links PRs the transcript scraper missed (branch→PR
   via `gh`, plus a gated Haiku read of the conversation).
 - **PR → author agent** (D27) — `loom chats pr <url|#N>` finds the loom chat that wrote a PR (created / pinned /

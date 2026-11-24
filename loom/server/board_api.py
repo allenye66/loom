@@ -60,6 +60,16 @@ def _require_enabled(key: str, cat: dict) -> None:
         )
 
 
+def _require_live(cat: dict) -> None:
+    """An archived category's board is kept but read-only — restore the category (or any one of its chats) first."""
+    if cat.get("archived"):
+        raise HTTPException(
+            409,
+            f'category "{cat["name"]}" is archived, so its board is read-only. Restore the category (or one of its chats) '
+            "to post again.",
+        )
+
+
 def _rate_limited(author: str, target: str) -> bool:
     q = _nudges[(author, target)]
     now = time.monotonic()
@@ -170,6 +180,7 @@ async def _nudge(entry: dict, cat_name: str, targets: list[str], *, wake: bool =
 @router.post("/boards/{key}")
 async def post_to_board(key: str, body: PostIn, x_loom_chat: str | None = Header(None)) -> dict:
     cat = _category(key)
+    _require_live(cat)
     _require_enabled(key, cat)
     author = x_loom_chat or "user"
     # Stored as "user" (the human), not "you": agents read these names, and to an agent "you" is itself.
@@ -217,6 +228,7 @@ def enable_board(key: str, x_loom_chat: str | None = Header(None)) -> dict:
     cat = _category(key)
     if x_loom_chat:
         raise HTTPException(403, "only the user can enable a message board (it's the ▤ on the category in the dashboard)")
+    _require_live(cat)
     out = board.enable(key)
     return {**out, "name": cat["name"]}
 

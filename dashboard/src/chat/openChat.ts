@@ -19,7 +19,7 @@ export const useOpenChat = () => useContext(ChatCtx);
  *  state when nothing is open. */
 /** A task whose worktree is still being created (`+ new`): shown as a placeholder sidebar row and,
  *  while the user hasn't clicked elsewhere, as a loading state in the content pane. */
-export type PendingChat = { id: number; branch: string; agent: AgentId; repo?: string; chatId?: string };
+export type PendingChat = { id: number; branch: string; agent: AgentId; repo?: string; category?: string; chatId?: string };
 
 export type ChatShell = {
   active: ActiveChat | null;

@@ -890,11 +890,13 @@ def _cat_scope(w: _World, project: str | None, all_projects: bool) -> tuple[list
 def categories_ls(
     project: str = typer.Option(None, "--project", "-p"),
     all_projects: bool = typer.Option(False, "--all-projects", "-A"),
+    archived: bool = typer.Option(False, "--archived", "-a", help="include archived categories"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Categories (in sidebar order) with their active / archived chat counts."""
     w = _World()
     cats, proj = _cat_scope(w, project, all_projects)
+    cats = [x for x in cats if archived or not x.get("archived")]
     chats = [c for c in w.loom_chats if proj is None or c.get("repo") == proj]
 
     def counts(cat_id: str | None) -> tuple[int, int]:
@@ -902,14 +904,14 @@ def categories_ls(
         return sum(not c.get("archived") for c in mine), sum(bool(c.get("archived")) for c in mine)
 
     rows = [{"id": None, "name": "Uncategorized", "repo": proj}] + cats
-    data = [{**x, "active": counts(x["id"])[0], "archived": counts(x["id"])[1]} for x in rows]
+    data = [{**x, "active": counts(x["id"])[0], "archived": counts(x["id"])[1], "category_archived": bool(x.get("archived"))} for x in rows]
     if as_json:
         _out_json(data)
         return
     print(f"categories in {proj or 'all projects'}")
     _table(
         ["NAME", "ACTIVE", "ARCHIVED", "ID", "PROJECT"],
-        [[d["name"], str(d["active"]), str(d["archived"]), d["id"] or "-", d.get("repo") or "-"] for d in data],
+        [[d["name"] + (" (archived)" if d["category_archived"] else ""), str(d["active"]), str(d["archived"]), d["id"] or "-", d.get("repo") or "-"] for d in data],
     )
 
 
@@ -928,13 +930,39 @@ def _find_cat(w: _World, ref: str, project: str | None) -> dict:
     return hit or _die(f"no category '{ref}' in {proj or 'any project'}")
 
 
-@categories_app.command("rm")
-def categories_rm(name: str = typer.Argument(...), project: str = typer.Option(None, "--project", "-p")) -> None:
-    """Delete a category — its chats move back to Uncategorized."""
+@categories_app.command("archive")
+def categories_archive(name: str = typer.Argument(...), project: str = typer.Option(None, "--project", "-p")) -> None:
+    """Archive a category: all its active chats are archived (agents stopped) and it leaves the sidebar.
+
+    Reversible — its message board and the chats' assignments are kept. `loom categories restore` brings the
+    whole category back; un-archiving any one of its chats does too."""
     w = _World()
     cat = _find_cat(w, name, project)
-    _api("DELETE", f"/categories/{cat['id']}")
-    print(f"deleted category {cat['name']} (its chats are Uncategorized now)")
+    r = _api("POST", f"/categories/{cat['id']}/archive", timeout=120)
+    n = len(r.get("archived_chats") or [])
+    print(f"archived category {cat['name']} — {n} chat{'s' if n != 1 else ''} archived; its board is kept (restore: loom categories restore \"{cat['name']}\")")
+
+
+@categories_app.command("restore")
+def categories_restore(name: str = typer.Argument(...), project: str = typer.Option(None, "--project", "-p")) -> None:
+    """Restore an archived category and the chats its archive archived (it doesn't start any agent)."""
+    w = _World()
+    cats = [x for x in w.cats["categories"] if x["id"] == name or x["name"].lower() == name.lower()]
+    cat = next((x for x in cats if x.get("archived")), None) or _die(f"no archived category '{name}' (`loom categories ls --archived`)")
+    r = _api("POST", f"/categories/{cat['id']}/restore", timeout=120)
+    n = len(r.get("restored_chats") or [])
+    print(f"restored category {cat['name']} — {n} chat{'s' if n != 1 else ''} un-archived")
+
+
+@categories_app.command("rm")
+def categories_rm(name: str = typer.Argument(...), project: str = typer.Option(None, "--project", "-p")) -> None:
+    """Delete a category FOR GOOD — its chats move back to Uncategorized and its message board (posts included)
+    is deleted. Use `loom categories archive` if you might want it back."""
+    w = _World()
+    cat = _find_cat(w, name, project)
+    r = _api("DELETE", f"/categories/{cat['id']}")
+    posts = r.get("purged_posts") or 0
+    print(f"deleted category {cat['name']} (its chats are Uncategorized now" + (f"; {posts} board post{'s' if posts != 1 else ''} deleted" if posts else "") + ")")
 
 
 @categories_app.command("rename")

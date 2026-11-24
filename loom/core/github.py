@@ -249,6 +249,22 @@ def pr_created_at(keys: list[str]) -> dict[str, float]:
     return {k: cache[k] for k in keys if k in cache}
 
 
+def created_prs_cached(seen: dict, windows: list) -> list[str]:
+    """Like `created_prs`, but never asks GitHub: only what the on-disk createdAt cache already knows (plus
+    Claude's own pr-link records, as the offline fallback). For hot paths — listing / searching hundreds of
+    chats — where a network call per chat is out of the question; a PR not cached yet simply isn't included."""
+    cache = _load_created()
+    out = []
+    for k in sorted(seen, key=lambda k: seen[k][0] or 0):
+        c = cache.get(k)
+        if c is None:
+            if seen[k][1] == "pr-link":
+                out.append(k)
+        elif c and any(s - _SLACK <= c <= e + _SLACK for s, e in windows):
+            out.append(k)
+    return out
+
+
 def created_prs(seen: dict, windows: list) -> list[str]:
     """The "owner/repo#n" keys of PRs the chat itself created, in first-seen order.
 

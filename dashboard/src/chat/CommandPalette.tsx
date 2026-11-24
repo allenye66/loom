@@ -48,18 +48,46 @@ function Highlight({ text, terms }: { text: string; terms: string[] }) {
   return <>{out}</>;
 }
 
+// A term that names a PR — `#2140`, `acme/web#2140`, `pr2140`, a PR URL, or "PR 2140" as two words — matches chats tied to
+// (or that mentioned) exactly that PR number. Mirrors loom/core/sessions.py `_search_terms`, so the sidebar's search
+// (server-side) and ⌘K agree.
+const PR_TERMS = [/github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/, /^(?:[\w.-]+\/[\w.-]+)?#(\d+)$/, /^pr[#:-]?(\d+)$/];
+type Term = { t: string; pr?: number };
+function searchTerms(q: string): Term[] {
+  const raw = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const out: Term[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const t = raw[i];
+    if ((t === 'pr' || t === 'pr:' || t === 'pull') && /^#?\d+$/.test(raw[i + 1] ?? '')) {
+      out.push({ t: raw[i + 1], pr: Number(raw[i + 1].replace('#', '')) });
+      i++;
+      continue;
+    }
+    const m = PR_TERMS.map((rx) => rx.exec(t)).find(Boolean);
+    out.push(m ? { t, pr: Number(m[1]) } : { t });
+  }
+  return out;
+}
+
 /** Every term must appear somewhere; hits in the title outrank the branch/project, which
- *  outrank the body (first prompt, preview, tags…). Returns 0 for no match. */
-function score(c: Chat, terms: string[]): number {
+ *  outrank the body (first prompt, preview, tags…). A PR term needs that exact PR (tied to the chat outranks merely
+ *  mentioned). Returns 0 for no match. */
+function score(c: Chat, terms: Term[]): number {
   if (!terms.length) return 1;
   const title = titleOf(c).toLowerCase();
   const near = `${c.branch ?? ''} ${c.repo ?? ''}`.toLowerCase();
-  const body = [c.title, c.preview, c.first_prompt, c.description, ...(c.tags ?? []), ...(c.prs ?? []), c.pr_manual]
+  const body = [c.title, c.preview, c.first_prompt, c.description, ...(c.tags ?? []), ...(c.prs ?? []), ...(c.pr_mentions ?? []), c.pr_manual]
     .filter((x) => x != null && x !== '')
     .join(' ')
     .toLowerCase();
   let total = 0;
-  for (const t of terms) {
+  for (const { t, pr } of terms) {
+    if (pr !== undefined) {
+      if ((c.prs ?? []).map(Number).includes(pr) || c.pr_manual === pr) total += 6;
+      else if ((c.pr_mentions ?? []).map(Number).includes(pr)) total += 2;
+      else return 0;
+      continue;
+    }
     if (title.startsWith(t)) total += 5;
     else if (title.includes(t)) total += 4;
     else if (near.includes(t)) total += 2;
@@ -126,16 +154,17 @@ function PaletteDialog({ onClose }: { onClose: () => void }) {
   }, [active.data, archived.data, tasks, hiddenRepos]);
   const multiRepo = useMemo(() => new Set(all.map((c) => c.repo)).size > 1, [all]);
 
-  const words = useMemo(() => q.toLowerCase().split(/\s+/).filter(Boolean), [q]);
+  const qTerms = useMemo(() => searchTerms(q), [q]);
+  const words = useMemo(() => qTerms.filter((x) => x.pr === undefined).map((x) => x.t), [qTerms]); // text terms, for highlighting
   const results = useMemo(
     () =>
       all
-        .map((c, i) => ({ c, i, s: score(c, words) }))
+        .map((c, i) => ({ c, i, s: score(c, qTerms) }))
         .filter((r) => r.s > 0)
         // Best match first; ties keep the server's order (starred, then most recent), live before archived.
         .sort((a, b) => b.s - a.s || Number(a.c.archived) - Number(b.c.archived) || a.i - b.i)
         .map((r) => r.c),
-    [all, words],
+    [all, qTerms],
   );
   const shown = results.slice(0, MAX_SHOWN);
 

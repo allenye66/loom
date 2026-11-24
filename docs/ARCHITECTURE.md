@@ -214,7 +214,7 @@ GET  /api/tasks/{id}/logs/kinds · /logs/since · SSE /logs/stream ;  DELETE /lo
 GET  /api/chats ;  GET/PATCH/DELETE /api/chats/{id} ;  POST /api/chats/{id}/restore   (PATCH archived:true also stops the agent, in the background — D22)
 POST /api/chats/{id}/{start,send,close} ;  POST /api/spawn                            (headless control — the harness, D20)
 GET  /api/chats/{id}/settings                                                       (agent + the model / effort it runs on, and its pin)
-GET /api/prs/chats?ref=  (PR → chat, D27) ;  POST /api/chats/{id}/notify · GET /api/inbox · POST /api/inbox/{id}/reply|dismiss · /dismiss-all (D28) ;  POST /api/chats/{id}/pr-scout (D29) ;  POST /api/chats/{id}/event ;  GET /api/events[?since] · /api/events/stream (SSE) ;  GET /api/categories/{id}/pr-conflicts   (diagnostics, D28)
+GET /api/prs/chats?ref=  (PR → chat, D27) ;  POST /api/categories/{id}/archive|restore · DELETE /api/categories/{id} (purges the board) (D30) ;  POST /api/tasks {category?} ;  POST /api/chats/{id}/notify · GET /api/inbox · POST /api/inbox/{id}/reply|dismiss · /dismiss-all (D28) ;  POST /api/chats/{id}/pr-scout (D29) ;  POST /api/chats/{id}/event ;  GET /api/events[?since] · /api/events/stream (SSE) ;  GET /api/categories/{id}/pr-conflicts   (diagnostics, D28)
 GET /api/boards ;  GET/POST /api/boards/{category_id} ;  GET /api/boards/{id}/wait ;  POST /api/boards/{id}/seen   (D22, `server/board_api.py`)
 GET  /api/chats/{id}/workspace ;  POST /api/chats/{id}/prompt-context                  (category roster / the UserPromptSubmit hook, D22)
 GET/POST /api/categories ;  PATCH/DELETE /api/categories/{id} ;  PUT /api/categories-{order,assign} ;  POST /api/categories-import

@@ -127,6 +127,8 @@ def compute_all() -> dict[str, dict]:
     raw = {s["id"]: s for s in sessions.build_index()}
     out: dict[str, dict] = {}
     for cat in state["categories"]:
+        if cat.get("archived"):
+            continue
         members = [c for c in chats if c.get("category") == cat["id"] and not c.get("archived")]
         if len(members) >= 2:
             out[cat["id"]] = _compute_category(cat, members, tasks, raw)

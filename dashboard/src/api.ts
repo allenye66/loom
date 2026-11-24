@@ -105,7 +105,7 @@ export function useTaskActions() {
   const invTasks = () => qc.invalidateQueries({ queryKey: ['tasks'] });
   return {
     create: useMutation({
-      mutationFn: (b: { repo_root: string; branch: string; base_branch?: string; agent?: AgentId }) =>
+      mutationFn: (b: { repo_root: string; branch: string; base_branch?: string; agent?: AgentId; category?: string }) =>
         jsend<Task>('/tasks', 'POST', b),
       onSuccess: invTasks,
     }),
@@ -176,6 +176,7 @@ export type Chat = {
   prs: (number | string)[];
   pr_repo?: string | null;
   pr_manual?: number | null;
+  pr_mentions?: number[]; // PRs the agent only mentioned (search finds them, ranked below PRs the chat is tied to)
   created?: string | null;
   last_active: number;
   n_user: number;
@@ -279,7 +280,7 @@ type ChatPatch = Partial<Pick<Chat,'starred' | 'archived' | 'hidden' | 'muted' |
 
 /** Move a chat between the cached active / archived lists right away (the sidebar's rows
  *  disappear the instant you click, not when the server answers). Returns what it overwrote. */
-function moveChatInCache(qc: QueryClient, id: string, archived: boolean) {
+export function moveChatInCache(qc: QueryClient, id: string, archived: boolean) {
   const lists = qc.getQueriesData<Chat[]>({ queryKey: ['chats'] });
   const chat = lists.flatMap(([, l]) => (Array.isArray(l) ? l : [])).find((c) => c.id === id);
   for (const [key, list] of lists) {

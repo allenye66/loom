@@ -531,6 +531,34 @@ run by the dashboard every minute **while you're on a chat** (`chat/usePrScout.t
 Found PRs are stored as `prs_scouted` and show as ordinary chips ("found by loom's PR scout"); × removes one for good.
 They also count as evidence for `loom chats pr` (D27) and the conflict awareness above.
 
+## D30 — Archive a category (reversible), delete purges its board; PR-number search; create a chat in a category (2026-11-24)
+- **Deleting a category used to strand its board.** `categories.remove` only dropped the record and the assignments;
+  the posts / cursors / enabled flag in `loom.db` (keyed by the category id) stayed as unreachable orphans, and
+  re-creating a category of the same name gets a new id, so they never came back. Now `DELETE /categories/{id}` purges
+  the board (`board.purge`) and reports `purged_posts`; the dashboard's confirm names the post count and points to archive.
+- **Archive a category** (`POST /categories/{id}/archive`, `loom categories archive`, the ⊘ on its header): every active
+  chat in it is archived the normal way (agents stopped, ports freed, in the background) and the category is flagged
+  `archived` with the list of chats *that archive* archived (`archived_with`). The category record keeps its id, so the
+  **board (posts, enabled flag, unread cursors) and every chat's assignment survive untouched**. The confirm says how many
+  chats / running agents it affects and that the board is kept; a toast offers **undo**.
+  Archived categories show in the Archived tab as groups ("archived", with ↺). An archived category's board is read-only
+  (409 on post/enable) and it's skipped by the PR-conflict check.
+- **Restore:** ↺ on the group (`loom categories restore`) un-archives exactly the chats its archive archived — not ones
+  archived on purpose earlier. Un-archiving **any one chat** of an archived category restores the category too (hook in
+  `PATCH /chats/{id}`): it reappears with just that chat active, its siblings stay archived inside it, the board is writable
+  again, and the roster/unread posts reach the agent through the usual per-message context. Un-archiving never starts an agent.
+- **Search by PR number.** Two bugs: the haystack only held Claude's own `pr-link` numbers (not PRs found by the transcript
+  scraper, pinned, or scouted), and the query was matched as one literal string, so `#2140` / `PR 2140` / a PR URL never matched
+  the bare number. Now each row's `prs` = pr-link ∪ created (as far as the on-disk createdAt cache knows — never a network call)
+  ∪ scouted ∪ pinned − removed, plus `pr_mentions` (PRs the agent only saw); search is term-wise AND, and a PR term (`#N`,
+  `owner/repo#N`, `prN`, a PR URL, "PR N") must be exactly that PR. ⌘K applies the same rules (tied outranks mentioned).
+- **Create a chat in a category.** `POST /tasks` takes an optional `category` (id or name in the task's project; unknown /
+  archived / another project's → 400 before anything is created), and the dashboard's `+ new` form has a category select
+  (the ＋ on a category's header preselects it). Filed at creation, so it never flashes in Uncategorized.
+- **Categories remain server-side** (`~/.loom/categories.json`, written by the server; the browser's old localStorage copy
+  is only a one-time import). Moving them into SQLite was considered and not done: no behaviour change, some migration risk
+  for the data that organises every chat. The one real argument for it is atomicity with boards (delete/archive touch both stores).
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

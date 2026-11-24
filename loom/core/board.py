@@ -141,6 +141,18 @@ def addressed_to(post: dict, reader: str) -> bool:
     return reader in (post.get("to") or [])
 
 
+def purge(key: str) -> int:
+    """Delete everything a board holds — posts, readers' cursors, the enabled flag. Returns how many posts
+    went. Used when its category is deleted (an archived category keeps its board)."""
+    key = _key(key)
+    with db.connect() as con:
+        n = int(con.execute("SELECT COUNT(*) AS n FROM board_posts WHERE board = ?", (key,)).fetchone()["n"])
+        con.execute("DELETE FROM board_posts WHERE board = ?", (key,))
+        con.execute("DELETE FROM board_cursors WHERE board = ?", (key,))
+        con.execute("DELETE FROM board_settings WHERE board = ?", (key,))
+    return n
+
+
 def summary(key: str, reader: str | None = None) -> dict:
     with db.connect() as con:
         r = con.execute("SELECT COUNT(*) AS n, COALESCE(MAX(seq),0) AS s, MAX(ts) AS t FROM board_posts WHERE board = ?", (_key(key),)).fetchone()

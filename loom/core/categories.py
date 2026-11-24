@@ -10,6 +10,11 @@ Shape (same as the old localStorage value, so the import is a straight merge):
 Each category belongs to one project (`repo`, a registered repo name); categories made before
 projects existed may have none until the sidebar files them. A chat in no category is
 "Uncategorized".
+
+A category can be **archived** (reversible, unlike `remove`): `archived: true`, when (`archived_at`) and which
+chats the archive itself archived (`archived_with` — so "restore the category" revives exactly those and not
+chats archived on purpose earlier). The category record keeps its id, so its message board (keyed by that id)
+and every chat's assignment survive untouched. Restoring any one member chat restores the category too.
 """
 
 from __future__ import annotations
@@ -33,8 +38,17 @@ def _read() -> dict:
         raw = json.loads(CATEGORIES_PATH.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         raw = {}
+    def clean(c: dict) -> dict:
+        out = {"id": c["id"], "name": c["name"], **({"repo": c["repo"]} if isinstance(c.get("repo"), str) else {})}
+        if c.get("archived") is True:
+            out["archived"] = True
+            if isinstance(c.get("archived_at"), (int, float)):
+                out["archived_at"] = c["archived_at"]
+            out["archived_with"] = [x for x in (c.get("archived_with") or []) if isinstance(x, str)]
+        return out
+
     cats = [
-        {"id": c["id"], "name": c["name"], **({"repo": c["repo"]} if isinstance(c.get("repo"), str) else {})}
+        clean(c)
         for c in (raw.get("categories") or [])
         if isinstance(c, dict) and isinstance(c.get("id"), str) and isinstance(c.get("name"), str)
     ]
@@ -117,6 +131,35 @@ def update(cat_id: str, *, name: str | None = None, repo: str | None = None) -> 
             cat["repo"] = repo
         _write(state)
         return cat
+
+
+def archive(cat_id: str, chat_ids: list[str]) -> dict:
+    """Mark a category archived, remembering the chats the archive archived. Assignments are kept."""
+    with _lock:
+        state = _read()
+        cat = next((c for c in state["categories"] if c["id"] == cat_id), None)
+        if cat is None:
+            raise KeyError(cat_id)
+        cat["archived"] = True
+        cat["archived_at"] = time.time()
+        cat["archived_with"] = list(dict.fromkeys(chat_ids))
+        _write(state)
+        return dict(cat)
+
+
+def restore(cat_id: str) -> list[str]:
+    """Un-archive a category; returns the chats its archive had archived (the caller revives them).
+    A no-op (empty list) if it isn't archived."""
+    with _lock:
+        state = _read()
+        cat = next((c for c in state["categories"] if c["id"] == cat_id), None)
+        if cat is None:
+            raise KeyError(cat_id)
+        with_ids = list(cat.get("archived_with") or [])
+        for k in ("archived", "archived_at", "archived_with"):
+            cat.pop(k, None)
+        _write(state)
+        return with_ids
 
 
 def remove(cat_id: str) -> None:
