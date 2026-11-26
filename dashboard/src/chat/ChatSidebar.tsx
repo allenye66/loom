@@ -582,7 +582,9 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
   // Stable, user-controlled order: each chat keeps its saved slot; brand-new chats sit at the
   // top until persisted. While searching, show matches in the query's order instead.
   const byId = new Map(rows.map((r) => [r.id, r]));
-  const orderedRows: Row[] = q
+  // The Archived tab is by archive date (the server's order: starred first, then most recently archived) — a chat's saved
+  // slot from when it was active must not override that.
+  const orderedRows: Row[] = q || tab === 'archived'
     ? rows
     : [
         ...rows.filter((r) => !order.includes(r.id)),

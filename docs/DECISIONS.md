@@ -547,6 +547,7 @@ They also count as evidence for `loom chats pr` (D27) and the conflict awareness
   archived on purpose earlier. Un-archiving **any one chat** of an archived category restores the category too (hook in
   `PATCH /chats/{id}`): it reappears with just that chat active, its siblings stay archived inside it, the board is writable
   again, and the roster/unread posts reach the agent through the usual per-message context. Un-archiving never starts an agent.
+- **Archived tab order (11-26 fix).** The server already sorted it by archive date (`archived_at`, most recent first; starred on top; chats archived before the stamp existed fall back to last activity), but the sidebar then re-sorted every tab by the saved manual slot order, so a chat kept its old position and the Archived tab wasn't by date. The Archived tab now uses the server's order (drag-reorder only applies to the active list). Within a category group the same order applies; groups themselves stay in category order.
 - **Search by PR number.** Two bugs: the haystack only held Claude's own `pr-link` numbers (not PRs found by the transcript
   scraper, pinned, or scouted), and the query was matched as one literal string, so `#2140` / `PR 2140` / a PR URL never matched
   the bare number. Now each row's `prs` = pr-link ∪ created (as far as the on-disk createdAt cache knows — never a network call)
