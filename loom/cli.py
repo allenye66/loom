@@ -29,6 +29,7 @@ app.add_typer(harness.board_app, name="board")
 app.command("whoami")(harness.whoami)
 app.command("projects")(harness.projects)
 app.command("notify")(harness.notify)
+app.command("find-pr")(harness.find_pr)
 
 
 @app.command()

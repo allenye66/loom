@@ -818,6 +818,54 @@ def notify(
           "Now end your turn with the question — their reply arrives as your next message.")
 
 
+def find_pr(
+    description: str = typer.Argument(..., help="what you remember about the PR — what it did, roughly when, anything"),
+    days: int = typer.Option(None, "--days", "-d", help="look this far back (default: what the description implies, else 45)"),
+    project: str = typer.Option(None, "--project", "-p", help="only this project"),
+    refine: list[str] = typer.Option([], "--refine", "-r", help="an extra detail to narrow it down (repeatable)"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Find one of the user's PRs — and the chat (even archived) that wrote it — from a loose description.
+
+    A cheap Haiku pass over the user's PRs on GitHub and loom's chats: "added a new export button on the billing page last
+    week". Prints the likeliest matches with a confidence and why, and a question that would narrow it down (answer it
+    with --refine). Takes ~10-20 s."""
+    r = _api("POST", "/find-pr", body={"query": description, "history": refine, "days": days, "project": project})
+    jid, deadline, last = r["job"], time.time() + 150, ""
+    while time.time() < deadline:
+        j = _api("GET", f"/find-pr/{jid}")
+        if j["phase"] != last and not j["done"] and not as_json:
+            last = j["phase"]
+            print(f"  … {last}", file=sys.stderr, flush=True)
+        if j["done"]:
+            break
+        time.sleep(1.5)
+    else:
+        _die("the search is still running — try again in a moment")
+    if j.get("error"):
+        _die(j["error"])
+    res = j["result"]
+    if as_json:
+        _out_json(res)
+        return
+    s = res["searched"]
+    print(f"searched {s['prs']} PRs and {s['chats']} chats ({', '.join(s['repos']) or 'no GitHub repo'}) since {s['since']}")
+    for n in res.get("notes") or []:
+        print(f"  note: {n}")
+    if not res["suggestions"]:
+        print("no match — try --days 90, or describe it differently")
+        return
+    for i, x in enumerate(res["suggestions"], 1):
+        pr = x.get("pr")
+        head = f'PR {pr.get("key") or "#" + str(pr["number"])} "{pr.get("title")}"' if pr else "(no PR linked)"
+        print(f"\n{i}. [{x['confidence']}] {head}" + (f"  {pr.get('state')} {_clip(str(pr.get('url') or ''), 70)}" if pr else ""))
+        for c in x.get("chats") or []:
+            print(f"   chat: \"{_clip(c['name'], 60)}\" ({'archived' if c['archived'] else 'active'}) → loom chats show {c['id'][:8]}")
+        print(f"   why: {x['why']}")
+    if res.get("narrow_down"):
+        print(f"\nto narrow it down: {res['narrow_down']}   (answer with --refine \"…\")")
+
+
 def whoami(as_json: bool = typer.Option(False, "--json")) -> None:
     """Which loom chat this shell is (project, category, branch, worktree, status)."""
     sid = _self_id()

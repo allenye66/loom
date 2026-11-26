@@ -30,6 +30,7 @@ from loom.core import (
     categories,
     claude_session,
     doctor,
+    findpr,
     github,
     manager,
     monitor,
@@ -1019,6 +1020,29 @@ def chat_prs(sid: str) -> dict:
         repo, _, n = key.rpartition("#")
         out.append({**github.pr_status(repo, int(n)), "source": source})
     return {"branch": chat.get("branch"), "prs": out}
+
+
+class FindPrIn(BaseModel):
+    query: str
+    history: list[str] = []  # refinements typed after the first description
+    days: int | None = None  # look this far back (default: what the description implies, else 45 days)
+    project: str | None = None  # limit to one project
+
+
+@router.post("/find-pr")
+def find_pr_start(body: FindPrIn) -> dict:
+    """Find a PR (and the chat that wrote it) from a loose description — a background job; poll /find-pr/{job}. D31."""
+    if not body.query.strip():
+        raise HTTPException(400, "describe the PR you're looking for")
+    return {"job": findpr.start(body.query, body.history, body.days, body.project)}
+
+
+@router.get("/find-pr/{job}")
+def find_pr_poll(job: str) -> dict:
+    j = findpr.get(job)
+    if j is None:
+        raise HTTPException(404, "unknown or expired search")
+    return {"phase": j["phase"], "done": j["done"], "error": j["error"], "result": j["result"]}
 
 
 @router.get("/prs/chats")

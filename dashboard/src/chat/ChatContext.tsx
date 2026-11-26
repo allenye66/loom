@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { NotesModal } from '../notes/NotesModal';
+import { FindPrModal } from '../findpr/FindPrModal';
 import { ChatCtx, ChatShellCtx, type ActiveChat, type ChatShell, type PendingChat } from './openChat';
 
 export { useOpenChat } from './openChat';
@@ -99,6 +100,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         {/* Global "all chat notes" modal — mounted here so it can reach useOpenChat and float
             above the shell. Reads its own open-state; renders null when closed. */}
         <NotesModal />
+        <FindPrModal />
       </ChatShellCtx.Provider>
     </ChatCtx.Provider>
   );

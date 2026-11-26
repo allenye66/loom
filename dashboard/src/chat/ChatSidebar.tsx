@@ -7,6 +7,7 @@ import { BoardButton } from '../board/BoardButtons';
 import { MuteButton } from '../notify/mute';
 import { NotifyBell } from '../notify/inbox';
 import { NotesButton } from '../notes/NotesButton';
+import { openFindPr } from '../findpr/findPrStore';
 import { setActiveProjectName } from './activeProject';
 import {
   addCategory,
@@ -1285,7 +1286,14 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
         })}
       </div>
 
-      <div className="border-t border-edge p-2 shrink-0">
+      <div className="border-t border-edge p-2 shrink-0 flex flex-col gap-1.5">
+        <button
+          onClick={openFindPr}
+          title="find a PR (and the chat that wrote it) by describing it — Haiku searches your PRs and chats, archived ones too"
+          className="w-full text-[11px] mono px-2 py-1.5 rounded border border-edge text-muted hover:text-ink inline-flex items-center justify-center gap-1.5"
+        >
+          ⌕ find a PR
+        </button>
         <NotesButton
           label="✎ all notes"
           className="w-full text-[11px] mono px-2 py-1.5 rounded border border-edge text-muted hover:text-ink inline-flex items-center justify-center gap-1.5"

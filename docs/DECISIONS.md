@@ -559,6 +559,28 @@ They also count as evidence for `loom chats pr` (D27) and the conflict awareness
   is only a one-time import). Moving them into SQLite was considered and not done: no behaviour change, some migration risk
   for the data that organises every chat. The one real argument for it is atomicity with boards (delete/archive touch both stores).
 
+## D31 — Find a PR by describing it (2026-11-25)
+Want: with hundreds of PRs a week and chats archived afterwards, reference "the PR where I added that button last week"
+without scrolling GitHub or searching chats. `core/findpr.py`, `POST /api/find-pr` (a background job; poll `GET
+/api/find-pr/{job}` for phase + result), the sidebar's "⌕ find a PR" modal, `loom find-pr "<description>"`.
+- **Stages** (deterministic wherever possible; ≈3 small Haiku calls, ~10–20 s, ~a cent): (1) *understand* — the description →
+  keywords, synonyms and a date range ("last week" → dates); (2) *retrieve* (no model) — the user's PRs from GitHub in that
+  window (`gh pr list --author @me`, one per project repo; when the window overflows a page, keyword searches top it up; cached
+  5 min so refinements are instant) and loom's chats **including archived** active in the window; PRs and chats are linked by the
+  evidence loom already has (PR numbers in the chat, its branch), and each side is pre-scored on the keywords locally; (3) *rank* —
+  Haiku over ≤60 PRs + ≤30 chats, one compact line each; (4) *verify* — for the top few, the PR's changed files + fuller
+  description (and, for a chat with no PR linked, the PRs on its branch) → final suggestions with a confidence, a one-line why that
+  cites evidence, and one question that would narrow it down.
+- **Privacy/cost:** only titles, first prompts, cached brief goals, branch names, PR text and changed paths go to the model — never
+  transcripts. Empty window → widened once (×3) and says so. If Haiku fails, it falls back to the local keyword ranking and says so.
+- **UI:** describe it, optional look-back (auto / 7 / 30 / 90 days / 1 year) and scope (all projects / this one); results show the
+  PR, state, date, size, confidence, why, the chat that wrote it (active/archived; "open chat" resumes an archived one), "open PR",
+  and "copy reference" (a one-line PR + link + chat to paste into another ask). Answer the narrowing question — or add any detail — to
+  refine (the whole conversation is re-sent). Verified with real Haiku on a corpus with distractors (a print button on the same
+  page, an older export button, a crash fix): the right PR first each time.
+- Limits: PRs are the user's own (`--author @me`) in projects whose repo `gh` can see; a PR older than the window is only found by a
+  wider look-back; a chat with no PR linked is suggested on its own text (and its branch's PR, if one exists).
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).
