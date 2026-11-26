@@ -40,6 +40,7 @@ from pathlib import Path
 
 from loom.core import agents
 from loom.core import events as events_mod
+from loom.core.draft import DraftTracker
 from loom.core import sessions as sessions_mod
 from loom.core.config import LOGS_DIR, LOOM_HOME
 from loom.core.pty_server import (
@@ -210,6 +211,7 @@ class _SessionBase:
         self._typed = False
         self.clear_needs_on_typing = False
         self.last_input = 0.0  # monotonic time of the last input written (keystrokes or loom's own)
+        self.draft = DraftTracker()  # is there unsent text in the input box? (core/draft.py — the sidebar's draft marker)
         # First message for a brand-new session, passed as the CLI's startup prompt (headless
         # spawn — see start_chat). Consumed by the launch; never reused on a relaunch.
         self.initial_prompt: str | None = None
@@ -391,6 +393,8 @@ class _SessionBase:
         if self._write_fd() is None or not data:
             return
         self.last_input = time.monotonic()
+        with contextlib.suppress(Exception):  # a status hint must never break typing
+            self.draft.feed(data)
         data = self._guard_input(data)
         if self._typed:
             self._typed = False
@@ -987,6 +991,9 @@ def list_active(detached: bool = False) -> list[dict]:
             "waiting_on": waiting_on(ts),
             "turn": (turns.get(ts.chat_id) or {}).get("turn"),
             "turn_since": (turns.get(ts.chat_id) or {}).get("since"),
+            "draft": ts.draft.active,  # unsent text sitting in the input box
+            "draft_since": ts.draft.since or None,
+            "draft_preview": ts.draft.preview() if ts.draft.active else "",
         })
     if detached:
         seen = {d["chat_id"] for d in out}

@@ -581,6 +581,17 @@ without scrolling GitHub or searching chats. `core/findpr.py`, `POST /api/find-p
 - Limits: PRs are the user's own (`--author @me`) in projects whose repo `gh` can see; a PR older than the window is only found by a
   wider look-back; a chat with no PR linked is suggested on its own text (and its branch's PR, if one exists).
 
+## D32 — Unsent-draft marker in the sidebar (2026-11-25)
+Want: if you start typing in a chat and switch away, see that there's an unsent message waiting. loom already forwards every byte into every
+agent's terminal (browser keystrokes, pastes, its own `loom chats send`), so `core/draft.py` (`DraftTracker`, pure, unit-tested) keeps a running
+picture of the input box without scraping the screen: printable characters grow it, Backspace / Ctrl+W / Alt+Backspace shrink it, Enter outside a
+paste, Ctrl+C and Ctrl+U clear it, and escape sequences (arrow keys, mouse and focus reports, paste markers, Alt+key) are skipped whole — so editing
+with the arrow keys doesn't lose the draft and a multi-line paste counts. It counts characters (UTF-8 aware) rather than reconstructing the line,
+which is why it's separate from the `/clear` guard's line tracker (that one gives up on cursor keys).
+Each terminal session owns a tracker; `/api/terminals` gains `draft`, `draft_since`, `draft_preview`; a sidebar row shows a pencil icon (tooltip: the
+draft's end and when it started) for a chat that has one — not the chat you're in. Blind spots: a loom restart forgets a draft still in the box; history
+recall (↑) isn't counted; text-killing shortcuts it doesn't model (Ctrl+K) can leave a stale marker until the next Enter.
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

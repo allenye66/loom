@@ -56,3 +56,13 @@ export function EyeOffIcon({ size = 13, className }: IconProps) {
     </svg>
   );
 }
+
+/** A pencil — "there's text you started typing here". */
+export function PencilIcon({ size = 12, className }: IconProps) {
+  return (
+    <svg {...base(size, className)}>
+      <path d="M2.5 13.5l.7-3L10.6 3.1a1.4 1.4 0 0 1 2 0l.3.3a1.4 1.4 0 0 1 0 2L5.5 12.8l-3 .7z" />
+      <path d="M9.4 4.3l2.3 2.3" />
+    </svg>
+  );
+}

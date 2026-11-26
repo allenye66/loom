@@ -127,6 +127,8 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 - **Find a PR** (D31) — the sidebar's "⌕ find a PR" (or `loom find-pr "<description>"`): describe a PR you made (what it did,
   roughly when) and Haiku searches your PRs on GitHub and loom's chats — archived too — returning suggestions with a confidence, why,
   the chat that wrote each, and a question to narrow it down; refine until it's the one.
+- **Draft marker** (D32) — a pencil on a sidebar row when that chat's input box holds text you typed but didn't send (tooltip shows it); tracked
+  server-side from the bytes loom forwards, so it works for chats you've switched away from.
 - **PR scout** (D29) — while you're on a chat, a per-minute scan links PRs the transcript scraper missed (branch→PR
   via `gh`, plus a gated Haiku read of the conversation).
 - **PR → author agent** (D27) — `loom chats pr <url|#N>` finds the loom chat that wrote a PR (created / pinned /

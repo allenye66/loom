@@ -39,7 +39,7 @@ import {
 import { AgentIcon } from '../components/AgentIcon';
 import { Spinner } from '../components/Spinner';
 import { toast, toastAction } from '../ui/toast';
-import { EyeIcon, EyeOffIcon } from '../ui/icons';
+import { EyeIcon, EyeOffIcon, PencilIcon } from '../ui/icons';
 
 // The sidebar's active/archived tab — module-level so it survives the overlay remount that
 // opening a chat triggers (otherwise clicking a chat would snap the tab back to 'active').
@@ -82,6 +82,10 @@ const saveCollapsed = (s: Set<string>) => {
   }
 };
 // The project (registered repo) the sidebar shows — remembered across reloads (localStorage).
+const draftAgo = (since: number) => {
+  const s = Math.max(0, Date.now() / 1000 - since);
+  return s < 90 ? 'just now' : s < 3600 ? `${Math.round(s / 60)}m ago` : s < 86400 ? `${Math.round(s / 3600)}h ago` : `${Math.round(s / 86400)}d ago`;
+};
 const PROJECT_KEY = 'loom.activeProject';
 const loadProject = (): string | null => {
   try {
@@ -518,7 +522,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     queryFn: () =>
       fetch('/api/terminals')
         .then((r) => r.json())
-        .then((d) => d.terminals as { chat_id: string; idle_sec: number; needs: boolean }[]),
+        .then((d) => d.terminals as { chat_id: string; idle_sec: number; needs: boolean; draft?: boolean; draft_since?: number | null; draft_preview?: string }[]),
     refetchInterval: 2000,
   });
   const termById = new Map((termData ?? []).map((t) => [t.chat_id, t]));
@@ -836,6 +840,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     const t = termById.get(r.id); // live terminal activity (undefined = not running this loom session)
     const working = t != null && t.idle_sec < WORKING_WITHIN_S; // recent output → agent is working
     const needs = t != null && t.needs && !working && r.id !== activeSid; // hook flagged a wait, quiet, not the chat you're viewing
+    const draft = !!t?.draft && r.id !== activeSid; // unsent text left in this chat's input box (you're not in it now)
     return (
       <div
         key={r.id}
@@ -900,6 +905,14 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
             className="text-xs text-ink truncate flex-1"
           >
             {r.title}
+          </span>
+        )}
+        {draft && (
+          <span
+            title={`unsent draft${t?.draft_preview ? `: “${t.draft_preview}”` : ''}${t?.draft_since ? ` · started ${draftAgo(t.draft_since)}` : ''} — open the chat to finish or send it`}
+            className="text-accent shrink-0 inline-flex items-center"
+          >
+            <PencilIcon size={11} />
           </span>
         )}
         {r.agent && (
