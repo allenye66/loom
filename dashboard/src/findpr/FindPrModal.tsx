@@ -1,17 +1,35 @@
 import { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useOpenChat } from '../chat/openChat';
 import { useActiveProjectName } from '../chat/activeProject';
 import { Spinner } from '../components/Spinner';
 import { toast } from '../ui/toast';
 import { closeFindPr, useFindPrOpen } from './findPrStore';
 
-/** "Find a PR": describe a PR you made — what it did, roughly when — and Haiku searches your PRs on GitHub and loom's
- *  chats (archived too) for it (core/findpr.py, D31). Suggestions come with a confidence and why, the chat that wrote
- *  each one, and a question that would narrow it down; answer it (or add any detail) to refine. */
-type Chat = { id: string; name: string; archived: boolean; project?: string | null; branch?: string | null; cwd?: string | null; agent?: 'claude' | 'codex' | 'grok' | null; mode?: 'chat' | 'terminal' | null };
+/** "Find a session": describe work you did — what it did, roughly when — and Haiku searches an index of your sessions (summaries, commits,
+ *  files, and quoted log excerpts) plus your PRs on GitHub (core/findpr.py + core/sessindex.py, D31/D33). Suggestions come with a confidence and
+ *  why, the session's own summary, the PR it made, and a question that would narrow it down; answer it (or add any detail) to refine. */
+type Snippet = { ts?: string | null; role?: string | null; text: string };
+type Chat = {
+  id: string;
+  name: string;
+  archived: boolean;
+  project?: string | null;
+  branch?: string | null;
+  last_active?: number | null;
+  cwd?: string | null;
+  agent?: 'claude' | 'codex' | 'grok' | null;
+  mode?: 'chat' | 'terminal' | null;
+  indexed?: boolean;
+  goal?: string;
+  summary?: string;
+  keywords?: string[];
+  snippets?: Snippet[];
+};
+type IndexStatus = { enabled: boolean; paused: boolean; total: number; indexed: number; summarized: number; today: number; cap: number; running?: string | null; cost_usd: number; backoff: boolean; last_error?: string };
 type PrInfo = { key?: string | null; repo?: string; number: number; title?: string | null; url?: string | null; state?: string | null; branch?: string | null; created?: number | null; merged?: number | null; additions?: number | null; deletions?: number | null; files?: number | null };
 type Suggestion = { kind: 'pr' | 'chat'; confidence: 'high' | 'medium' | 'low'; why: string; pr: PrInfo | null; chats: Chat[]; id: string };
-type Result = { suggestions: Suggestion[]; narrow_down: string; searched: { prs: number; chats: number; repos: string[]; since: string; until: string | null; widened: boolean }; notes: string[] };
+type Result = { suggestions: Suggestion[]; narrow_down: string; searched: { prs: number; chats: number; repos: string[]; since: string; until: string | null; widened: boolean; index?: { total: number; indexed: number; summarized: number; hits: number } }; notes: string[] };
 
 const CONF: Record<Suggestion['confidence'], string> = {
   high: 'border-ok/50 text-ok bg-ok/10',
@@ -34,6 +52,17 @@ export function FindPrModal() {
   const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState<string | null>(null);
   const run = useRef(0); // search generation: a stale poll must not overwrite a newer search
+  const qc = useQueryClient();
+  const { data: ix } = useQuery({
+    queryKey: ['index-status'],
+    queryFn: () => fetch('/api/index/status').then((r) => r.json()) as Promise<IndexStatus>,
+    enabled: open,
+    refetchInterval: 8000,
+  });
+  const togglePause = async () => {
+    await fetch(`/api/index/${ix?.paused ? 'resume' : 'pause'}`, { method: 'POST' });
+    qc.invalidateQueries({ queryKey: ['index-status'] });
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -105,7 +134,7 @@ export function FindPrModal() {
     <div className="fixed inset-0 z-[60] flex items-start justify-center bg-black/50 backdrop-blur-sm p-4 sm:p-10" onClick={closeFindPr}>
       <div className="w-full max-w-3xl max-h-full flex flex-col rounded-xl border border-edge bg-surface shadow-2xl" onClick={(e) => e.stopPropagation()}>
         <div className="px-4 py-3 flex items-center gap-2.5 border-b border-edge shrink-0">
-          <span className="text-sm font-semibold">Find a PR</span>
+          <span className="text-sm font-semibold">Find a session</span>
           <span className="text-[11px] mono text-muted">describe it — what it did, roughly when</span>
           <div className="flex-1" />
           <button onClick={closeFindPr} className="text-muted hover:text-ink text-lg leading-none px-1" aria-label="close">
@@ -125,7 +154,7 @@ export function FindPrModal() {
                 go();
               }
             }}
-            placeholder="e.g. “in this PR I added a new export button on the billing page sometime last week”"
+            placeholder="e.g. “the session where we added a CSV export button to the billing page last week” — or describe the PR"
             className="w-full resize-none text-[13px] px-3 py-2 rounded bg-canvas border border-edge outline-none focus:border-accent"
           />
           <div className="flex items-center gap-2 flex-wrap text-[10px] mono">
@@ -170,7 +199,7 @@ export function FindPrModal() {
           {error && <div className="text-[12px] text-bad px-1">{error}</div>}
           {!phase && !result && !error && (
             <div className="text-center text-muted py-8 text-[12px] leading-relaxed">
-              Haiku reads your PRs on GitHub and loom’s chats — archived ones too — and suggests where it is.
+              Haiku searches an index of your sessions — summaries, commits, files, quoted logs; archived chats too — plus your PRs on GitHub.
               <br />
               The more you remember (the feature, the page, roughly when), the better. About 10–20 seconds.
             </div>
@@ -181,7 +210,7 @@ export function FindPrModal() {
                 <div className="flex items-start gap-2">
                   <span className={`text-[10px] mono px-1.5 py-0.5 rounded border shrink-0 mt-0.5 ${CONF[s.confidence]}`}>{s.confidence}</span>
                   <div className="min-w-0 flex-1">
-                    <div className="text-[13px] text-ink font-medium break-words">{s.pr?.title ?? 'a chat with no PR linked'}</div>
+                    <div className="text-[13px] text-ink font-medium break-words">{s.pr?.title ?? s.chats[0]?.goal ?? s.chats[0]?.name ?? 'a session with no PR linked'}</div>
                     <div className="text-[10px] mono text-muted mt-0.5 flex flex-wrap gap-x-2">
                       {s.pr && <span>{s.pr.key ?? `#${s.pr.number}`}</span>}
                       {s.pr?.state && <span>{s.pr.state}</span>}
@@ -198,7 +227,7 @@ export function FindPrModal() {
                 <div className="text-[12px] text-ink/85 mt-2 break-words">{s.why}</div>
                 {s.chats.map((c) => (
                   <div key={c.id} className="mt-2 flex items-center gap-2 text-[11px]">
-                    <span className="text-muted shrink-0">chat</span>
+                    <span className="text-muted shrink-0">session</span>
                     <span className="text-ink truncate">{c.name}</span>
                     <span className={`text-[10px] mono px-1.5 py-0.5 rounded border shrink-0 ${c.archived ? 'border-edge text-muted' : 'border-ok/40 text-ok'}`}>{c.archived ? 'archived' : 'active'}</span>
                     {c.project && <span className="text-[10px] mono text-muted shrink-0">{c.project}</span>}
@@ -206,6 +235,17 @@ export function FindPrModal() {
                     <button onClick={() => goChat(c)} title={c.archived ? 'this chat is archived — opening it resumes it' : 'open this chat'} className="text-[11px] px-2 py-1 rounded border border-edge text-accent hover:bg-accent/10 shrink-0">
                       open chat →
                     </button>
+                  </div>
+                ))}
+                {s.chats.slice(0, 1).map((c) => (
+                  <div key={'d' + c.id} className="mt-1.5 flex flex-col gap-1">
+                    {c.summary && <div className="text-[11px] text-muted leading-snug break-words">{c.summary}</div>}
+                    {c.snippets?.[0] && (
+                      <div className="text-[11px] text-muted/80 border-l-2 border-edge pl-2 leading-snug break-words italic">
+                        “{c.snippets[0].text}”{c.snippets[0].ts ? <span className="not-italic mono text-[10px] ml-1.5">{String(c.snippets[0].ts).slice(0, 10)}</span> : null}
+                      </div>
+                    )}
+                    {!c.indexed && c.id && <div className="text-[10px] mono text-muted/60">not summarized yet — matched on its title, first prompt, commits and files</div>}
                   </div>
                 ))}
                 <div className="mt-2.5 flex items-center gap-2">
@@ -250,7 +290,7 @@ export function FindPrModal() {
               </button>
             </div>
             <div className="text-[10px] mono text-muted/70">
-              searched {result.searched.prs} PRs · {result.searched.chats} chats · {result.searched.repos.join(', ') || 'no GitHub repo'} · since {result.searched.since}
+              searched {result.searched.index?.hits ?? 0} index hits · {result.searched.prs} PRs · {result.searched.chats} sessions · {result.searched.repos.join(', ') || 'no GitHub repo'} · PRs since {result.searched.since}
               {result.notes.map((n, i) => (
                 <span key={i} className="block text-warn/80">
                   {n}
@@ -259,6 +299,28 @@ export function FindPrModal() {
             </div>
           </div>
         )}
+        {ix && (
+          <div className="px-4 py-1.5 border-t border-edge shrink-0 flex items-center gap-2 text-[10px] mono text-muted/70">
+            <span title="sessions whose summary has been written in the background (facts — commits, files, your messages — are indexed for all of them)">
+              index: {ix.summarized}/{ix.total} summarized
+            </span>
+            <span>
+              · today {ix.today}/{ix.cap}
+            </span>
+            {ix.cost_usd > 0 && <span>· {ix.cost_usd < 0.01 ? 'under 1¢' : '≈$' + ix.cost_usd.toFixed(2)} spent so far</span>}
+            {ix.running && <span className="text-accent truncate">· summarizing “{ix.running}”…</span>}
+            {ix.backoff && <span className="text-warn">· backing off after errors</span>}
+            {ix.paused && <span className="text-warn">· summaries paused</span>}
+            {!ix.enabled && <span className="text-warn">· background indexer is off (LOOM_INDEXER=0)</span>}
+            <div className="flex-1" />
+            {ix.enabled && (
+              <button onClick={togglePause} className="hover:text-ink underline decoration-dotted" title="Haiku summaries cost a fraction of a cent each; pausing keeps the free fact index going">
+                {ix.paused ? 'resume summaries' : 'pause summaries'}
+              </button>
+            )}
+          </div>
+        )}
+
       </div>
     </div>
   );

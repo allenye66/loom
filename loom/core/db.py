@@ -73,6 +73,27 @@ CREATE TABLE IF NOT EXISTS pr_scout (
     haiku_n    INTEGER NOT NULL DEFAULT 0,       -- Haiku reads today
     judged     TEXT NOT NULL DEFAULT '{}'        -- {"owner/repo#n": verdict} — candidates already judged
 );
+CREATE TABLE IF NOT EXISTS session_index (
+    chat_id    TEXT PRIMARY KEY,
+    facts_size INTEGER NOT NULL DEFAULT 0,     -- transcript bytes the deterministic scan covered (-1: nothing to scan)
+    facts_at   REAL    NOT NULL DEFAULT 0,
+    facts      TEXT    NOT NULL DEFAULT '{}',  -- files edited, commit messages, PR titles, first/last user messages
+    src_size   INTEGER NOT NULL DEFAULT 0,     -- transcript bytes Haiku summarized
+    summarized REAL    NOT NULL DEFAULT 0,
+    goal       TEXT    NOT NULL DEFAULT '',
+    summary    TEXT    NOT NULL DEFAULT '',
+    keywords   TEXT    NOT NULL DEFAULT '',
+    done       TEXT    NOT NULL DEFAULT '[]',
+    outcome    TEXT    NOT NULL DEFAULT '',
+    cost       REAL    NOT NULL DEFAULT 0,
+    error      TEXT    NOT NULL DEFAULT '',
+    error_at   REAL    NOT NULL DEFAULT 0
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(body, tokenize='porter unicode61');
+CREATE TABLE IF NOT EXISTS index_meta (
+    key TEXT PRIMARY KEY,
+    val TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ctx_state (
     key     TEXT PRIMARY KEY,
     ws_hash TEXT NOT NULL,

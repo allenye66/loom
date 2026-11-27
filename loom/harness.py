@@ -34,6 +34,11 @@ chats_app = typer.Typer(
     help="See and manage loom's chats: list, read, brief, archive/close, categorize, spawn, send.",
 )
 categories_app = typer.Typer(no_args_is_help=True, add_completion=False, help="loom's sidebar categories.")
+index_app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="The background session index behind `loom find`: status, pause/resume, summarize a chat now.",
+)
 board_app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
@@ -825,11 +830,12 @@ def find_pr(
     refine: list[str] = typer.Option([], "--refine", "-r", help="an extra detail to narrow it down (repeatable)"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Find one of the user's PRs — and the chat (even archived) that wrote it — from a loose description.
+    """Find one of the user's sessions (chats, archived too) — and the PR it made — from a loose description.
 
-    A cheap Haiku pass over the user's PRs on GitHub and loom's chats: "added a new export button on the billing page last
-    week". Prints the likeliest matches with a confidence and why, and a question that would narrow it down (answer it
-    with --refine). Takes ~10-20 s."""
+    Searches loom's session index first (summaries, commits and files per session — built in the background; see `loom index
+    status`), then the user's PRs on GitHub, ranks with a cheap Haiku pass, and quotes the session logs as evidence:
+    "added a new export button on the billing page last week". Prints the likeliest matches with a confidence and why, and a
+    question that would narrow it down (answer it with --refine). Takes ~10-20 s."""
     r = _api("POST", "/find-pr", body={"query": description, "history": refine, "days": days, "project": project})
     jid, deadline, last = r["job"], time.time() + 150, ""
     while time.time() < deadline:
@@ -860,10 +866,49 @@ def find_pr(
         head = f'PR {pr.get("key") or "#" + str(pr["number"])} "{pr.get("title")}"' if pr else "(no PR linked)"
         print(f"\n{i}. [{x['confidence']}] {head}" + (f"  {pr.get('state')} {_clip(str(pr.get('url') or ''), 70)}" if pr else ""))
         for c in x.get("chats") or []:
-            print(f"   chat: \"{_clip(c['name'], 60)}\" ({'archived' if c['archived'] else 'active'}) → loom chats show {c['id'][:8]}")
+            print(f"   session: \"{_clip(c['name'], 60)}\" ({'archived' if c['archived'] else 'active'}{', ' + c['outcome'] if c.get('outcome') else ''}) → loom chats show {c['id'][:8]}")
+            if c.get("summary"):
+                print(f"     did: {_clip(c['summary'], 220)}")
+            for sn in (c.get("snippets") or [])[:1]:
+                print(f"     log ({sn.get('role')}): {_clip(sn.get('text'), 160)}")
         print(f"   why: {x['why']}")
     if res.get("narrow_down"):
         print(f"\nto narrow it down: {res['narrow_down']}   (answer with --refine \"…\")")
+
+
+@index_app.command("status")
+def index_status_cmd(as_json: bool = typer.Option(False, "--json")) -> None:
+    """How far the background session index is, and today's Haiku usage."""
+    s = _api("GET", "/index/status")
+    if as_json:
+        _out_json(s)
+        return
+    state = "paused" if s["paused"] else ("disabled (LOOM_INDEXER=0)" if not s["enabled"] else ("backing off after errors" if s["backoff"] else "running"))
+    print(f"{s['indexed']}/{s['total']} sessions indexed (facts) · {s['summarized']} summarized · {state}")
+    print(f"today: {s['today']}/{s['cap']} Haiku summaries · total spent ≈ ${s['cost_usd']}" + (f" · now: {s['running']}" if s.get("running") else ""))
+    if s.get("last_error"):
+        print(f"last error: {s['last_error']}")
+
+
+@index_app.command("pause")
+def index_pause_cmd() -> None:
+    """Stop spending Haiku on summaries (facts are still collected — they're free)."""
+    _api("POST", "/index/pause")
+    print("paused — `loom index resume` to continue")
+
+
+@index_app.command("resume")
+def index_resume_cmd() -> None:
+    _api("POST", "/index/resume")
+    print("resumed")
+
+
+@index_app.command("run")
+def index_run_cmd(ref: str = typer.Argument(None, help="chat to index now (default: one pass of the worker)")) -> None:
+    """Index a chat right now — its facts and a Haiku summary (~10 s) — without waiting for it to go quiet."""
+    cid = _World().resolve(ref)["id"] if ref else None
+    r = _api("POST", "/index/run", body={"chat_id": cid}, timeout=240)
+    print(f"indexed {cid[:8]}: {r}" if cid else f"one pass: {r.get('did')}")
 
 
 def whoami(as_json: bool = typer.Option(False, "--json")) -> None:

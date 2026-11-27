@@ -1304,10 +1304,10 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
       <div className="border-t border-edge p-2 shrink-0 flex flex-col gap-1.5">
         <button
           onClick={openFindPr}
-          title="find a PR (and the chat that wrote it) by describing it — Haiku searches your PRs and chats, archived ones too"
+          title="find a session (and its PR) by describing it — Haiku searches an index of your sessions, their logs, and your PRs; archived chats too"
           className="w-full text-[11px] mono px-2 py-1.5 rounded border border-edge text-muted hover:text-ink inline-flex items-center justify-center gap-1.5"
         >
-          ⌕ find a PR
+          ⌕ find a session
         </button>
         <NotesButton
           label="✎ all notes"

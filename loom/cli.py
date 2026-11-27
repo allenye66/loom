@@ -30,6 +30,8 @@ app.command("whoami")(harness.whoami)
 app.command("projects")(harness.projects)
 app.command("notify")(harness.notify)
 app.command("find-pr")(harness.find_pr)
+app.command("find")(harness.find_pr)  # same thing — it finds sessions as well as PRs
+app.add_typer(harness.index_app, name="index")
 
 
 @app.command()

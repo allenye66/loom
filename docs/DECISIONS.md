@@ -593,6 +593,30 @@ Each terminal session owns a tracker; `/api/terminals` gains `draft`, `draft_sin
 draft's end and when it started) for a chat that has one — not the chat you're in. Blind spots: a loom restart forgets a draft still in the box; history
 recall (↑) isn't counted; text-killing shortcuts it doesn't model (Ctrl+K) can leave a stale marker until the next Enter.
 
+## D33 — Find a *session*: a background-built session index (SQLite) is the first pass (2026-11-26)
+D31 searched GitHub PRs and chat titles; the thing you actually remember is the *work* ("the session where finance wanted to download
+invoices"), which is in the conversations — most of your 420 chats are archived with meaningless titles. `core/sessindex.py` keeps, per session,
+in `loom.db` (`session_index` + an FTS5 table `session_fts`, porter-stemmed, bm25-ranked):
+- **facts** (no model, instant): files edited, commit messages (`-m` and heredoc forms), `gh pr create --title`s, your first and last messages — parsed from
+  the transcript's tool calls with cheap pre-filters (most of a 100 MB transcript is tool output we never parse). Alone this finds "the session that touched
+  ExportButton.tsx" (camelCase file names are indexed as words too).
+- **summary** (one cheap Haiku call per session): goal, 2-4 sentences of what was done, keywords *including synonyms*, "done" bullets, outcome — from a
+  compressed timeline (head + tail, tool output dropped; same input as the status briefs), through your own `claude` login. Measured: 0.04–0.11¢ per session
+  (6 synthetic sessions: $0.0044), so backfilling ~420 chats is well under a dollar.
+- **The worker** (`sessindex.start()` in the server lifespan; `LOOM_INDEXER=0` turns it off): facts for 6 sessions per pass, moving on every 3 s while there's a
+  backlog; then at most ONE Haiku summary per pass, newest first, 15 s apart, only for a session quiet ≥ 10 min with ≥ 2 user turns; ≤ `LOOM_INDEX_DAILY` (200) a day;
+  re-summarized only after the transcript grew ≥ 25% and ≥ 20 KB and 6 h passed; failures retry after 30 min and five in a row back off for an hour; pausable
+  (`loom index pause|resume`, or the modal's "pause summaries"). Sessions not indexed yet are still found through their title / first prompt, and the modal
+  says how far along the index is. Test servers run with the indexer off so they never summarize your real sessions.
+- **Find** (`core/findpr.py`) now: understand → **index first pass** (FTS over all sessions, all time unless you gave a window) + GitHub PRs → rank (candidate lines
+  carry the stored goal / summary / keywords / commits / files) → verify, where the finalists' **raw logs are grepped for quotable excerpts** (your messages and
+  the agent's prose, never tool output) and shown as evidence. Results are sessions first — the PR it made is attached when there is one; a session with no PR is
+  a result on its own. UI: "⌕ find a session"; `loom find "<description>"` (alias `find-pr`); `loom index status|pause|resume|run <chat>`; `/api/index/*`.
+- Privacy note: the first backfill sends compressed conversation timelines of your *old* sessions to Haiku (as the status briefs already do for the chats you open);
+  pause it or set `LOOM_INDEXER=0` if you don't want that.
+- Verified: unit suite (facts, FTS, stemming, worker policies, caps, backoff, regrowth, log excerpts, index-first find), real Haiku on six sessions with meaningless
+  titles found from vague descriptions (4/4), and a real-browser run (PR + session, session-only, status line, paused/off states).
+
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's
 DB migrations (human-only); remote/multi-machine (local-only); per-worktree dev DBs (D2).

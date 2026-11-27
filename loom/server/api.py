@@ -37,6 +37,7 @@ from loom.core import (
     perf,
     prlink,
     prscout,
+    sessindex,
     registry,
     repos,
     sessions,
@@ -1043,6 +1044,41 @@ def find_pr_poll(job: str) -> dict:
     if j is None:
         raise HTTPException(404, "unknown or expired search")
     return {"phase": j["phase"], "done": j["done"], "error": j["error"], "result": j["result"]}
+
+
+@router.get("/index/status")
+def index_status() -> dict:
+    """The background session index (core/sessindex.py): how far along it is, today's Haiku usage, paused?"""
+    return sessindex.status()
+
+
+@router.post("/index/pause")
+def index_pause() -> dict:
+    sessindex.set_paused(True)
+    return sessindex.status()
+
+
+@router.post("/index/resume")
+def index_resume() -> dict:
+    sessindex.set_paused(False)
+    return sessindex.status()
+
+
+class IndexRunIn(BaseModel):
+    chat_id: str | None = None  # one chat now (facts + a Haiku summary), regardless of how recently it was active
+    haiku: bool = True
+
+
+@router.post("/index/run")
+async def index_run(body: IndexRunIn) -> dict:
+    """Index one session immediately — useful right after a session ends, or to test the summary. Without `chat_id`, runs one pass of the worker."""
+    if not body.chat_id:
+        return {"did": await run_in_threadpool(sessindex.tick)}
+    sid = sessions.canonical_id(body.chat_id)
+    chat = await run_in_threadpool(lambda: next((c for c in sessions.list_chats(scope="all", tab="all") if c["id"] == sid), None))
+    if not chat:
+        raise HTTPException(404, f"unknown chat '{body.chat_id}'")
+    return await run_in_threadpool(sessindex.index_now, chat, haiku=body.haiku)
 
 
 @router.get("/prs/chats")

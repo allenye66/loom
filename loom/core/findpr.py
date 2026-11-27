@@ -30,7 +30,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 
-from loom.core import briefs, github, repos, sessions
+from loom.core import briefs, github, repos, sessindex, sessions
 
 DEFAULT_DAYS = 45
 WIDEN_FACTOR = 3                 # nothing found → look this much further back, once
@@ -59,7 +59,7 @@ UNDERSTAND_SCHEMA = {
     },
     "required": ["keywords", "synonyms", "date_from", "date_to"],
 }
-UNDERSTAND_PROMPT = """You turn a developer's loose description of a pull request they once made into search terms. \
+UNDERSTAND_PROMPT = """You turn a developer's loose description of a pull request or coding session they once did into search terms. \
 Today's date is {today}. Output: `keywords` — up to 10 lowercase words/short phrases most likely to appear in the PR's title, \
 branch name, description or code (feature nouns, UI element names, component/file-name fragments, domain terms — NOT filler \
 like "added" or "pr"); `synonyms` — up to 10 more lowercase alternatives (e.g. button → btn, cta; modal → dialog, popup); \
@@ -74,12 +74,14 @@ RANK_SCHEMA = {
     },
     "required": ["matches"],
 }
-RANK_PROMPT = """A developer is trying to find ONE of their pull requests (and the coding-agent chat that wrote it) from a rough \
-description; they've made hundreds. You get their description (plus any refinements they typed afterwards) and numbered \
-candidates: `P#` lines are PRs (title, branch, date, size, a snippet of the description, and the chat linked to it if any), `C#` \
-lines are chats (title, when active, first prompt, goal summary, linked PRs). Pick the up-to-10 candidates most likely to be what \
-they mean, best first, each with a 0-100 score and a one-sentence reason that quotes what matched. Judge by meaning, not just \
-shared words. Never invent ids; if nothing fits, return few or no matches."""
+RANK_PROMPT = """A developer is trying to find ONE of their coding-agent SESSIONS (chats) — and the pull request it produced, if \
+any — from a rough description; they've had hundreds. You get their description (plus any refinements they typed afterwards) and \
+numbered candidates: `P#` lines are PRs (title, branch, date, size, a snippet of the description, and the session linked to it if \
+any), `C#` lines are sessions (title, when active, and — when indexed — a stored goal, summary of what was done, keywords, commits \
+and files touched). The thing they remember may be the session's WORK rather than a PR's title, so a session whose summary matches can be \
+the answer even with no PR. Pick the up-to-10 candidates most likely to be what they mean, best first, each with a 0-100 score and a \
+one-sentence reason that quotes what matched. Judge by meaning, not just shared words. Never invent ids; if nothing fits, return few or \
+no matches."""
 
 VERIFY_SCHEMA = {
     "type": "object",
@@ -91,11 +93,12 @@ VERIFY_SCHEMA = {
     },
     "required": ["suggestions", "narrow_down"],
 }
-VERIFY_PROMPT = """A developer is finding one of their pull requests from a rough description. You now see the FINAL short-list \
-with more detail: for PRs the changed file paths and a fuller description, for chats their goal and the PRs on their branch. \
-Re-rank them: return up to 6 suggestions, most likely first, each with a confidence (high = the details clearly match what they \
-described; medium = plausible; low = a guess) and ONE sentence saying why, citing the concrete evidence (a file path, a phrase \
-from the PR). Drop candidates the details rule out. Also give `narrow_down`: ONE short question the developer could answer to \
+VERIFY_PROMPT = """A developer is finding one of their coding sessions (and the pull request it made, if any) from a rough \
+description. You now see the FINAL short-list with more detail: for PRs the changed file paths and a fuller description; for sessions \
+their stored summary, the PRs on their branch, and short excerpts quoted from the session's own log. Re-rank them: return up to 6 \
+suggestions, most likely first, each with a confidence (high = the details clearly match what they described; medium = plausible; low = \
+a guess) and ONE sentence saying why, citing the concrete evidence (a file path, a phrase from the PR or from a log excerpt). Drop \
+candidates the details rule out. Also give `narrow_down`: ONE short question the developer could answer to \
 tell the remaining candidates apart (e.g. which page it touched, roughly which day, a word in the title) — or an empty string \
 if one suggestion is clearly right. Never invent ids."""
 
@@ -235,9 +238,9 @@ def _brief_goal(chat_id: str) -> str:
         return ""
 
 
-def gather_chats(since: date, until: date | None, project: str | None) -> list[dict]:
-    """loom's task chats — archived included — that were active in the window."""
-    lo = datetime.combine(since, datetime.min.time()).timestamp()
+def gather_chats(since: date | None, until: date | None, project: str | None) -> list[dict]:
+    """loom's task chats — archived included — that were active in the window (no `since` = any time)."""
+    lo = datetime.combine(since, datetime.min.time()).timestamp() if since else 0.0
     hi = datetime.combine(until + timedelta(days=1), datetime.min.time()).timestamp() if until else None
     out = []
     for c in sessions.list_chats(scope="all", tab="all"):
@@ -272,6 +275,7 @@ def search(query: str, history: list[str] | None = None, *, days: int | None = N
     else:
         since, until = today - timedelta(days=DEFAULT_DAYS), None
 
+    fts = sessindex.search(terms, limit=80)  # first pass: full-text over every indexed session's summary, facts and title
     widened = False
     for attempt in (0, 1):
         progress("reading your PRs from GitHub…")
@@ -286,16 +290,23 @@ def search(query: str, history: list[str] | None = None, *, days: int | None = N
         if until:
             hi = datetime.combine(until + timedelta(days=1), datetime.min.time()).timestamp()
             pr_pool = [p for p in pr_pool if not p["created"] or p["created"] <= hi]
-        progress("matching your chats…")
-        chat_pool = gather_chats(since, until, project)
+        progress("searching your sessions…")
+        # An explicit window ("last week", a chip) narrows sessions too; otherwise sessions are searched across all time —
+        # the index makes that cheap, and a chat's work can be much older than the PR you're thinking of.
+        chat_pool = gather_chats(since if (days or d_from) else None, until, project)
         if pr_pool or chat_pool or attempt or days:
             break
         widened, since, until = True, today - timedelta(days=DEFAULT_DAYS * WIDEN_FACTOR), None
         notes.append(f"nothing in that window — widened to the last {DEFAULT_DAYS * WIDEN_FACTOR} days")
 
-    cands = _build_candidates(pr_pool, chat_pool, terms, slugs)
+    cands = _build_candidates(pr_pool, chat_pool, terms, slugs, fts)
+    ix = sessindex.status()
     searched = {"prs": len(pr_pool), "chats": len(chat_pool), "repos": sorted(slugs), "since": since.isoformat(),
-                "until": until.isoformat() if until else None, "widened": widened, "keywords": u["keywords"][:8]}
+                "until": until.isoformat() if until else None, "widened": widened, "keywords": u["keywords"][:8],
+                "index": {"total": ix["total"], "indexed": ix["indexed"], "summarized": ix["summarized"], "hits": len(fts)}}
+    if ix["total"] and ix["summarized"] < ix["total"] * 0.6:
+        notes.append(f"the session index is still building ({ix['summarized']}/{ix['total']} sessions summarized) — older sessions are matched on their "
+                     "title, first prompt, commits and files for now")
     if not cands:
         return {"suggestions": [], "narrow_down": "", "searched": searched, "notes": [*notes, "no PRs or chats in that window — try a wider time range"]}
 
@@ -313,7 +324,7 @@ def search(query: str, history: list[str] | None = None, *, days: int | None = N
     short = ranked[: DEEP_PRS + DEEP_CHATS]
 
     progress("checking the top candidates…")
-    _enrich(short)
+    _enrich(short, terms)
     verdict: dict = {}
     try:
         verdict = _haiku(VERIFY_PROMPT, _verify_input(text, short), VERIFY_SCHEMA)
@@ -342,20 +353,39 @@ def _linked_chats(pr: dict, chat_pool: list[dict], proj_of_slug: dict[str, str])
     return out
 
 
-def _build_candidates(pr_pool: list[dict], chat_pool: list[dict], terms: list[str], proj_of_slug: dict[str, str]) -> list[dict]:
+def _fts_bonus(fts: dict[str, float]) -> dict[str, float]:
+    """Rank-based boost for sessions the full-text index matched: the best hit gets the most."""
+    ranked = sorted(fts, key=lambda k: -fts[k])
+    n = max(1, len(ranked))
+    return {cid: 8 + 14 * (1 - i / n) for i, cid in enumerate(ranked)}
+
+
+def _ix_text(chat_id: str) -> str:
+    ix = sessindex.get(chat_id)
+    if not ix:
+        return _brief_goal(chat_id)
+    f = ix.get("facts") or {}
+    return " ".join([ix.get("goal") or "", ix.get("summary") or "", ix.get("keywords") or "", " ".join(ix.get("done") or []),
+                     " ".join(f.get("commits", [])), " ".join(f.get("pr_titles", []))])
+
+
+def _build_candidates(pr_pool: list[dict], chat_pool: list[dict], terms: list[str], proj_of_slug: dict[str, str],
+                      fts: dict[str, float] | None = None) -> list[dict]:
+    bonus = _fts_bonus(fts or {})
     cands: list[dict] = []
     linked_chat_ids: set[str] = set()
     for p in pr_pool:
         chats = _linked_chats(p, chat_pool, proj_of_slug)
         linked_chat_ids |= {c["id"] for c in chats}
-        chat_text = " ".join(f"{c.get('display_title', '')} {c.get('first_prompt') or ''}" for c in chats)
-        pre = _score(p["title"], terms, 3) + _score(p["branch"], terms, 2) + _score(p["body"], terms) + _score(chat_text, terms)
+        chat_text = " ".join(f"{c.get('display_title', '')} {c.get('first_prompt') or ''} {_ix_text(c['id'])}" for c in chats)
+        pre = (_score(p["title"], terms, 3) + _score(p["branch"], terms, 2) + _score(p["body"], terms) + _score(chat_text, terms)
+               + max([bonus.get(c["id"], 0) for c in chats] or [0]))
         cands.append({"kind": "pr", "pr": p, "chats": chats, "pre": pre})
-    # chats nothing links to a fetched PR (the PR may be older, unlinked, or never opened) compete on their own text
+    # sessions nothing links to a fetched PR (the PR may be older, unlinked, or never opened) compete on their own text + the index
     for c in chat_pool:
         text = " ".join([c.get("display_title") or "", c.get("first_prompt") or "", c.get("preview") or "", c.get("branch") or "",
-                         c.get("description") or "", " ".join(c.get("tags") or [])])
-        pre = _score(text, terms, 2) + (_score(_brief_goal(c["id"]), terms) if terms else 0)
+                         c.get("description") or "", " ".join(c.get("tags") or []), _ix_text(c["id"])])
+        pre = _score(text, terms, 2) + bonus.get(c["id"], 0)
         cands.append({"kind": "chat", "pr": None, "chats": [c], "pre": pre, "solo": c["id"] not in linked_chat_ids})
     prs = sorted([c for c in cands if c["kind"] == "pr"], key=lambda c: (-c["pre"], -(c["pr"]["created"] or 0)))
     chats = sorted([c for c in cands if c["kind"] == "chat" and c["solo"] and c["pre"] > 0], key=lambda c: -c["pre"])
@@ -371,12 +401,30 @@ def _build_candidates(pr_pool: list[dict], chat_pool: list[dict], terms: list[st
     return chosen
 
 
-def _chat_line(c: dict, goal: bool = True) -> str:
-    g = _clip(_brief_goal(c["id"]), 160) if goal else ""
+def _chat_line(c: dict, detail: bool = True) -> str:
+    """One compact line about a session: what it is, and — from the index — what was done in it."""
     prs = ",".join(f"#{n}" for n in (c.get("prs") or [])[:4]) or "none linked"
-    return (f'chat "{_clip(c.get("display_title"), 70)}" ({"archived" if c.get("archived") else "active"}, {c.get("repo") or "?"}, '
-            f'last active {_day(c.get("last_active"))}, branch {c.get("branch") or "?"}, PRs: {prs})'
-            + (f' | first prompt: "{_clip(c.get("first_prompt"), 140)}"' if c.get("first_prompt") else "") + (f' | goal: "{g}"' if g else ""))
+    head = (f'chat "{_clip(c.get("display_title"), 70)}" ({"archived" if c.get("archived") else "active"}, {c.get("repo") or "?"}, '
+            f'last active {_day(c.get("last_active"))}, branch {c.get("branch") or "?"}, PRs: {prs})')
+    ix = sessindex.get(c["id"]) if detail else None
+    if not ix or not (ix.get("summary") or ix.get("facts")):
+        g = _clip(_brief_goal(c["id"]), 160) if detail else ""
+        return head + (f' | first prompt: "{_clip(c.get("first_prompt"), 140)}"' if c.get("first_prompt") else "") + (f' | goal: "{g}"' if g else "")
+    f = ix.get("facts") or {}
+    out = [head]
+    if ix.get("summary"):
+        out.append(f'goal: "{_clip(ix.get("goal"), 120)}" | did: "{_clip(ix["summary"], 280)}"')
+        if ix.get("keywords"):
+            out.append("keywords: " + ", ".join(ix["keywords"].split()[:12]))
+        if ix.get("done"):
+            out.append("done: " + "; ".join(_clip(d, 90) for d in ix["done"][:3]))
+    elif c.get("first_prompt"):
+        out.append(f'first prompt: "{_clip(c.get("first_prompt"), 140)}"')
+    if f.get("commits"):
+        out.append("commits: " + "; ".join(_clip(m, 80) for m in f["commits"][:3]))
+    if f.get("files"):
+        out.append("files: " + ", ".join(f["files"][:4]))
+    return " | ".join(out)
 
 
 def _rank_input(text: str, cands: list[dict]) -> str:
@@ -384,7 +432,7 @@ def _rank_input(text: str, cands: list[dict]) -> str:
     for c in cands:
         if c["kind"] == "pr":
             p = c["pr"]
-            ch = f' | chat: {_chat_line(c["chats"][0], goal=False)}' if c["chats"] else ""
+            ch = f' | session: {_chat_line(c["chats"][0], detail=True)}' if c["chats"] else ""
             lines.append(f'{c["id"]} | PR {p["key"]} "{_clip(p["title"], 90)}" | branch {p["branch"] or "?"} | {_day(p["created"])} {p["state"]} '
                          f'| +{p["additions"] or 0}/-{p["deletions"] or 0} in {p["files"] or "?"} files | "{_clip(p["body"], 160)}"{ch}')
         else:
@@ -400,18 +448,34 @@ def _pr_detail(pr: dict) -> dict:
     return pr
 
 
-def _enrich(short: list[dict]) -> None:
-    """Fuller detail for the short-list: a PR's changed files + description; for a chat with no PR, the PRs on its branch."""
+def _enrich(short: list[dict], terms: list[str]) -> None:
+    """Fuller detail for the short-list: a PR's changed files + description; for a session, its PRs (the ones tied to it and any on its
+    branch) and short excerpts quoted from its raw log that mention what the developer described."""
     def one(c: dict) -> None:
         if c["kind"] == "pr":
             _pr_detail(c["pr"])
         elif c["chats"]:
             ch = c["chats"][0]
             slug = ch.get("pr_repo") or next((s for s, p in _project_slugs(None).items() if p == ch.get("repo")), None)
-            if slug and ch.get("branch"):
-                c["branch_prs"] = github.prs_for_branch(slug, ch["branch"])[:3]
+            found: list[dict] = []
+            if slug:
+                for n in [int(x) for x in (ch.get("prs") or []) if str(x).isdigit()][:3]:
+                    st = github.pr_status(slug, n)
+                    if st.get("state") != "unknown":
+                        found.append({"number": n, "title": st.get("title"), "url": st.get("url"), "state": st.get("state"), "created_at": st.get("created_at")})
+                if ch.get("branch"):
+                    have = {x["number"] for x in found}
+                    found += [x for x in github.prs_for_branch(slug, ch["branch"])[:3] if x["number"] not in have]
+            c["branch_prs"] = found[:3]
+        for ch in c["chats"][:2]:  # the "search the session logs" step: quotable evidence from the raw transcript
+            ch["_snips"] = sessindex.snippets(sessindex._transcript(ch), terms, n=3)
     with ThreadPoolExecutor(max_workers=6) as ex:
         list(ex.map(one, short))
+
+
+def _snip_lines(ch: dict) -> str:
+    sn = ch.get("_snips") or []
+    return "".join(f'\n    log excerpt ({x["role"]}, {str(x.get("ts") or "")[:10]}): "{x["text"]}"' for x in sn[:3])
 
 
 def _verify_input(text: str, short: list[dict]) -> str:
@@ -419,19 +483,25 @@ def _verify_input(text: str, short: list[dict]) -> str:
     for c in short:
         if c["kind"] == "pr":
             p = c["pr"]
-            ch = f'\n    chat: {_chat_line(c["chats"][0])}' if c["chats"] else ""
+            ch = f'\n    session: {_chat_line(c["chats"][0])}{_snip_lines(c["chats"][0])}' if c["chats"] else ""
             out.append(f'{c["id"]} | PR {p["key"]} "{p["title"]}" | branch {p["branch"] or "?"} | {_day(p["created"])} {p["state"]}\n'
                        f'    description: "{_clip(p.get("body_full") or p["body"], 700)}"\n    changed files: {", ".join(p.get("paths") or []) or "(unknown)"}{ch}')
         else:
             bp = "; ".join(f'#{x["number"]} "{_clip(x.get("title"), 60)}"' for x in c.get("branch_prs") or []) or "none found"
-            out.append(f'{c["id"]} | {_chat_line(c["chats"][0])}\n    PRs on its branch: {bp}')
+            out.append(f'{c["id"]} | {_chat_line(c["chats"][0])}\n    PRs of this session: {bp}{_snip_lines(c["chats"][0])}')
     return f"WHAT THE DEVELOPER REMEMBERS:\n{text}\n\nSHORT-LIST:\n" + "\n".join(out)
 
 
 def _suggestion(c: dict, confidence: str, why: str) -> dict:
-    chats = [{"id": x["id"], "name": x.get("name") or x.get("display_title") or x["id"][:8], "archived": bool(x.get("archived")),
-              "project": x.get("repo"), "branch": x.get("branch"), "last_active": x.get("last_active"), "agent": x.get("agent"),
-              "cwd": x.get("cwd"), "mode": x.get("mode")} for x in c["chats"][:3]]
+    chats = []
+    for x in c["chats"][:3]:
+        ix = sessindex.get(x["id"]) or {}
+        chats.append({"id": x["id"], "name": x.get("name") or x.get("display_title") or x["id"][:8], "archived": bool(x.get("archived")),
+                      "project": x.get("repo"), "branch": x.get("branch"), "last_active": x.get("last_active"), "agent": x.get("agent"),
+                      "cwd": x.get("cwd"), "mode": x.get("mode"), "indexed": bool(ix.get("summary")),
+                      "goal": ix.get("goal") or "", "summary": ix.get("summary") or "", "outcome": ix.get("outcome") or "",
+                      "keywords": (ix.get("keywords") or "").split()[:8],
+                      "snippets": [{"ts": s.get("ts"), "role": s.get("role"), "text": s.get("text")} for s in (x.get("_snips") or [])[:2]]})
     pr = None
     if c["pr"]:
         p = c["pr"]

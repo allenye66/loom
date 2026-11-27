@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from loom import __version__
 from loom.core.config import LOOM_API_HOST
-from loom.core import manager, monitor, perf, radar, registry, sessions, terminals
+from loom.core import manager, monitor, perf, radar, registry, sessindex, sessions, terminals
 from loom.server.api import router
 from loom.server.guard import CORS_ORIGIN_REGEX, LoopbackOnlyMiddleware
 from loom.server.board_api import router as board_router
@@ -60,9 +60,11 @@ async def _lifespan(_app: FastAPI):
     # now (off the request path; a stat per task, a transcript scan only for the rare mismatch).
     asyncio.get_running_loop().run_in_executor(None, sessions.repair_all)
     lag = asyncio.create_task(perf.loop_lag_monitor()) if perf.enabled() else None
+    sessindex.start()  # background session index (D33): facts now, Haiku summaries as sessions go quiet
     try:
         yield
     finally:
+        sessindex.stop()
         for t in (task, sweeper, lag):
             if t:
                 t.cancel()
