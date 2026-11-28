@@ -26,6 +26,7 @@ console = Console()
 app.add_typer(harness.chats_app, name="chats")
 app.add_typer(harness.categories_app, name="categories")
 app.add_typer(harness.board_app, name="board")
+app.add_typer(harness.dev_app, name="dev")
 app.command("whoami")(harness.whoami)
 app.command("projects")(harness.projects)
 app.command("notify")(harness.notify)
@@ -166,7 +167,7 @@ def start(task_id: str) -> None:
     if not task:
         console.print("[red]unknown task[/]")
         raise typer.Exit(1)
-    manager.start_task(load_repo_config(task.repo_root), task_id)
+    manager.start_task(load_repo_config(task.repo_root), task_id, requested=True)
     console.print(f"started services for {task_id}")
 
 

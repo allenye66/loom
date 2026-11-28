@@ -908,6 +908,7 @@ def _merge(s: dict, resolve=None) -> dict:
         "mode": ov.get("mode"),  # "chat" | "terminal" | None (not yet chosen)
         "opened": bool(ov.get("opened_at")),  # loom ever attached a terminal to this chat
         "spawned_by": ov.get("spawned_by"),  # the chat that handed this one off (`loom chats spawn`)
+        "queued": bool(ov.get("queued_at")),  # spawned, waiting for a slot to start (core/spawnq.py)
     }
 
 
@@ -1001,11 +1002,12 @@ def _pending_chat_rows(indexed_ids: set, resolve) -> list[dict]:
     row for each so it persists; the real indexed row takes over once the first message lands.
     Only OPENED overlays qualify (a task's chat gets mode:terminal at create time too — opened_at
     is written solely when a terminal actually attaches), so this never floods with never-opened
-    task chats."""
+    task chats — plus spawned chats still waiting in the spawn queue (`queued_at`), which haven't
+    been opened yet but are very much there."""
     task_by_chat = {t.chat_id: t for t in registry.list_tasks() if t.chat_id}
     out = []
     for cid, ov in overlay_all().items():
-        if cid in indexed_ids or not ov.get("opened_at"):
+        if cid in indexed_ids or not (ov.get("opened_at") or ov.get("queued_at")):
             continue
         if ov.get("deleted") or ov.get("archived") or ov.get("hidden"):
             continue
@@ -1017,7 +1019,7 @@ def _pending_chat_rows(indexed_ids: set, resolve) -> list[dict]:
             "title": (t.branch if t else None), "preview": None, "first_prompt": None,
             "branch": (t.branch if t else None), "cwd": (t.worktree_path if t else None),
             "prs": [], "pr_repo": None, "created": None,
-            "last_active": float(ov.get("opened_at") or 0.0), "size": 0,
+            "last_active": float(ov.get("opened_at") or ov.get("queued_at") or 0.0), "size": 0,
             "n_user": 0, "n_assistant": 0,
         }, resolve))
     return out

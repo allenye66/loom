@@ -194,6 +194,8 @@ export type Chat = {
   hidden: boolean;
   mode?: 'chat' | 'terminal' | null;
   agent?: AgentId | null;
+  spawned_by?: string | null; // the chat that spawned this one (`loom chats spawn`)
+  queued?: boolean; // spawned, waiting for a free slot before its agent starts (core/spawnq.py)
 };
 
 export type ChatQuery = { repo?: string; scope: string; tab: string; q?: string; starred?: boolean };

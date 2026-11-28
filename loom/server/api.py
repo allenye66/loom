@@ -35,12 +35,14 @@ from loom.core import (
     manager,
     monitor,
     perf,
+    process,
     prlink,
     prscout,
     sessindex,
     registry,
     repos,
     sessions,
+    spawnq,
     terminals,
 )
 from loom.core.config import LOGS_DIR, LOOM_HOME, load_repo_config
@@ -256,7 +258,9 @@ def start_task(task_id: str, only: str | None = None) -> dict:
     those (e.g. `?only=frontend` to bring a down port back up without touching the other)."""
     _, cfg = _cfg_for(task_id)
     svcs = {s for s in only.split(",") if s} if only else None
-    return _view(manager.start_task(cfg, task_id, only=svcs))
+    # Someone asked for these (the dev-stack start button) — the supervisor keeps them up while the
+    # chat is in use, even a service it wouldn't start itself (Vite for an agent-spawned chat).
+    return _view(manager.start_task(cfg, task_id, only=svcs, requested=True))
 
 
 @router.post("/tasks/{task_id}/stop")
@@ -568,7 +572,9 @@ async def _archive_followup(sid: str, caller: str | None, prev: asyncio.Task | N
         # The transcript stays — reopening resumes it. Never the caller's own agent.
         if caller != sid:
             await _step(sid, "stop agent", terminals.close_chat(sid))
-        # An archived chat's task shouldn't keep a dev stack running (see monitor.py reaper).
+        # An archived chat's task shouldn't keep a dev stack running. An agent that archived itself
+        # is still finishing its turn — the reaper (monitor.py) stops it and parks its stack once
+        # it goes quiet.
         tid = await _step(sid, "stop dev stack", run_in_threadpool(monitor.stop_for_archived_chat, sid))
         if tid:
             print(f"[loom reaper] {tid}: stopped dev stack (chat archived)", flush=True)
@@ -731,6 +737,91 @@ async def close_chat(sid: str, force: bool = False, x_loom_chat: str | None = He
     return {"chat_id": sid, "closed": await terminals.close_chat(sid)}
 
 
+# --- a chat's dev stack, for its agent (`loom dev …`) -----------------------------------------
+class DevIn(BaseModel):
+    services: list[str] | None = None  # default: what loom runs for this chat on its own (see monitor.wanted_services)
+    wait: float = 0.0  # `up`: seconds to wait for them to answer their health URL
+
+
+def _dev_task(sid: str):
+    task = manager.task_for_chat(sid)
+    if not task:
+        raise HTTPException(404, "this chat has no worktree task, so it has no dev stack")
+    return task, load_repo_config(task.repo_root)
+
+
+def _dev_view(sid: str) -> dict:
+    """The chat's dev services: port, URL, whether loom runs it, whether it answers, and whether
+    loom starts it on its own (`auto`) or only on request (an agent-spawned chat's frontend)."""
+    task, cfg = _dev_task(sid)
+    spawned = bool(sessions.get_overlay(sid).get("spawned_by"))
+    auto = set(monitor.wanted_services(task, cfg, spawned))
+    ctx = manager._ctx(cfg, task)
+    ports = {"backend": task.ports.backend, "frontend": task.ports.frontend} if task.ports else {}
+    running = {s.name for s in task.services}
+    services = []
+    for svc in cfg.services:
+        url = manager._render(svc.health, ctx) if svc.health else None
+        services.append({
+            "name": svc.name, "port": ports.get(svc.name), "url": url,
+            "running": svc.name in running,
+            "healthy": bool(url) and process.health_check(url, timeout=2.0),
+            "auto": svc.name in auto, "requested": svc.name in task.requested,
+            "log": str(LOGS_DIR / f"{task.id}-{svc.name}.log"),
+        })
+    return {
+        "chat_id": sid, "task": task.id, "state": task.state.value, "spawned": spawned,
+        "idle_stop_min": round(monitor.IDLE_S / 60), "services": services,
+    }
+
+
+@router.get("/chats/{sid}/dev")
+def chat_dev(sid: str) -> dict:
+    return _dev_view(sessions.canonical_id(sid))
+
+
+@router.post("/chats/{sid}/dev/up")
+async def chat_dev_up(sid: str, body: DevIn) -> dict:
+    """Start the chat's dev services now (default: the ones loom runs for it on its own; name others,
+    e.g. `frontend`, to have them too) and keep them up while the chat is in use. A service already
+    running is left alone — one still booting is waited for, not restarted."""
+    sid = sessions.canonical_id(sid)
+    task, cfg = await run_in_threadpool(_dev_task, sid)
+    known = [s.name for s in cfg.services]
+    names = body.services or monitor.wanted_services(task, cfg, bool(sessions.get_overlay(sid).get("spawned_by")))
+    unknown = [n for n in names if n not in known]
+    if unknown:
+        raise HTTPException(400, f"no service {', '.join(unknown)} in {cfg.name}'s .loom.yaml (has: {', '.join(known) or 'none'})")
+    procs = {s.name: s for s in task.services}
+    start = {n for n in names if n not in procs or not (procs[n].pid and process.is_alive(procs[n].pid))}
+    if start:
+        await run_in_threadpool(lambda: manager.start_task(cfg, task.id, only=start, requested=True))
+    elif names:  # all running already: still mark them asked-for, so the supervisor keeps them
+        await run_in_threadpool(manager.mark_requested, task.id, set(names))
+    deadline = time.monotonic() + max(0.0, min(body.wait, 300.0))
+    while True:
+        view = await run_in_threadpool(_dev_view, sid)
+        if all(s["healthy"] or not s["url"] for s in view["services"] if s["name"] in names):
+            break
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(1.5)
+    return {**view, "started": sorted(start), "asked": names}
+
+
+@router.post("/chats/{sid}/dev/down")
+def chat_dev_down(sid: str, body: DevIn) -> dict:
+    """Stop the chat's dev services (default: all of them — deliberately: they stay down until
+    someone starts them again, rather than coming back when the chat is next in use)."""
+    sid = sessions.canonical_id(sid)
+    task, _ = _dev_task(sid)
+    if body.services:
+        manager.stop_services(task.id, set(body.services))
+    else:
+        manager.stop_task(task.id)
+    return _dev_view(sid)
+
+
 class SpawnIn(BaseModel):
     branch: str
     repo: str | None = None  # registered project name …
@@ -796,15 +887,27 @@ async def spawn_chat(body: SpawnIn, x_loom_chat: str | None = Header(None)) -> d
     if body.category:
         cat = categories.find_or_add(body.category, cfg.name)
         categories.assign([chat_id], cat["id"])
-    try:
-        ts, _ = await terminals.start_chat(chat_id, task.worktree_path, initial_prompt=body.prompt)
-    except Exception as e:  # noqa: BLE001 — the task exists; report the launch failure
-        raise HTTPException(500, f"created task '{task.id}' but could not start its agent: {e}") from e
+    # A spawner gets spawnq.MAX_WORKING children working at once; past that the chat waits in the
+    # queue with its handoff, and the monitor launches it when one of the others finishes its turn.
+    queue_pos = None
+    async with spawnq.launch_lock:
+        if x_loom_chat:
+            working = await run_in_threadpool(spawnq.working_children, x_loom_chat)
+            if len(working) >= spawnq.MAX_WORKING:
+                queue_pos = await run_in_threadpool(spawnq.enqueue, chat_id, body.prompt)
+        if queue_pos is None:
+            try:
+                ts, _ = await terminals.start_chat(chat_id, task.worktree_path, initial_prompt=body.prompt)
+            except Exception as e:  # noqa: BLE001 — the task exists; report the launch failure
+                raise HTTPException(500, f"created task '{task.id}' but could not start its agent: {e}") from e
     # e.g. Claude's folder-trust prompt for a repo it's never trusted — the first message waits.
-    blocked = await terminals.settle_after_launch(ts)
+    blocked = await terminals.settle_after_launch(ts) if queue_pos is None else None
     return {
+        "queued": queue_pos is not None,
+        "queue_position": queue_pos,
+        "max_working": spawnq.MAX_WORKING,
         "waiting_on": blocked,
-        "error": None if blocked else terminals.launch_error(ts),
+        "error": None if blocked or queue_pos is not None else terminals.launch_error(ts),
         "model": model,
         "effort": effort,
         "chat_id": chat_id,

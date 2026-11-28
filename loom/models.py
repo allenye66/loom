@@ -49,3 +49,8 @@ class Task(BaseModel):
     pr: int | None = None
     note: str | None = None
     chat_id: str | None = None  # the task's single linked chat (session id) — strict 1:1
+    # Services someone explicitly asked for (the dev-stack start button, `loom dev up`) — the
+    # supervisor keeps these up even where it wouldn't start them itself (e.g. Vite for an
+    # agent-spawned chat). Cleared when the stack is stopped or parked.
+    requested: list[str] = Field(default_factory=list)
+    stack_started_at: float | None = None  # epoch of the last service start (idle reference for a chat-less stack)

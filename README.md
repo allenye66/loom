@@ -93,7 +93,8 @@ loom/
     process.py      # process-group spawn / health / port-scoped teardown
     manager.py      # task lifecycle (create/start/stop/remove)
     tests.py        # isolated test runs
-    monitor.py      # dev-stack supervisor + reaper
+    monitor.py      # stops what loom starts: dev-stack supervisor + reaper, spawn-queue drain
+    spawnq.py       # spawn queue: a few spawned chats per spawner at once
     sessions.py     # chat index (~/.claude, ~/.grok, ~/.codex) + local overlay
     agents.py       # claude / grok / codex launch adapters
     terminals.py    # the in-browser agent terminal (pty host)

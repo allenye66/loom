@@ -27,11 +27,19 @@ Wire protocol, daemon -> client:
 
 CLI:
     python -m loom.core.pty_server /path/to/session.sock --rows 40 --cols 120 -- claude --resume UUID
+
+One daemon per socket, ever: a daemon holds an exclusive flock on `<socket>.lock` for its whole
+life, taken BEFORE it starts the agent, and exits with EXIT_ALREADY_RUNNING if another holds it.
+Without that, a second daemon launched while one was alive (two opens racing) stole the socket path
+and left the first running unreachable — the same chat running twice, invisible to archive / close,
+and its eventual cleanup unlinked the live daemon's socket so the next open started a third. The lock
+is also the liveness test (`daemon_running`): it can't be fooled by a reused pid the way a pidfile can.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import logging
@@ -42,6 +50,7 @@ import select
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import termios
 import threading
@@ -49,6 +58,8 @@ import time
 from pathlib import Path
 
 log = logging.getLogger("loom.pty_server")
+
+EXIT_ALREADY_RUNNING = 3  # another live daemon owns this socket; this one never started an agent
 
 # --- protocol constants -------------------------------------------------------
 ESCAPE = 0x1C          # ASCII File Separator (dtach convention)
@@ -220,6 +231,8 @@ class PtyServer:
         # select loop's write set — NEVER by a blocking write.
         self._pty_write_buf = bytearray()
         self._running = True
+        self._lock_fd: int | None = None   # held for life — see acquire_lock
+        self._sock_ino: int | None = None  # the socket file THIS daemon bound (cleanup unlinks only that)
         # Optional raw-input capture, for diagnosing stray /clear submissions (what bytes reach
         # claude right before a /clear-offspring session appears). Enabled by creating
         # ~/.loom/pty-debug-input BEFORE a daemon (re)launch; off by default → zero cost.
@@ -242,6 +255,12 @@ class PtyServer:
 
         sock_dir = Path(self.socket_path).parent
         sock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        # Claim the socket BEFORE the agent exists — a daemon that loses must not have started one.
+        # A daemon from before the lock existed doesn't hold it, so check for one of those too.
+        self._lock_fd = acquire_lock(self.socket_path)
+        if self._lock_fd is None or _legacy_daemon_pid(self.socket_path) is not None:
+            raise AlreadyRunning(self.socket_path)
 
         master_fd, slave_fd = pty.openpty()
 
@@ -325,6 +344,7 @@ class PtyServer:
             pass
         self.server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server_sock.bind(self.socket_path)
+        self._sock_ino = os.stat(self.socket_path).st_ino
         os.chmod(self.socket_path, 0o700)
         self.server_sock.listen(1)
         self.server_sock.setblocking(False)
@@ -730,11 +750,15 @@ class PtyServer:
                 self.server_sock.close()
             except OSError:
                 pass
-        for p in (self.socket_path, self.socket_path + ".pid"):
-            try:
-                os.unlink(p)
-            except (FileNotFoundError, PermissionError):
-                pass
+        # Unlink only files that are still OURS — a socket path someone else has since bound, or a
+        # pidfile naming another daemon, belongs to a live session (unlinking it would make that
+        # chat unreachable, and the next open would start a second copy of it).
+        with contextlib.suppress(OSError):
+            if self._sock_ino is not None and os.stat(self.socket_path).st_ino == self._sock_ino:
+                os.unlink(self.socket_path)
+        with contextlib.suppress(OSError, ValueError):
+            if read_pid(self.socket_path) == os.getpid():
+                os.unlink(self.socket_path + ".pid")
         if self.child_pid:
             try:
                 os.killpg(os.getpgid(self.child_pid), signal.SIGTERM)
@@ -766,93 +790,240 @@ class PtyServer:
                 os.close(self.master_fd)
             except OSError:
                 pass
+        if self._lock_fd is not None:  # last: the agent is gone, so a successor may start now
+            with contextlib.suppress(OSError):
+                os.close(self._lock_fd)
+            self._lock_fd = None
         log.info("pty_server cleaned up: socket=%s", self.socket_path)
 
 
-# --- liveness (used by PtyTerminalSession to decide spawn-vs-reconnect) --------
-def is_session_alive(socket_path: str | None) -> bool:
-    """True iff a pty_server is running for this socket path. Read-only, safe to
-    call from any thread.
+# --- one daemon per socket: the lifetime lock ----------------------------------
+class AlreadyRunning(RuntimeError):
+    """Another live daemon owns this socket — this one exits without starting an agent."""
 
-    Chain (any failure => False): socket file exists -> PID sidecar readable +
-    int -> PID alive -> cmdline is a pty_server (guards against PID reuse).
-    """
-    if not socket_path or not os.path.exists(socket_path):
+
+def _lock_path(socket_path: str) -> str:
+    return socket_path + ".lock"
+
+
+def acquire_lock(socket_path: str, wait: float = 2.0) -> int | None:
+    """Take this socket's exclusive lock and return its fd (hold it open for the daemon's life;
+    the kernel drops it when the process dies, however it dies). None if another daemon holds it.
+    Retries for `wait` seconds because a liveness probe (`_lock_held`) holds a shared lock for a
+    few microseconds — a real owner holds it for good. The lock file itself is never unlinked:
+    deleting a lock file while others may have it open is how two processes end up "holding" it."""
+    fd = os.open(_lock_path(socket_path), os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.02)
+
+
+def _lock_held(socket_path: str) -> bool:
+    """Does a live daemon hold this socket's lock?"""
+    try:
+        fd = os.open(_lock_path(socket_path), os.O_RDONLY)
+    except OSError:
+        return False  # no lock file: no daemon of this version ever ran here
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)  # also drops our probe's shared lock
+
+
+# --- liveness (used by PtyTerminalSession to decide spawn-vs-reconnect) --------
+def read_pid(socket_path: str) -> int | None:
     try:
         with open(socket_path + ".pid") as f:
-            pid = int(f.read().strip())
-    except (FileNotFoundError, ValueError, OSError):
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
-    if hasattr(os, "pidfd_open"):
-        try:
-            fd = os.pidfd_open(pid)  # type: ignore[attr-defined]
-            os.close(fd)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return False
-    try:
-        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except FileNotFoundError:
-        return not Path("/proc").is_dir()   # no /proc (macOS) -> PID-alive is enough
-    except OSError:
+    except PermissionError:
         return True
-    return b"pty_server" in cmdline
+    except OSError:
+        return False
+    return True
 
 
-def kill_session(socket_path: str | None):
-    """Stop a pty_server by socket path (SIGTERM the pgroup, wait, SIGKILL,
-    unlink files). Works whether or not we're the spawning process (uses
-    os.kill(pid, 0) polling, not waitpid, since the daemon is start_new_session)."""
-    if not socket_path:
-        return
-    pid_file = socket_path + ".pid"
+def _cmdline(pid: int) -> str | None:
+    """A process's command line (None if it's gone). /proc on Linux; `ps` where there's none."""
     try:
-        with open(pid_file) as f:
-            pid = int(f.read().strip())
-        # Guard against PID reuse before killing.
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except FileNotFoundError:
+        if Path("/proc").is_dir():
+            return None
+    except OSError:
+        return None
+    try:
+        r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() or None
+
+
+def _daemon_socket(cmd: str) -> str | None:
+    """The socket path, if this command line IS a pty_server daemon (`<python> -m loom.core.pty_server
+    <socket> …`) — matched on argv, never as a substring: a shell whose command merely mentions the
+    daemon (an agent grepping `ps`) must never be taken for one, let alone killed as one."""
+    argv = cmd.split(" ", 4)
+    if len(argv) < 4 or argv[1:3] != ["-m", "loom.core.pty_server"]:
+        return None
+    return argv[3] if os.path.basename(argv[0]).startswith("python") else None
+
+
+# (pid, socket path) → (is that pid the daemon for that socket?, checked at). A pid can't change
+# what it is while it lives, and a reused pid only matters after the original died — so a verdict
+# stays good for a while. Keeps `ps` (slow on a loaded machine: 25–100 ms a call) out of every
+# sweep. Only daemons from before the lifetime lock need this at all; a locked one never does.
+_verdicts: dict[tuple[int, str], tuple[bool, float]] = {}
+_VERDICT_TTL = 300.0
+
+
+def _is_daemon_for(pid: int, socket_path: str, *, fresh: bool = False) -> bool:
+    """Is `pid` the pty_server serving `socket_path`? Checks the command line, never just the pid:
+    a pidfile left by a daemon that died (a reboot, a SIGKILL) can name a pid the OS has since given
+    to an unrelated process — macOS has no /proc, and trusting the bare pid there once pointed a
+    stale chat at a system daemon, which `kill_session` would then have SIGTERMed."""
+    key = (pid, socket_path)
+    hit = _verdicts.get(key)
+    if hit and not fresh and time.monotonic() - hit[1] < _VERDICT_TTL:
+        return hit[0]
+    cmd = _cmdline(pid)
+    ok = bool(cmd) and _daemon_socket(cmd) == socket_path
+    _verdicts[key] = (ok, time.monotonic())
+    return ok
+
+
+def _legacy_daemon_pid(socket_path: str, *, fresh: bool = False) -> int | None:
+    """The pid of a daemon serving this socket that predates the lifetime lock (it doesn't hold
+    one, so only its pidfile — verified — can say it's alive)."""
+    pid = read_pid(socket_path)
+    if pid is None or pid == os.getpid() or not _pid_alive(pid):
+        return None
+    return pid if _is_daemon_for(pid, socket_path, fresh=fresh) else None
+
+
+def daemon_running(socket_path: str | None) -> bool:
+    """Is a pty_server running for this socket — even one still starting up (lock held, socket not
+    bound yet)? Read-only, safe from any thread."""
+    if not socket_path:
+        return False
+    return _lock_held(socket_path) or _legacy_daemon_pid(socket_path) is not None
+
+
+def is_session_alive(socket_path: str | None) -> bool:
+    """True iff a pty_server is running for this socket path AND its socket is there to connect to.
+    Read-only, safe to call from any thread."""
+    return bool(socket_path) and os.path.exists(socket_path) and daemon_running(socket_path)
+
+
+def _etime_s(etime: str) -> float:
+    """`ps` elapsed time ([[dd-]hh:]mm:ss) → seconds."""
+    days, _, rest = etime.rpartition("-")
+    secs = 0
+    for part in rest.split(":"):
+        secs = secs * 60 + int(part)
+    return secs + (int(days) * 86400 if days else 0)
+
+
+def find_daemons(sock_dir: str) -> dict[str, list[tuple[int, float]]]:
+    """Every running pty_server whose socket lives in `sock_dir`, by socket path → [(pid, age in
+    seconds)] — found by command line, so it also sees daemons whose socket file is gone (a ghost a
+    later daemon displaced, before the lock existed). `pgrep` narrows it to the daemons, then one
+    `ps` reads just their command lines (a `ps` of every process takes seconds on a loaded machine)."""
+    try:
+        found = subprocess.run(
+            ["pgrep", "-f", r"python[^ ]* -m loom[.]core[.]pty_server "], capture_output=True, text=True, timeout=10,
+        )
+        pids = ",".join(found.stdout.split()) if found.returncode in (0, 1) else None
+        if pids == "":
+            return {}
+        args = ["-p", pids] if pids else ["-ax"]  # no usable pgrep → every process
+        r = subprocess.run(["ps", "-ww", "-o", "pid=,etime=,command=", *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out: dict[str, list[tuple[int, float]]] = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        sock = _daemon_socket(parts[2]) if len(parts) == 3 else None
+        if not sock or os.path.dirname(sock) != sock_dir:
+            continue
+        with contextlib.suppress(ValueError):
+            out.setdefault(sock, []).append((int(parts[0]), _etime_s(parts[1])))
+    return out
+
+
+def alive_sockets(sock_dir: str) -> set[str]:
+    """Every socket file in `sock_dir` with a live daemon behind it."""
+    return {str(p) for p in Path(sock_dir).glob("*.sock") if daemon_running(str(p))}
+
+
+def kill_daemon(pid: int, timeout: float = 5.0) -> None:
+    """SIGTERM a daemon's process group (it stops its agent on the way out), wait, then SIGKILL."""
+    kill_daemons([pid], timeout)
+
+
+def kill_daemons(pids, timeout: float = 5.0) -> None:
+    pids = [p for p in pids if p and p != os.getpid()]
+    for pid in pids:
         try:
-            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
-            if b"pty_server" not in cmdline:
-                pid = None  # not ours anymore — just clean files below
-        except (FileNotFoundError, OSError):
-            pass
-        if pid is not None:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            terminated = False
-            for _ in range(50):     # 5 s
-                try:
-                    os.kill(pid, 0)
-                except (ProcessLookupError, OSError):
-                    terminated = True
-                    break
-                time.sleep(0.1)
-            if not terminated:
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-    except (FileNotFoundError, ValueError):
-        pass
-    for p in (socket_path, pid_file):
-        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    left = set(pids)
+    while left and time.monotonic() < deadline:
+        for pid in list(left):
+            # Reap it if it's our own child (loom spawned it this run): an unreaped exit lingers as
+            # a zombie that still answers kill(pid, 0) — we'd wait out the whole timeout for nothing.
+            with contextlib.suppress(ChildProcessError, OSError):
+                os.waitpid(pid, os.WNOHANG)
+            if not _pid_alive(pid):
+                left.discard(pid)
+        if left:
+            time.sleep(0.1)
+    for pid in left:
+        with contextlib.suppress(OSError):
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+
+
+def kill_session(socket_path: str | None) -> int:
+    """Stop every pty_server serving this socket path — the one its pidfile names (verified, never
+    a bare pid) and any duplicate found by command line — then remove the socket + pidfile. Works
+    whether or not we're the spawning process. Returns how many daemons it stopped."""
+    if not socket_path:
+        return 0
+    pids: set[int] = set()
+    pid = read_pid(socket_path)
+    if pid is not None and pid != os.getpid() and _pid_alive(pid) and (
+        _lock_held(socket_path) or _is_daemon_for(pid, socket_path, fresh=True)
+    ):
+        pids.add(pid)
+    pids |= {p for p, _ in find_daemons(os.path.dirname(socket_path)).get(socket_path, [])}
+    kill_daemons(pids)
+    for p in (socket_path, socket_path + ".pid"):
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(p)
-        except FileNotFoundError:
-            pass
+    return len(pids)
 
 
 # --- CLI ----------------------------------------------------------------------
@@ -877,7 +1048,11 @@ def _main(argv: list[str]) -> None:
         p.error("no command given (expected `... -- <cmd> [args...]`)")
 
     server = PtyServer(args.socket, cmd_argv, rows=args.rows, cols=args.cols, cwd=args.cwd)
-    server.run()
+    try:
+        server.run()
+    except AlreadyRunning:
+        log.info("pty_server not started: another daemon already serves %s", args.socket)
+        sys.exit(EXIT_ALREADY_RUNNING)
 
 
 if __name__ == '__main__':
