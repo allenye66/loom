@@ -28,6 +28,10 @@ DEFAULT_WORKTREE_BASE = LOOM_HOME / "worktrees"
 LOOM_API_HOST = os.environ.get("LOOM_API_HOST", "127.0.0.1")
 LOOM_API_PORT = int(os.environ.get("LOOM_API_PORT", "8787"))
 
+# A chat's dev stack is stopped after this many minutes with nothing happening in the chat, and comes
+# back by itself when the chat is used again (core/monitor.py, D34).
+IDLE_STOP_MIN = float(os.environ.get("LOOM_IDLE_STOP_MIN", "30"))
+
 
 def ensure_dirs() -> None:
     for d in (LOOM_HOME, LOGS_DIR, DEFAULT_WORKTREE_BASE):

@@ -46,6 +46,9 @@ from loom.core.config import LOGS_DIR, LOOM_HOME
 from loom.core.pty_server import (
     CMD_SNAPSHOT,
     ESCAPE,
+    EXIT_ALREADY_RUNNING,
+    alive_sockets,
+    daemon_running,
     encode_resize,
     encode_snapshot_request,
     is_session_alive,
@@ -59,6 +62,9 @@ _registry: dict[str, "_SessionBase"] = {}
 # at once); re-opening the chat must wait that out, or the dying daemon's last act — unlinking
 # its socket files — would delete the new daemon's.
 _closing: dict[str, "asyncio.Task[bool]"] = {}
+# chat_id → lock held while open_terminal attaches/launches that chat. Two opens at once (a browser
+# reconnect landing during a headless `start_chat`, two tabs after a restart) must not both launch it.
+_open_locks: dict[str, asyncio.Lock] = {}
 
 _SEND_TIMEOUT = 5.0          # max seconds to push a frame to one subscriber before dropping it
 _BACKLOG_MAX = 256 * 1024    # bytes of recent output kept for replay-on-attach
@@ -211,6 +217,7 @@ class _SessionBase:
         self._typed = False
         self.clear_needs_on_typing = False
         self.last_input = 0.0  # monotonic time of the last input written (keystrokes or loom's own)
+        self.last_viewed = 0.0  # monotonic time a browser tab last stopped showing it
         self.draft = DraftTracker()  # is there unsent text in the input box? (core/draft.py — the sidebar's draft marker)
         # First message for a brand-new session, passed as the CLI's startup prompt (headless
         # spawn — see start_chat). Consumed by the launch; never reused on a relaunch.
@@ -457,6 +464,7 @@ class _SessionBase:
 
     def unsubscribe(self, ws) -> None:
         self.subscribers.discard(ws)
+        self.last_viewed = time.monotonic()  # someone was looking at it until now (see activity())
 
     async def _broadcast(self, data: bytes) -> None:
         dead = []
@@ -798,6 +806,11 @@ class PtyTerminalSession(_SessionBase):
         _SOCK_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         if is_session_alive(self.socket_path):
             return                          # running daemon — just reconnect
+        if daemon_running(self.socket_path):
+            # A daemon is still coming up (it holds the socket's lock but hasn't bound the socket
+            # yet) — wait for it rather than start a second agent on the same session.
+            self._wait_for_socket(None)
+            return
         # Stale socket file with no live daemon behind it — clear it.
         with contextlib.suppress(FileNotFoundError, OSError):
             os.unlink(self.socket_path)
@@ -832,7 +845,7 @@ class PtyTerminalSession(_SessionBase):
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         logf = open(LOGS_DIR / f"{session_name(self.chat_id)}-pty.log", "ab")
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 full_cmd, env=child_env,
                 start_new_session=True,          # <-- survives loom restarts
                 stdin=subprocess.DEVNULL,
@@ -841,14 +854,24 @@ class PtyTerminalSession(_SessionBase):
             )
         finally:
             logf.close()
-        # Wait (bounded) for the socket + PID sidecar to appear.
-        deadline = time.monotonic() + 5.0
+        self._wait_for_socket(proc)
+
+    def _wait_for_socket(self, proc: subprocess.Popen | None) -> None:
+        """Wait (bounded) for this chat's daemon socket to come up. `proc` = the daemon we just
+        launched: if it bows out because another daemon owns the socket (EXIT_ALREADY_RUNNING —
+        someone else launched this chat a moment earlier), wait for that one instead; any other
+        early exit is a failed launch."""
+        log = LOGS_DIR / (session_name(self.chat_id) + "-pty.log")
+        deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             if is_session_alive(self.socket_path):
                 return
+            if proc is not None and proc.poll() is not None:
+                if proc.returncode != EXIT_ALREADY_RUNNING:
+                    raise RuntimeError(f"pty_server exited ({proc.returncode}) before coming up (see {log})")
+                proc = None
             time.sleep(0.05)
-        raise RuntimeError("pty_server daemon did not come up within 5s "
-                           f"(see {LOGS_DIR / (session_name(self.chat_id) + '-pty.log')})")
+        raise RuntimeError(f"pty_server daemon did not come up within 8s (see {log})")
 
     # --- lifecycle -----------------------------------------------------------
     async def open(self) -> None:
@@ -1012,9 +1035,10 @@ def _alive_daemon_ids() -> list[str]:
     is named from the chat id (`session_name`), which is the id itself for every uuid chat id."""
     out: list[str] = []
     with contextlib.suppress(OSError):
-        for p in _SOCK_DIR.glob("loomx-*.sock"):
-            if is_session_alive(str(p)):
-                out.append(p.name[len("loomx-"):-len(".sock")])
+        for path in alive_sockets(str(_SOCK_DIR)):
+            name = Path(path).name
+            if name.startswith("loomx-"):
+                out.append(name[len("loomx-"):-len(".sock")])
     return out
 
 
@@ -1024,7 +1048,7 @@ def process_alive(chat_id: str) -> bool:
     ts = _registry.get(chat_id)
     if ts is not None and ts.attached:
         return True
-    if is_session_alive(_socket_path(chat_id)):
+    if daemon_running(_socket_path(chat_id)):
         return True
     tm = _tmux()
     return bool(tm) and subprocess.run(
@@ -1035,6 +1059,41 @@ def process_alive(chat_id: str) -> bool:
 def active_sessions() -> list[_SessionBase]:
     """Live terminal sessions (transport attached) — used by the dev-stack supervisor (monitor.py)."""
     return [ts for ts in list(_registry.values()) if ts.attached]
+
+
+def running_chat_ids() -> set[str]:
+    """Every chat whose agent is running right now — attached or not, pty or legacy tmux — in one
+    pass (a socket-dir scan + at most one `tmux ls`), for sweeps that would otherwise call
+    process_alive() per chat. Blocking — call off the event loop."""
+    ids = {ts.chat_id for ts in active_sessions()} | set(_alive_daemon_ids())
+    tm = _tmux()
+    if tm:
+        r = subprocess.run([tm, "ls", "-F", "#{session_name}"], capture_output=True, text=True)
+        names = set(r.stdout.split()) if r.returncode == 0 else set()
+        if names:
+            ov = sessions_mod.overlay_all()
+            ids |= {cid for cid in ov if session_name(cid) in names}
+    return ids
+
+
+def viewing(chat_id: str) -> bool:
+    """Is a browser tab showing this chat right now (a subscribed terminal socket)?"""
+    ts = _registry.get(chat_id)
+    return ts is not None and ts.attached and bool(ts.subscribers)
+
+
+def activity(chat_id: str) -> tuple[float, float] | None:
+    """(last touched, last output) of an attached session as wall-clock times, else None. Touched =
+    someone typed into it (or loom did) or a browser tab was showing it (now, if one still is);
+    output = anything the TUI drew — a status line can redraw on its own, so for an agent with
+    lifecycle hooks the hooks are the better "working" signal."""
+    ts = _registry.get(chat_id)
+    if ts is None or not ts.attached:
+        return None
+    mono = time.monotonic()
+    off = time.time() - mono
+    touched = mono if ts.subscribers else max(ts.last_input, ts.last_viewed)
+    return (touched + off if touched else 0.0), ts.last_output + off
 
 
 def terminal_backend(chat_id: str) -> str:
@@ -1090,7 +1149,16 @@ async def open_terminal(
     chat_id: str, cwd: str | None, cols: int = 120, rows: int = 32, *, initial_prompt: str | None = None,
 ) -> _SessionBase:
     """Attach to (or launch) a chat's agent. `initial_prompt` only takes effect when this call
-    actually starts a brand-new session — it becomes the CLI's startup prompt."""
+    actually starts a brand-new session — it becomes the CLI's startup prompt. One open per chat at
+    a time: a second waits for the first and then simply attaches to what it launched."""
+    lock = _open_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        return await _open_terminal(chat_id, cwd, cols, rows, initial_prompt=initial_prompt)
+
+
+async def _open_terminal(
+    chat_id: str, cwd: str | None, cols: int, rows: int, *, initial_prompt: str | None,
+) -> _SessionBase:
     await _after_close(chat_id)
     loop = asyncio.get_running_loop()
     backend = await loop.run_in_executor(None, terminal_backend, chat_id)
@@ -1114,6 +1182,15 @@ async def open_terminal(
             None, sessions_mod.set_overlay, chat_id, {"opened_at": time.time()},
         )
     ts.clear_needs_on_typing = agent == "codex"  # codex has no prompt-submit hook (see write())
+    # A spawned chat still waiting for a slot (spawnq) carries its handoff as `queued_prompt`. Whatever
+    # launches it first — its turn in the queue, you opening it, a `loom chats send` — starts it ON that
+    # handoff, so the first message is never lost; resuming an already-running agent leaves it queued.
+    queued = None
+    if not ts.attached and initial_prompt is None:
+        ov = await loop.run_in_executor(None, sessions_mod.get_overlay, chat_id)
+        if ov.get("queued_at") and not await loop.run_in_executor(None, process_alive, chat_id):
+            queued = ov.get("queued_prompt") or ""
+            initial_prompt = queued or None
     if initial_prompt and not ts.attached:
         ts.initial_prompt = initial_prompt
     if agent == "claude" and not ts.attached:
@@ -1123,6 +1200,10 @@ async def open_terminal(
             _registry.pop(chat_id, None)  # don't leave a half-registered session behind
             raise
     await ts.open()
+    if queued is not None:
+        await loop.run_in_executor(
+            None, sessions_mod.set_overlay, chat_id, {"queued_at": None, "queued_prompt": None},
+        )
     if agent == "codex":
         live = _codex_watchers.get(chat_id)
         if live is None or live.done():
@@ -1141,14 +1222,15 @@ async def start_chat(chat_id: str, cwd: str | None, *, initial_prompt: str | Non
     launched) — `launched` = this call started a new agent process (vs. attaching to a running
     one). A brand-new session gets `initial_prompt` as its startup prompt; a resumed one does
     not (use send_text)."""
-    await _after_close(chat_id)
-    ts = _registry.get(chat_id)
-    if ts is not None and ts.attached:
-        return ts, False
-    loop = asyncio.get_running_loop()
-    was_alive = await loop.run_in_executor(None, process_alive, chat_id)
-    ts = await open_terminal(chat_id, cwd, initial_prompt=None if was_alive else initial_prompt)
-    return ts, not was_alive
+    async with _open_locks.setdefault(chat_id, asyncio.Lock()):  # so `launched` is true for one caller only
+        await _after_close(chat_id)
+        ts = _registry.get(chat_id)
+        if ts is not None and ts.attached:
+            return ts, False
+        loop = asyncio.get_running_loop()
+        was_alive = await loop.run_in_executor(None, process_alive, chat_id)
+        ts = await _open_terminal(chat_id, cwd, 120, 32, initial_prompt=None if was_alive else initial_prompt)
+        return ts, not was_alive
 
 
 async def _wait_quiet(ts: _SessionBase, *, quiet: float = 2.0, timeout: float = 45.0) -> None:
@@ -1260,9 +1342,9 @@ async def _close_chat(chat_id: str) -> bool:
         await ts.close()
         return True
     loop = asyncio.get_running_loop()
-    sock = _socket_path(chat_id)
-    if await loop.run_in_executor(None, is_session_alive, sock):
-        await loop.run_in_executor(None, kill_session, sock)
+    # kill_session finds this chat's daemons by command line too, so it also stops a copy whose
+    # socket file is gone (a duplicate from before the lifetime lock) — not just the pidfile's.
+    if await loop.run_in_executor(None, kill_session, _socket_path(chat_id)):
         with contextlib.suppress(Exception):
             _marker_path(chat_id).unlink(missing_ok=True)
         return True

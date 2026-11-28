@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from loom.core import registry
-from loom.core.config import LOGS_DIR, LOOM_API_HOST, LOOM_API_PORT
+from loom.core.config import IDLE_STOP_MIN, LOGS_DIR, LOOM_API_HOST, LOOM_API_PORT
 
 # --- resilience ---------------------------------------------------------------
 # Merged into every session's env. Turns on Claude Code's *native* recovery that
@@ -69,8 +69,11 @@ def _loom_runtime(cwd: str | None) -> tuple[dict[str, str], str | None]:
             f"You're in loom worktree task `{task.id}` (branch `{task.branch}`). Its dev stack, when "
             f"running, is backend $LOOM_BACKEND_URL (http://localhost:{be}) and frontend $LOOM_FRONTEND_URL "
             f"(http://localhost:{fe}) — use THESE worktree-specific URLs, not any default dev ports. "
-            f"This worktree's server logs are under $LOOM_LOG_DIR. Start/stop the stack from the loom "
-            f"task card.\n"
+            f"This worktree's server logs are under $LOOM_LOG_DIR. loom runs the stack while this chat is "
+            f"in use and stops it after {IDLE_STOP_MIN:g} min with nothing happening; it comes back by itself "
+            f"when the chat is used again. A chat spawned by another agent gets only its backend — run "
+            f"`loom dev up frontend` when you actually need the UI. If a server isn't answering, `loom dev up` "
+            f"starts it and waits until it does (`loom dev status` shows what's up).\n"
             f"</loom-runtime>"
         )
         return env, note
@@ -94,7 +97,10 @@ is $LOOM_CHAT_ID. When the user asks you to look at or manage their loom chats, 
   loom chats archive|unarchive|close <id...>    archive also stops the agent; close only stops it
   loom chats categorize <id...> <category>  ·  loom chats rename <id> <name>
   loom chats spawn --branch <b> --prompt <text> [--category C] [--model M] [--effort E]
-                                                new worktree + chat, already working
+                                                new worktree + chat, already working (a few at
+                                                once per spawner; the rest queue and start as
+                                                earlier ones finish)
+  loom dev status|up [frontend]|down            this chat's dev servers
   loom chats send <id> <text>                   type a message into another chat
   loom notify "<question>"                      push a notification to the USER (see below)
   loom chats pr <pr url|owner/repo#N|N>         which loom chat wrote that PR

@@ -243,11 +243,16 @@ export function DevStackBar({
       (m) => `start failed — ${m}`,
     );
   };
+  // `ready` with nothing up = parked: loom stopped it while the chat was idle (or archived) and brings
+  // it back by itself once the chat is in use again — unlike `stopped`, which someone chose (D34).
+  const parked = !anyUp && task.state === 'ready';
   const [statusTxt, statusCls] = allUp
     ? ['● running', 'text-ok']
     : anyUp
       ? ['◐ partial', 'text-warn']
-      : ['○ stopped', 'text-muted'];
+      : parked
+        ? ['○ idle', 'text-muted']
+        : ['○ stopped', 'text-muted'];
 
   return (
     <div className="border-b border-edge bg-surface-2/40 px-5 py-1.5 flex items-center gap-2 text-[11px] mono shrink-0">
@@ -255,7 +260,16 @@ export function DevStackBar({
       <PortLink label={`FE :${task.ports.frontend}`} url={feUrl!} up={feUp} />
       <PortLink label={`BE :${task.ports.backend}`} url={beUrl!} up={beUp} />
       <div className="flex-1" />
-      <span className={statusCls}>{statusTxt}</span>
+      <span
+        className={statusCls}
+        title={
+          parked
+            ? 'loom stopped this stack while the chat was idle — it starts again by itself while you use the chat (an agent-spawned chat gets only its backend; press start for the rest)'
+            : undefined
+        }
+      >
+        {statusTxt}
+      </span>
       {onToggleLogs && (
         <button
           onClick={onToggleLogs}
@@ -558,6 +572,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     mode?: 'chat' | 'terminal' | null;
     agent?: AgentId | null;
     muted?: boolean;
+    queued?: boolean;
   };
   const rows: Row[] = taskChats.map((c) => ({
     id: c.id,
@@ -568,6 +583,7 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
     mode: c.mode,
     agent: c.agent,
     muted: c.muted,
+    queued: c.queued,
   }));
 
   // The open chat's header title follows its sidebar row — so a rename (here, in the header, or
@@ -923,8 +939,16 @@ export function ChatSidebar({ activeSid }: { activeSid?: string }) {
           </span>
         )}
         {working && <span title="agent is working (recent output)" className="text-[9px] mono text-accent shrink-0 animate-pulse">working</span>}
+        {r.queued && !t && (
+          <span
+            title="spawned by another chat and waiting its turn — it starts on its own when one of that chat's working spawns finishes (open it to start it now)"
+            className="text-[9px] mono text-muted shrink-0"
+          >
+            queued
+          </span>
+        )}
         {needs && <span title={r.muted ? 'waiting on you (muted — no notification)' : 'idle — agent may be waiting on you'} className={`text-[9px] mono text-ok shrink-0 ${r.muted ? 'opacity-40' : ''}`}>needs you</span>}
-        {r.mode === 'terminal' && !working && !needs && <span title="terminal chat (real agent TUI)" className="text-[9px] mono text-accent shrink-0">❯</span>}
+        {r.mode === 'terminal' && !working && !needs && !(r.queued && !t) && <span title="terminal chat (real agent TUI)" className="text-[9px] mono text-accent shrink-0">❯</span>}
         {/* Open this chat as a terminal (resumes the same transcript in the real claude TUI). */}
         {r.mode !== 'terminal' && (
           <button

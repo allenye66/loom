@@ -44,6 +44,11 @@ board_app = typer.Typer(
     add_completion=False,
     help="The shared message board of a category: post findings/handoffs, read what you missed, wait for others.",
 )
+dev_app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="This chat's dev stack (its worktree's backend / frontend servers): status, up, down.",
+)
 
 WORKING_WITHIN_S = 6  # output within this many seconds = "working" (the sidebar's pulse window)
 _NONE_CATEGORY = {"none", "uncategorized", "-", ""}
@@ -106,7 +111,7 @@ class _World:
     def status(self, sid: str) -> str:
         t = self.terms.get(sid)
         if not t:
-            return "stopped"
+            return "queued" if (self.get(sid) or {}).get("queued") else "stopped"
         if not t.get("attached"):
             return "running"  # alive, but loom hasn't re-attached since a restart → activity unknown
         if t.get("waiting_on"):
@@ -629,7 +634,10 @@ def chats_spawn(
         print(f"  branch    {r['branch']}")
         print(f"  worktree  {r['worktree']}")
         print(f"  open      {url}")
-        if r.get("waiting_on"):
+        if r.get("queued"):
+            print(f"  queued    #{r['queue_position']} — {r['max_working']} of the chats you spawned are already working;")
+            print("            loom starts this one (on its first message) as soon as one of them finishes its turn")
+        elif r.get("waiting_on"):
             print(f"  ! the agent is waiting on its {r['waiting_on']} — the first message runs once someone")
             print("    answers it in the browser (`loom chats open <id>`); loom never answers it for you")
         elif r.get("error"):
@@ -1219,3 +1227,60 @@ def board_enable(category: str = typer.Option(None, "--category", "-c", help="th
     key, cname = _board_key(category)
     _api("POST", f"/boards/{key}/enable")
     print(f'enabled the message board for "{cname}" — its chats are told on their next message')
+
+
+# --- dev stack ------------------------------------------------------------------------------
+def _dev_chat(ref: str | None) -> str:
+    if ref:
+        return _World().resolve(ref)["id"]
+    return _self_id() or _die("not inside a loom chat — pass --chat <id>")
+
+
+def _print_dev(d: dict) -> None:
+    print(f"dev stack of {d['task']} ({d['state']}) — loom stops it after {d['idle_stop_min']} min with nothing "
+          "happening in the chat and brings it back when the chat is used again")
+    rows = []
+    for s in d["services"]:
+        state = "up" if s["healthy"] else ("starting / not answering" if s["running"] else "stopped")
+        how = "auto" if s["auto"] else ("asked for" if s["requested"] else "on demand — `loom dev up " + s["name"] + "`")
+        rows.append([s["name"], state, s["url"] or (f":{s['port']}" if s["port"] else "-"), how])
+    _table(["service", "state", "url", "started"], rows) if rows else print("  (no services in this project's .loom.yaml)")
+
+
+@dev_app.command("status")
+def dev_status(chat: str = typer.Option(None, "--chat", help="another chat (default: this one)"),
+               as_json: bool = typer.Option(False, "--json")) -> None:
+    """This chat's dev services: up or not, their URLs, and which loom starts on its own."""
+    d = _api("GET", f"/chats/{_dev_chat(chat)}/dev")
+    _out_json(d) if as_json else _print_dev(d)
+
+
+@dev_app.command("up")
+def dev_up(
+    services: list[str] = typer.Argument(None, help="e.g. frontend (default: what loom runs for this chat on its own)"),
+    chat: str = typer.Option(None, "--chat", help="another chat (default: this one)"),
+    wait: float = typer.Option(120.0, "--wait", help="seconds to wait for them to answer (0 = don't wait)"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Start dev services now and wait until they answer; loom keeps them up while the chat is in use.
+    An agent-spawned chat gets only its backend on its own — `loom dev up frontend` when you need the UI."""
+    sid = _dev_chat(chat)
+    d = _api("POST", f"/chats/{sid}/dev/up", body={"services": services or None, "wait": wait}, timeout=wait + 60)
+    if as_json:
+        _out_json(d)
+        return
+    _print_dev(d)
+    late = [s for s in d["services"] if s["name"] in d["asked"] and s["url"] and not s["healthy"]]
+    for s in late:
+        print(f"  ! {s['name']} isn't answering {s['url']} yet — its log: {s['log']}")
+    if late and wait:
+        raise typer.Exit(1)
+
+
+@dev_app.command("down")
+def dev_down(
+    services: list[str] = typer.Argument(None, help="e.g. frontend (default: all — they stay down until started again)"),
+    chat: str = typer.Option(None, "--chat", help="another chat (default: this one)"),
+) -> None:
+    """Stop dev services you no longer need."""
+    _print_dev(_api("POST", f"/chats/{_dev_chat(chat)}/dev/down", body={"services": services or None}))

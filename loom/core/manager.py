@@ -190,7 +190,10 @@ def finish_removal(task: Task) -> None:
 
 
 # --- start / stop services (Phase 2) -----------------------------------------
-def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> Task:
+def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None, *, requested: bool = False) -> Task:
+    """Start the task's dev services (`only` = just those). `requested` = someone asked for them
+    (the dashboard, `loom dev up`, `loom start`) rather than the supervisor keeping a busy chat's
+    stack up — the supervisor then keeps them up too, even a service it wouldn't start itself."""
     task = registry.get_task(task_id)
     if not task:
         raise ValueError(f"unknown task '{task_id}'")
@@ -228,6 +231,9 @@ def start_task(cfg: RepoConfig, task_id: str, only: set[str] | None = None) -> T
     # When starting a subset, keep the services we didn't touch + the ones we just (re)started.
     task.services = ([s for s in task.services if s.name not in only] + procs) if only else procs
     task.state = TaskState.running
+    task.stack_started_at = time.time()
+    if requested:
+        task.requested = sorted(set(task.requested) | {p.name for p in procs})
     return registry.upsert(task)
 
 
@@ -243,15 +249,42 @@ def _teardown(svc: ServiceProc) -> None:
 
 
 def stop_task(task_id: str) -> None:
+    """A deliberate stop (the stop button, `loom stop`): the stack stays down — state `stopped`, which
+    the supervisor respects — until someone starts it again."""
     task = registry.get_task(task_id)
     if not task:
         return
     for svc in task.services:
         _teardown(svc)
     task.services = []
+    task.requested = []
     if task.state == TaskState.running:
         task.state = TaskState.stopped
     registry.upsert(task)
+
+
+def mark_requested(task_id: str, names: set[str]) -> None:
+    """Record that someone asked for these services (see `start_task`'s `requested`)."""
+    task = registry.get_task(task_id)
+    if task and not names <= set(task.requested):
+        task.requested = sorted(set(task.requested) | names)
+        registry.upsert(task)
+
+
+def park_task(task_id: str) -> Task | None:
+    """Stop a stack nobody is using (its chat went idle or was archived — monitor.py). Unlike
+    `stop_task` it lands on `ready`, not `stopped`: the supervisor brings the stack back by itself
+    the next time the chat is in use, so stopping an idle stack costs nothing but its boot time."""
+    task = registry.get_task(task_id)
+    if not task:
+        return None
+    for svc in task.services:
+        _teardown(svc)
+    task.services = []
+    task.requested = []
+    if task.state == TaskState.running:  # a deliberate `stopped` stays stopped
+        task.state = TaskState.ready
+    return registry.upsert(task)
 
 
 def stop_services(task_id: str, names: set[str]) -> None:
@@ -263,6 +296,9 @@ def stop_services(task_id: str, names: set[str]) -> None:
         if svc.name in names:
             _teardown(svc)
     task.services = [s for s in task.services if s.name not in names]
+    task.requested = [n for n in task.requested if n not in names]
+    if not task.services and task.state == TaskState.running:
+        task.state = TaskState.ready
     registry.upsert(task)
 
 

@@ -100,6 +100,7 @@ native `tmux attach`; pre-existing live tmux chats stay tmux until switched, so 
 session id never runs two claudes. Remove tmux once pty is proven.
 
 ## D14 — Dev stacks are reaped when their chat is done (2026-07-08)
+*(The policy below was replaced by D34: "in use", parking instead of `stopped`, a 30 min idle window.)*
 Archiving a chat now stops its task's dev stack (`PATCH /chats` → `monitor.stop_for_archived_chat`),
 and a **reaper** pass in `core/monitor.py` (startup + every 10 min) stops any task holding services
 that has no live terminal session and whose chat is archived — or whose worktree has had no chat
@@ -616,6 +617,67 @@ in `loom.db` (`session_index` + an FTS5 table `session_fts`, porter-stemmed, bm2
   pause it or set `LOOM_INDEXER=0` if you don't want that.
 - Verified: unit suite (facts, FTS, stemming, worker policies, caps, backoff, regrowth, log excerpts, index-first find), real Haiku on six sessions with meaningless
   titles found from vague descriptions (4/4), and a real-browser run (PR + session, session-only, status line, paused/off states).
+
+## D34 — loom stops what it starts (2026-11-28)
+The 11-27 night audit (Kalendir memory `mac-memory-audit`): ~138 GB of demand on a 48 GB Mac, swap full, load 135, and
+roughly 40 GB of it was things loom started and never stopped. That included 36 archived chats still running (11 GB), 22
+backends of chats idle for a day or more, a Vite for each of 30 spawned perf chats (12.7 GB), and 10 chats running two or
+three times at once. Six causes in the code, and the fix for each:
+- **One chat, several agents.** `pty_server` forked the agent, then unlinked whatever socket sat at its path and bound its own.
+  When two opens of one chat raced (a browser reconnect during a headless `start_chat`, two tabs after a restart), the second
+  daemon took the path and the first kept running, unreachable. Archive and close only killed the daemon the pidfile named
+  (the newest one), and when a displaced copy exited, its cleanup unlinked the live daemon's socket, so the next open started a
+  third. Now each daemon holds an exclusive `flock` on `<socket>.lock` for its whole life, taken **before** it forks the
+  agent. A daemon that can't get it exits `EXIT_ALREADY_RUNNING` (3) without starting anything. Cleanup unlinks only the socket
+  it bound (by inode) and the pidfile it wrote. `open_terminal` / `start_chat` hold a per-chat asyncio lock, and the launcher
+  waits for a daemon that's still coming up instead of replacing it. `kill_session` stops every daemon for the socket, found
+  by argv (`pgrep`, then `ps -p`), not only the pidfile's. The reaper stops leftover copies from before the lock: copies older
+  than 60 s that the pidfile doesn't name, and unreachable ones (socket file gone) only once the chat isn't mid-turn.
+  The lock file is never unlinked: deleting a lock file while someone may have it open is how two processes both end up
+  "holding" it. A liveness probe takes `LOCK_SH` for microseconds, so a starting daemon retries `LOCK_EX` for up to 2 s.
+- **macOS pid reuse.** With no `/proc`, `is_session_alive` treated any live pid as the daemon. A pidfile left by an August
+  daemon now named `ExtensibleSSOSubscriber`, so that archived chat read as running, and closing it would have SIGTERMed that
+  system process's group. Now a daemon is alive if it holds the lock, or, for a daemon that predates the lock, if the pidfile's
+  pid has this socket's daemon command line. The command line is matched on argv (`<python> -m loom.core.pty_server <socket>`),
+  never as a substring: an agent's shell that greps `ps` must never be taken for a daemon. The verdict is cached for 5 min,
+  because `ps` takes 25–100 ms per call on a loaded Mac and 1–3 s for all processes. Once every pre-lock daemon has been
+  relaunched, liveness is a lock probe alone.
+- **Archive didn't stick.** Besides the duplicates above, three things went wrong. An agent archiving itself (rightly) isn't
+  killed mid-turn, and nothing came back for it later. Anything that relaunched an archived chat (`loom chats send|ask`, a
+  notification reply, board `--wake`, opening it from the archived tab) left it running for good. And
+  `stop_for_archived_chat` and the reaper both skipped any worktree with a live session. Now the reaper enforces
+  "archived ⇒ stopped". Once an archived chat is quiet (no tab shows it, it isn't mid-turn, and nothing has happened for
+  2 min), the reaper stops its agent, parks its stack and releases its port offset. That catches all of these cases.
+- **Stacks of idle chats.** The supervisor counted every attached session as active, and since agents are never stopped,
+  that meant forever. It also restarted those stacks, and the reaper skipped any worktree with a live session. Now a
+  chat is **in use** while a tab shows it, while it's mid-turn (claude's hooks; recent output for grok/codex, which have none;
+  claude's own output proves nothing since its status line redraws itself), or for `LOOM_IDLE_STOP_MIN` (default 30) after its
+  last sign of life: a turn event, a keystroke, a tab leaving it, a transcript write, a launch. The supervisor keeps
+  *wanted* services up only while the chat is in use, and starts missing ones at once (the down-streak is only for
+  restarts). The reaper (now every 60 s, was 10 min) **parks** an idle stack (`manager.park_task`): stopped, state `ready`,
+  so the supervisor restarts it by itself the next time the chat is used. A deliberate stop (button, `loom stop`,
+  `loom dev down`) still lands on `stopped` and stays down. A parked stack shows "○ idle" in the dev-stack strip. An idle
+  **agent** is never stopped; only an archived one is. Some idle-looking chats do real work, such as session crons.
+- **A Vite per spawned chat.** Chats an agent spawned (`spawned_by`) get every service except `frontend`, unless someone
+  asks for it. Asking means the dev-stack start button, `loom dev up frontend` or `loom start`, recorded in
+  `task.requested` and cleared when the stack is parked or stopped. A spawned chat's frontend that nobody asked for is
+  stopped, but only once it isn't mid-turn or open in a tab. New: `loom dev status|up|down` (`/api/chats/{id}/dev`,
+  `…/dev/up`, `…/dev/down`). `up` waits until the services answer, and leaves one that's still booting alone. Agents
+  learn this from `<loom-runtime>`.
+- **One spawn wave, 30 chats at once.** A spawner now has at most `LOOM_SPAWN_MAX_WORKING` (default 4) children working:
+  mid-turn, or launched less than 3 min ago with no turn event yet. A spawn past that still creates the worktree and the
+  chat, but its handoff waits in the overlay (`queued_at` / `queued_prompt`, `core/spawnq.py`). The sidebar shows it as
+  "queued", `spawn` prints its place, and the monitor loop launches queued chats oldest-first as slots free up. Opening a
+  queued chat, or `loom chats send` to it, starts it right away, on its handoff (consumed in `open_terminal`).
+
+Verified: real-process tests of the lock, liveness and kill paths (a second daemon bows out without starting its command,
+a stale pidfile on a live unrelated pid is neither alive nor killed, a displaced copy is found and stopped by argv, a decoy
+shell is ignored, cleanup leaves foreign files alone). Decision tests on a constructed world (reaper plan, supervisor wants
+and starts, spawn-queue slots). Two end-to-end runs on an isolated instance: the cap and queue, backend-only for spawned
+chats, `dev up frontend`, three concurrent starts giving one daemon, idle park then auto-restart, outside and self-archive,
+and a **pre-lock daemon** displacing a chat's daemon, then reaped. A read-only dry run against the live state would park 32
+idle stacks, stop 29 spawned chats' Vites and release 97 archived tasks' port offsets.
+(Supersedes D14's 12 h / live-session policy.)
 
 ## Non-goals
 Rebuilding the agent/session-orchestration commodity layer; running a target repo's

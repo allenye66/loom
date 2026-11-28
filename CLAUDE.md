@@ -83,6 +83,12 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
 - **A chat's loom id and its claude session id can differ** (claude's background daemon can hand a chat
   another session — D23). `sessions.bind_session` records the real one (`agent_session_id`), the index
   re-keys that transcript to the loom id, and resume uses it. Don't assume transcript filename == chat id.
+- **loom stops what it starts (D34)**: a chat is *in use* while a tab shows it, it's mid-turn, or for
+  `LOOM_IDLE_STOP_MIN` (30) after its last activity — the supervisor keeps its stack up only then, the reaper
+  parks it after (state `ready`, comes back on use; `stopped` = someone chose it). Archived chats' agents are
+  stopped once quiet; idle (non-archived) agents never are. Spawned chats get no `frontend` unless asked
+  (`loom dev up frontend`); a spawner has `LOOM_SPAWN_MAX_WORKING` (4) children working at once, the rest queue.
+  One pty daemon per chat, enforced by a lifetime `flock` — never unlink a daemon's socket you didn't bind.
 - Match the existing code style; keep Python imports at top of file.
 
 ## Docs
@@ -133,8 +139,10 @@ Full code map + data flow + the WS protocol: **`docs/ARCHITECTURE.md`**.
   head-branch evidence); `loom chats ask <id> "…"` asks it and prints the reply (read its `brief`/`show` first —
   asking interrupts it); messages an agent sends another chat are tagged as from an agent, not the user.
 - **Harness** — agents drive loom themselves: `loom chats ls/show/brief/archive/close/
-  categorize/spawn/send`, `loom categories …`, `loom whoami` (spawn = new worktree + chat already
-  working on a handoff prompt).
+  categorize/spawn/send`, `loom categories …`, `loom whoami`, `loom dev status|up|down` (spawn = new
+  worktree + chat already working on a handoff prompt; past the per-spawner cap it queues).
+- **Lifecycle** (D34) — idle chats' dev stacks are parked and come back on use; archived chats stop for
+  real; spawned chats get a backend only; one daemon per chat; spawn waves are capped and queued.
 - **In-chat tools** — dev-stack start/stop + FE/BE/test logs, transcript search,
   copy-text panel, ⌘↑/⌘↓ message jumps, image drop, PR badges, Claude usage chip,
   `⧉ terminal` (plain shell in the worktree), open-in-editor.
